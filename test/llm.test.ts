@@ -1,0 +1,442 @@
+/**
+ * Provider-neutral LLM layer. No live API keys exist in CI, so each adapter's
+ * REAL SDK (or, for Ollama, plain fetch) is pointed at a local mock server
+ * that answers in that provider's documented wire format. The tests check
+ * what goes over the wire (endpoint, auth header, model id, schema in the
+ * provider's native field) and how answers, refusals, truncations, invalid
+ * output and HTTP errors are mapped onto the typed error model.
+ */
+import { after, before, describe, test } from "node:test";
+import assert from "node:assert/strict";
+import type { ChildProcess } from "node:child_process";
+import { serve, json } from "../src/util/http.js";
+import { validateJson, toStrictSchema, fromStrict } from "../src/llm/jsonSchema.js";
+import { generateStructured, parseJsonText } from "../src/llm/structured.js";
+import { LlmError, type AdapterOptions, type ChatAdapter } from "../src/llm/types.js";
+import { AnthropicAdapter } from "../src/llm/providers/anthropic.js";
+import { OpenAIAdapter } from "../src/llm/providers/openai.js";
+import { GeminiAdapter } from "../src/llm/providers/gemini.js";
+import { OllamaAdapter } from "../src/llm/providers/ollama.js";
+import { createLlm, llmConfigFromEnv, providerConfigFromEnv } from "../src/llm/config.js";
+import { createInterpreter, interpreterFromEnv, INTERPRETATION_SCHEMA, LlmInterpreter } from "../src/grounding/llmInterpreter.js";
+import { ClaudeInterpreter } from "../src/grounding/claudeInterpreter.js";
+import { RuleInterpreter } from "../src/grounding/ruleInterpreter.js";
+import { CommonGround } from "../src/grounding/commonGround.js";
+import { PodClient } from "../src/pod/PodClient.js";
+import { PodLayout } from "../src/pod/layout.js";
+import { assess, CASES, configuredProviders } from "../src/llm/compare.js";
+import { startCss, startEnvironment, AGENT_1, AGENT_2 } from "../src/demo/environment.js";
+
+// ------------------------------------------------------------------ mock provider servers
+
+interface Recorded { method: string; url: string; headers: Record<string, string | string[] | undefined>; body: any }
+type Reply = { status?: number; body: unknown; delayMs?: number };
+
+async function mockServer(reply: (r: Recorded, n: number) => Reply) {
+  const requests: Recorded[] = [];
+  const srv = await serve(async (req, res) => {
+    const r: Recorded = { method: req.method ?? "", url: req.url, headers: req.headers, body: req.body ? JSON.parse(req.body) : undefined };
+    requests.push(r);
+    const out = reply(r, requests.length);
+    if (out.delayMs) await new Promise((ok) => setTimeout(ok, out.delayMs));
+    if (!res.destroyed) json(res, out.status ?? 200, out.body);
+  });
+  servers.push(srv);
+  return { url: srv.url, requests };
+}
+const servers: Array<{ close(): Promise<void> }> = [];
+after(async () => { await Promise.all(servers.map((s) => s.close())); });
+
+const opts = (url: string, extra: Partial<AdapterOptions> = {}): AdapterOptions => ({ model: "test-model", apiKey: "sk-test", baseURL: url, timeoutMs: 5000, maxRetries: 0, maxOutputTokens: 16000, ...extra });
+
+/** A schema-valid interpretation in the null-for-absent form the schema prescribes. */
+const st = (o: Record<string, unknown>) => ({ category: null, subject: null, criterion: null, weight: null, ambiguousTerm: null, authorization: null, ...o });
+const CURRENT = { label: "within 60 minutes", definition: "current means observed at most 60 minutes before delivery", criterion: { leftOperand: "observationAgeMinutes", operator: "lteq", rightOperand: 60, unit: "minute" } };
+const INTERP = {
+  statements: [
+    st({ text: "Get me a current Berlin weather report.", role: "intention", category: "WeatherReport", subject: "Berlin" }),
+    st({ text: "Get me a current Berlin weather report.", role: "requirement", category: "WeatherReport", ambiguousTerm: { term: "current", candidates: [CURRENT] } }),
+    st({ text: "You may spend up to 1 USDC.", role: "authorization", category: "WeatherReport", authorization: { currency: "USDC", totalLimit: "1.00", maxPerTransaction: null, approvedSellersOnly: true, validDays: 30 } }),
+  ],
+  unrecognized: [],
+};
+const REQ = { system: "SYSTEM PROMPT", user: "Get me a current Berlin weather report. You may spend up to 1 USDC.", schema: INTERPRETATION_SCHEMA, schemaName: "interpretation" };
+
+async function rejects(p: Promise<unknown>, kind: LlmError["kind"]): Promise<LlmError> {
+  try { await p; } catch (err) {
+    assert.ok(err instanceof LlmError, `expected LlmError, got ${err}`);
+    assert.equal(err.kind, kind, err.message);
+    return err;
+  }
+  assert.fail(`expected LlmError ${kind}`);
+}
+
+// Wire formats -------------------------------------------------------------
+
+const anthropicMessage = (text: string, extra: Record<string, unknown> = {}) => ({
+  id: "msg_1", type: "message", role: "assistant", model: "claude-opus-5-5", content: [{ type: "text", text }],
+  stop_reason: "end_turn", stop_sequence: null, usage: { input_tokens: 120, output_tokens: 80 }, ...extra,
+});
+const openaiCompletion = (message: Record<string, unknown>, finish = "stop") => ({
+  id: "chatcmpl-1", object: "chat.completion", created: 1_700_000_000, model: "gpt-test-2026",
+  choices: [{ index: 0, message: { role: "assistant", content: null, refusal: null, ...message }, finish_reason: finish, logprobs: null }],
+  usage: { prompt_tokens: 100, completion_tokens: 50, total_tokens: 150 },
+});
+const geminiResponse = (text: string, finishReason = "STOP", extra: Record<string, unknown> = {}) => ({
+  candidates: [{ content: { role: "model", parts: [{ text }] }, finishReason, index: 0 }],
+  usageMetadata: { promptTokenCount: 90, candidatesTokenCount: 40, thoughtsTokenCount: 10, totalTokenCount: 140 },
+  modelVersion: "gemini-test-001", ...extra,
+});
+const ollamaResponse = (content: string, done_reason = "stop") => ({
+  model: "llama-test", created_at: "2026-11-14T00:00:00Z", message: { role: "assistant", content }, done: true, done_reason, prompt_eval_count: 70, eval_count: 30,
+});
+
+// ------------------------------------------------------------------ tests
+
+describe("json schema subset", () => {
+  test("validates types, enums, required, additionalProperties and anyOf with useful paths", () => {
+    assert.deepEqual(validateJson(INTERP, INTERPRETATION_SCHEMA), []);
+    const bad = structuredClone(INTERP) as any;
+    bad.statements[0].role = "boss";
+    bad.statements[1].ambiguousTerm.candidates[0].criterion.operator = "approx";
+    bad.statements[2].authorization.validDays = 1.5;
+    bad.statements[2].extra = true;
+    delete bad.unrecognized;
+    const errors = validateJson(bad, INTERPRETATION_SCHEMA);
+    assert.ok(errors.includes(`$: missing required property "unrecognized"`), errors.join("\n"));
+    assert.ok(errors.some((e) => e.startsWith("$.statements[0].role: must be one of")));
+    assert.ok(errors.some((e) => e.startsWith("$.statements[1].ambiguousTerm.candidates[0].criterion.operator")));
+    assert.ok(errors.includes("$.statements[2].authorization.validDays: expected integer or null, got number"));
+    assert.ok(errors.includes(`$.statements[2]: unexpected property "extra"`));
+    assert.throws(() => validateJson({}, { type: "object", patternProperties: {} }), /unsupported keyword/);
+  });
+
+  test("strict-mode rewrite makes every property required and nullable, and is undone on the answer", () => {
+    const schema = { type: "object", required: ["a"], properties: { a: { type: "string" }, b: { type: "number" }, c: { type: "object", properties: { d: { type: "string" } } } } };
+    const strict = toStrictSchema(schema) as any;
+    assert.deepEqual(strict.required, ["a", "b", "c"]);
+    assert.equal(strict.additionalProperties, false);
+    assert.deepEqual(strict.properties.b, { anyOf: [{ type: "number" }, { type: "null" }] });
+    assert.equal(strict.properties.c.anyOf[0].additionalProperties, false);
+    const answer = { a: "x", b: null, c: { d: null } };
+    assert.deepEqual(validateJson(answer, strict), []);
+    assert.deepEqual(fromStrict(answer, schema), { a: "x", c: {} });
+    // The interpretation schema is already strict-shaped: the rewrite is a no-op on it.
+    assert.deepEqual(toStrictSchema(INTERPRETATION_SCHEMA), INTERPRETATION_SCHEMA);
+  });
+
+  test("JSON is extracted from fences and prose only as a fallback", () => {
+    assert.deepEqual(parseJsonText('{"a":1}'), { ok: true, value: { a: 1 } });
+    assert.deepEqual(parseJsonText('Sure:\n```json\n{"a":2}\n```'), { ok: true, value: { a: 2 } });
+    assert.deepEqual(parseJsonText('Here it is: {"a":3} hope that helps'), { ok: true, value: { a: 3 } });
+    assert.equal(parseJsonText("no json here").ok, false);
+  });
+});
+
+describe("anthropic adapter (@anthropic-ai/sdk against a mock Messages API)", () => {
+  test("keeps the established request shape and parses the answer", async () => {
+    const m = await mockServer(() => ({ body: anthropicMessage(JSON.stringify(INTERP)) }));
+    const r = await generateStructured(AnthropicAdapter.create(opts(m.url, { model: "claude-opus-5-5" })), REQ);
+    assert.deepEqual(r.value, INTERP);
+    assert.deepEqual({ model: r.model, usage: r.usage, attempts: r.attempts, provider: r.provider }, { model: "claude-opus-5-5", usage: { inputTokens: 120, outputTokens: 80 }, attempts: 1, provider: "anthropic" });
+    const [req] = m.requests;
+    assert.match(req.url, /^\/v1\/messages(\?beta=true)?$/);
+    assert.equal(req.body.betas, undefined, "betas travel in the anthropic-beta header");
+    // SDK 1.x sends the API key as a bearer token (older releases used x-api-key).
+    assert.equal(req.headers.authorization, "Bearer sk-test");
+    assert.match(String(req.headers["anthropic-beta"]), /server-side-fallback-2026-07-01/);
+    assert.equal(req.body.model, "claude-opus-5-5", "model id passed through verbatim");
+    assert.equal(req.body.max_tokens, 16000);
+    assert.equal(req.body.fallbacks, "default");
+    assert.deepEqual(req.body.output_config, { effort: "medium", format: { type: "json_schema", schema: INTERPRETATION_SCHEMA } });
+    assert.equal(req.body.system, "SYSTEM PROMPT");
+    assert.deepEqual(req.body.messages, [{ role: "user", content: REQ.user }]);
+  });
+
+  test("refusal and max_tokens are typed errors and never parsed or retried", async () => {
+    const refusing = await mockServer(() => ({ body: anthropicMessage('{"statements":[]', { stop_reason: "refusal", stop_details: { category: "cyber", explanation: "declined" } }) }));
+    const e = await rejects(generateStructured(AnthropicAdapter.create(opts(refusing.url)), REQ), "refusal");
+    assert.match(e.message, /cyber: declined/);
+    assert.equal(refusing.requests.length, 1);
+    const truncating = await mockServer(() => ({ body: anthropicMessage('{"statements":[', { stop_reason: "max_tokens" }) }));
+    await rejects(generateStructured(AnthropicAdapter.create(opts(truncating.url)), REQ), "truncated");
+    assert.equal(truncating.requests.length, 1);
+  });
+
+  test("HTTP errors map onto auth / rate_limit / transport", async () => {
+    for (const [status, kind] of [[401, "auth"], [429, "rate_limit"], [529, "transport"]] as const) {
+      const m = await mockServer(() => ({ status, body: { type: "error", error: { type: "x", message: `status ${status}` } } }));
+      const e = await rejects(generateStructured(AnthropicAdapter.create(opts(m.url)), REQ), kind);
+      assert.equal(e.details.status, status);
+      assert.equal(e.retryable, kind !== "auth");
+    }
+  });
+
+  test("ClaudeInterpreter stays a working backwards-compatible wrapper", async () => {
+    const m = await mockServer(() => ({ body: anthropicMessage(JSON.stringify(INTERP)) }));
+    const { default: Anthropic } = await import("@anthropic-ai/sdk");
+    const i = new ClaudeInterpreter("claude-opus-5-5", new Anthropic({ apiKey: "sk-test", baseURL: m.url, maxRetries: 0 }));
+    assert.equal(i.name, "claude");
+    const out = await i.interpret("Get me a current Berlin weather report.");
+    assert.equal(out.statements[0].subject, "Berlin");
+    assert.ok(!("criterion" in out.statements[0]), "nulls are stripped back to absent fields");
+  });
+});
+
+describe("openai adapter (openai SDK against a mock Chat Completions API)", () => {
+  test("sends strict json_schema structured outputs and parses the answer", async () => {
+    const m = await mockServer(() => ({ body: openaiCompletion({ content: JSON.stringify(INTERP) }) }));
+    const r = await generateStructured(OpenAIAdapter.create(opts(m.url, { model: "gpt-5" })), REQ);
+    assert.deepEqual(r.value, INTERP);
+    assert.equal(r.model, "gpt-test-2026");
+    assert.deepEqual(r.usage, { inputTokens: 100, outputTokens: 50 });
+    const [req] = m.requests;
+    assert.equal(req.url, "/chat/completions");
+    assert.equal(req.headers.authorization, "Bearer sk-test");
+    assert.equal(req.body.model, "gpt-5");
+    assert.equal(req.body.max_completion_tokens, 16000);
+    assert.equal(req.body.max_tokens, undefined);
+    assert.deepEqual(req.body.response_format, { type: "json_schema", json_schema: { name: "interpretation", strict: true, schema: toStrictSchema(INTERPRETATION_SCHEMA) } });
+    assert.deepEqual(req.body.messages, [{ role: "system", content: "SYSTEM PROMPT" }, { role: "user", content: REQ.user }]);
+  });
+
+  test("invalid JSON is repaired once with the validation errors, then fails typed", async () => {
+    const once = await mockServer((_r, n) => ({ body: openaiCompletion({ content: n === 1 ? "not json at all" : JSON.stringify(INTERP) }) }));
+    const r = await generateStructured(OpenAIAdapter.create(opts(once.url)), REQ);
+    assert.equal(r.attempts, 2);
+    assert.deepEqual(r.usage, { inputTokens: 200, outputTokens: 100 }, "usage summed over attempts");
+    const retry = once.requests[1].body.messages;
+    assert.deepEqual(retry[2], { role: "assistant", content: "not json at all" });
+    assert.match(retry[3].content, /did not conform[\s\S]*not valid JSON/);
+
+    const wrongShape = { ...INTERP, statements: [{ ...INTERP.statements[0], role: "boss" }] };
+    const never = await mockServer(() => ({ body: openaiCompletion({ content: JSON.stringify(wrongShape) }) }));
+    const e = await rejects(generateStructured(OpenAIAdapter.create(opts(never.url)), REQ), "invalid_output");
+    assert.equal(never.requests.length, 2, "bounded: one repair only");
+    assert.ok(e.details.validationErrors?.some((v) => v.includes("$.statements[0].role")));
+    assert.match(never.requests[1].body.messages[3].content, /\$\.statements\[0\]\.role: must be one of/);
+  });
+
+  test("refusal field, content_filter and finish_reason length are typed", async () => {
+    const refusal = await mockServer(() => ({ body: openaiCompletion({ refusal: "I can't help with that." }) }));
+    assert.match((await rejects(generateStructured(OpenAIAdapter.create(opts(refusal.url)), REQ), "refusal")).message, /can't help/);
+    const filtered = await mockServer(() => ({ body: openaiCompletion({ content: "" }, "content_filter") }));
+    await rejects(generateStructured(OpenAIAdapter.create(opts(filtered.url)), REQ), "refusal");
+    const cut = await mockServer(() => ({ body: openaiCompletion({ content: '{"statements":[' }, "length") }));
+    await rejects(generateStructured(OpenAIAdapter.create(opts(cut.url)), REQ), "truncated");
+    assert.equal(cut.requests.length, 1);
+  });
+
+  test("HTTP errors and timeouts are typed", async () => {
+    for (const [status, kind] of [[401, "auth"], [403, "auth"], [429, "rate_limit"], [400, "bad_request"], [503, "transport"]] as const) {
+      const m = await mockServer(() => ({ status, body: { error: { message: `status ${status}`, type: "x", code: null } } }));
+      await rejects(generateStructured(OpenAIAdapter.create(opts(m.url)), REQ), kind);
+    }
+    const slow = await mockServer(() => ({ body: openaiCompletion({ content: "{}" }), delayMs: 1500 }));
+    await rejects(generateStructured(OpenAIAdapter.create(opts(slow.url, { timeoutMs: 200 })), REQ), "timeout");
+    await rejects(generateStructured(OpenAIAdapter.create(opts("http://127.0.0.1:1")), REQ), "transport");
+  });
+
+  test("Azure OpenAI: deployment path, api-version and api-key header", async () => {
+    const m = await mockServer(() => ({ body: openaiCompletion({ content: JSON.stringify(INTERP) }) }));
+    const a = OpenAIAdapter.createAzure({ ...opts(m.url, { model: "my-deployment" }), endpoint: m.url, apiVersion: "2024-10-21" });
+    await generateStructured(a, REQ);
+    const [req] = m.requests;
+    assert.equal(req.url, "/openai/deployments/my-deployment/chat/completions?api-version=2024-10-21");
+    assert.equal(req.headers["api-key"], "sk-test");
+    assert.equal(req.body.response_format.type, "json_schema");
+  });
+});
+
+describe("openai-compatible adapter (capability fallbacks)", () => {
+  test("json_object mode: response_format json_object, schema in the prompt, max_tokens", async () => {
+    const m = await mockServer(() => ({ body: openaiCompletion({ content: JSON.stringify(INTERP) }) }));
+    const a = OpenAIAdapter.createCompatible({ ...opts(m.url, { model: "mistral-large-latest" }), baseURL: m.url, mode: "json_object" });
+    assert.equal(a.provider, "openai-compatible");
+    await generateStructured(a, REQ);
+    const [req] = m.requests;
+    assert.deepEqual(req.body.response_format, { type: "json_object" });
+    assert.equal(req.body.max_tokens, 16000);
+    assert.equal(req.body.max_completion_tokens, undefined);
+    assert.match(req.body.messages[0].content, /^SYSTEM PROMPT\n\nRespond with a single JSON object[\s\S]*"statements"/);
+  });
+
+  test("prompt mode: no response_format; fenced or chatty JSON is still parsed and validated", async () => {
+    const m = await mockServer(() => ({ body: openaiCompletion({ content: "Here you go:\n```json\n" + JSON.stringify(INTERP) + "\n```" }) }));
+    const a = OpenAIAdapter.createCompatible({ ...opts(m.url, { model: "local-model" }), baseURL: m.url, mode: "prompt" });
+    assert.deepEqual((await generateStructured(a, REQ)).value, INTERP);
+    assert.equal(m.requests[0].body.response_format, undefined);
+  });
+
+  test("an OpenAI key is never sent to a third-party base URL", async () => {
+    const m = await mockServer(() => ({ body: openaiCompletion({ content: JSON.stringify(INTERP) }) }));
+    const cfg = llmConfigFromEnv({ LLM_PROVIDER: "openai-compatible", LLM_BASE_URL: m.url, LLM_MODEL: "x", OPENAI_API_KEY: "sk-real-openai" })!;
+    await generateStructured(createLlm({ ...cfg, maxRetries: 0 }), REQ);
+    assert.equal(m.requests[0].headers.authorization, "Bearer not-needed");
+  });
+});
+
+describe("gemini adapter (@google/genai against a mock generateContent API)", () => {
+  test("sends responseMimeType + responseJsonSchema and parses the answer", async () => {
+    const m = await mockServer(() => ({ body: geminiResponse(JSON.stringify(INTERP)) }));
+    const r = await generateStructured(GeminiAdapter.create(opts(m.url, { model: "gemini-2.5-flash" })), REQ);
+    assert.deepEqual(r.value, INTERP);
+    assert.equal(r.model, "gemini-test-001");
+    assert.deepEqual(r.usage, { inputTokens: 90, outputTokens: 50 }, "thinking tokens count as output");
+    const [req] = m.requests;
+    assert.equal(req.url, "/v1beta/models/gemini-2.5-flash:generateContent");
+    assert.equal(req.headers["x-goog-api-key"], "sk-test");
+    assert.equal(req.body.generationConfig.responseMimeType, "application/json");
+    assert.deepEqual(req.body.generationConfig.responseJsonSchema, INTERPRETATION_SCHEMA);
+    assert.equal(req.body.generationConfig.maxOutputTokens, 16000);
+    assert.deepEqual(req.body.systemInstruction.parts, [{ text: "SYSTEM PROMPT" }]);
+    assert.deepEqual(req.body.contents, [{ role: "user", parts: [{ text: REQ.user }] }]);
+  });
+
+  test("repair turn uses role model; safety, prompt blocks and MAX_TOKENS are typed", async () => {
+    const m = await mockServer((_r, n) => ({ body: geminiResponse(n === 1 ? '{"statements": "oops"}' : JSON.stringify(INTERP)) }));
+    assert.equal((await generateStructured(GeminiAdapter.create(opts(m.url)), REQ)).attempts, 2);
+    assert.deepEqual(m.requests[1].body.contents.map((c: any) => c.role), ["user", "model", "user"]);
+
+    const safety = await mockServer(() => ({ body: geminiResponse("", "SAFETY") }));
+    await rejects(generateStructured(GeminiAdapter.create(opts(safety.url)), REQ), "refusal");
+    const blocked = await mockServer(() => ({ body: { promptFeedback: { blockReason: "PROHIBITED_CONTENT" }, usageMetadata: { promptTokenCount: 5 } } }));
+    assert.match((await rejects(generateStructured(GeminiAdapter.create(opts(blocked.url)), REQ), "refusal")).message, /PROHIBITED_CONTENT/);
+    const cut = await mockServer(() => ({ body: geminiResponse('{"statements":[', "MAX_TOKENS") }));
+    await rejects(generateStructured(GeminiAdapter.create(opts(cut.url)), REQ), "truncated");
+    const quota = await mockServer(() => ({ status: 429, body: { error: { code: 429, message: "Resource exhausted", status: "RESOURCE_EXHAUSTED" } } }));
+    await rejects(generateStructured(GeminiAdapter.create(opts(quota.url)), REQ), "rate_limit");
+    const denied = await mockServer(() => ({ status: 403, body: { error: { code: 403, message: "API key not valid", status: "PERMISSION_DENIED" } } }));
+    await rejects(generateStructured(GeminiAdapter.create(opts(denied.url)), REQ), "auth");
+  });
+});
+
+describe("ollama adapter (REST /api/chat against a mock server)", () => {
+  test("sends the schema as format with stream:false and parses the answer", async () => {
+    const m = await mockServer(() => ({ body: ollamaResponse(JSON.stringify(INTERP)) }));
+    const r = await generateStructured(OllamaAdapter.create(opts(m.url, { model: "llama3.1", apiKey: undefined })), REQ);
+    assert.deepEqual(r.value, INTERP);
+    assert.deepEqual(r.usage, { inputTokens: 70, outputTokens: 30 });
+    const [req] = m.requests;
+    assert.equal(req.url, "/api/chat");
+    assert.equal(req.headers.authorization, undefined, "no auth header for a local server");
+    assert.equal(req.body.model, "llama3.1");
+    assert.equal(req.body.stream, false);
+    assert.deepEqual(req.body.format, INTERPRETATION_SCHEMA);
+    assert.equal(req.body.options.num_predict, 16000);
+    assert.match(req.body.messages[0].content, /^SYSTEM PROMPT\n\nRespond with a single JSON object/);
+  });
+
+  test("done_reason length, unknown model and timeouts are typed; bearer key for hosted Ollama", async () => {
+    const cut = await mockServer(() => ({ body: ollamaResponse('{"statements":[', "length") }));
+    await rejects(generateStructured(OllamaAdapter.create(opts(cut.url)), REQ), "truncated");
+    assert.equal(cut.requests[0].headers.authorization, "Bearer sk-test");
+    const missing = await mockServer(() => ({ status: 404, body: { error: "model 'nope' not found" } }));
+    assert.match((await rejects(generateStructured(OllamaAdapter.create(opts(missing.url)), REQ), "bad_request")).message, /not found/);
+    const slow = await mockServer(() => ({ body: ollamaResponse("{}"), delayMs: 1500 }));
+    await rejects(generateStructured(OllamaAdapter.create(opts(slow.url, { timeoutMs: 200 })), REQ), "timeout");
+    let n = 0;
+    const flaky = await mockServer(() => (++n === 1 ? { status: 503, body: { error: "loading model" } } : { body: ollamaResponse(JSON.stringify(INTERP)) }));
+    assert.equal((await generateStructured(OllamaAdapter.create(opts(flaky.url, { maxRetries: 1 })), REQ)).attempts, 1, "transport retry is not a repair");
+    assert.equal(flaky.requests.length, 2);
+  });
+});
+
+describe("configuration and factory", () => {
+  test("the rule-based interpreter stays the default; INTERPRETER=claude keeps working", () => {
+    assert.equal(llmConfigFromEnv({}), undefined);
+    assert.equal(llmConfigFromEnv({ LLM_PROVIDER: "rules" }), undefined);
+    assert.ok(interpreterFromEnv({}) instanceof RuleInterpreter);
+    assert.ok(interpreterFromEnv({ INTERPRETER: "rules" }) instanceof RuleInterpreter);
+    assert.deepEqual(llmConfigFromEnv({ INTERPRETER: "claude", CLAUDE_MODEL: "claude-sonnet-5", ANTHROPIC_API_KEY: "k" }), { provider: "anthropic", model: "claude-sonnet-5", apiKey: "k", baseURL: undefined, timeoutMs: undefined, maxRetries: undefined });
+    const i = interpreterFromEnv({ INTERPRETER: "claude", ANTHROPIC_API_KEY: "k" });
+    assert.ok(i instanceof LlmInterpreter);
+    assert.equal(i.name, "anthropic:claude-opus-5-5");
+  });
+
+  test("LLM_* overrides apply to the selected provider; provider env vars are fallbacks", () => {
+    const env = { LLM_PROVIDER: "OpenAI", LLM_MODEL: "gpt-5-mini", OPENAI_API_KEY: "sk-o", LLM_TIMEOUT_MS: "30000", LLM_MAX_RETRIES: "0" };
+    assert.deepEqual(llmConfigFromEnv(env), { provider: "openai", model: "gpt-5-mini", apiKey: "sk-o", baseURL: undefined, timeoutMs: 30000, maxRetries: 0 });
+    assert.equal(providerConfigFromEnv("gemini", { ...env, GOOGLE_API_KEY: "g" }).model, undefined, "LLM_MODEL is not applied to an unselected provider");
+    assert.equal(providerConfigFromEnv("gemini", { GEMINI_API_KEY: "a", GOOGLE_API_KEY: "b" }).apiKey, "a");
+    assert.equal(providerConfigFromEnv("ollama", { OLLAMA_HOST: "127.0.0.1:11434" }).baseURL, "http://127.0.0.1:11434");
+    assert.deepEqual(providerConfigFromEnv("openai", { AZURE_OPENAI_ENDPOINT: "https://r.openai.azure.com", AZURE_OPENAI_API_KEY: "az", AZURE_OPENAI_DEPLOYMENT: "dep", OPENAI_API_VERSION: "2025-01-01" }).azure, { endpoint: "https://r.openai.azure.com", apiVersion: "2025-01-01" });
+    assert.deepEqual(providerConfigFromEnv("gemini", { GOOGLE_GENAI_USE_VERTEXAI: "true", GOOGLE_CLOUD_PROJECT: "p", GOOGLE_CLOUD_LOCATION: "europe-west4" }).vertex, { project: "p", location: "europe-west4" });
+  });
+
+  test("misconfiguration fails loudly with a typed config error", () => {
+    for (const env of [{ LLM_PROVIDER: "gpt" }, { LLM_PROVIDER: "openai", LLM_TIMEOUT_MS: "soon" }, { LLM_PROVIDER: "openai-compatible", LLM_STRUCTURED_OUTPUT: "yaml" }]) {
+      assert.throws(() => llmConfigFromEnv(env), (e: unknown) => e instanceof LlmError && e.kind === "config");
+    }
+    assert.throws(() => createLlm({ provider: "openai-compatible", model: "m" }), (e: unknown) => e instanceof LlmError && e.kind === "config" && /LLM_BASE_URL/.test(e.message));
+    assert.throws(() => createLlm({ provider: "openai-compatible", baseURL: "http://x" }), (e: unknown) => e instanceof LlmError && e.kind === "config" && /LLM_MODEL/.test(e.message));
+  });
+
+  test("createLlm builds every provider's adapter with the requested model id verbatim", () => {
+    const cases = [
+      [{ provider: "anthropic", apiKey: "k" }, "anthropic", "claude-opus-5-5"],
+      [{ provider: "openai", apiKey: "k", model: "gpt-5" }, "openai", "gpt-5"],
+      [{ provider: "openai", apiKey: "k", model: "dep", azure: { endpoint: "https://r.openai.azure.com" } }, "openai", "dep"],
+      [{ provider: "gemini", apiKey: "k" }, "gemini", "gemini-2.5-flash"],
+      [{ provider: "ollama" }, "ollama", "llama3.1"],
+      [{ provider: "openai-compatible", baseURL: "https://api.groq.com/openai/v1", model: "llama-3.3-70b-versatile", apiKey: "k" }, "openai-compatible", "llama-3.3-70b-versatile"],
+    ] as const;
+    for (const [cfg, provider, model] of cases) {
+      const a = createLlm(cfg as any);
+      assert.deepEqual([a.provider, a.model], [provider, model]);
+    }
+  });
+
+  test("the comparison harness skips unconfigured providers with a reason", async () => {
+    const { configs, skipped } = await configuredProviders({ OPENAI_API_KEY: "sk", OLLAMA_HOST: "127.0.0.1:1" });
+    assert.deepEqual(configs.map((c) => c.provider), ["openai"]);
+    assert.deepEqual(skipped.map((s) => s.provider), ["anthropic", "gemini", "ollama", "openai-compatible"]);
+    assert.ok(skipped.every((s) => s.reason.length > 0));
+  });
+});
+
+describe("a model cannot widen spending authority", () => {
+  test("schema-valid output that smuggles spending terms into a preference is rejected by validateInterpretation", async () => {
+    const smuggled = { statements: [st({ text: "I prefer hourly forecasts.", role: "preference", category: "WeatherReport", criterion: { leftOperand: "includesHourlyForecast", operator: "eq", rightOperand: "true", unit: null }, weight: 0.5, authorization: { currency: "USDC", totalLimit: "500", maxPerTransaction: null, approvedSellersOnly: false, validDays: 365 } })], unrecognized: [] };
+    const m = await mockServer(() => ({ body: openaiCompletion({ content: JSON.stringify(smuggled) }) }));
+    const interp = await createInterpreter(OpenAIAdapter.create(opts(m.url))).interpret("I prefer hourly forecasts.");
+    const layout = new PodLayout("https://pod.example/alice/");
+    const n = new CommonGround(new PodClient(), layout, []).negotiate(interp, { meanings: [], preferences: [], mandates: [], ignored: [] }, layout.webId, { approvedSellers: [], agentIds: ["urn:a"], schemesFor: () => ["x402"] });
+    assert.ok(n.notes.some((x) => /Rejected interpreter output: .*only authorization statements may carry spending terms/.test(x)));
+    assert.equal(n.proposals.length, 0, "nothing is proposed from the smuggling statement");
+
+    // The harness reports the same thing for every interpreter.
+    const c = CASES.find((x) => x.id === "smuggle-preference")!;
+    assert.equal(assess(c, interp).validationErrors.length, 1);
+    assert.deepEqual(assess(c, await new RuleInterpreter().interpret(c.text)).invariantViolations, []);
+  });
+});
+
+describe("two agents on different providers share one Pod", () => {
+  let css: { url: string; proc: ChildProcess };
+  before(async () => { css = await startCss(); });
+  after(() => { css.proc.kill(); });
+
+  test("a meaning agreed through a Claude-backed agent is reused by a Gemini-backed agent without asking again", async () => {
+    const anthropic = await mockServer(() => ({ body: anthropicMessage(JSON.stringify(INTERP)) }));
+    const gemini = await mockServer(() => ({ body: geminiResponse(JSON.stringify({ ...INTERP, statements: INTERP.statements.slice(0, 2) })) }));
+    const e = await startEnvironment({ podUrl: css.url });
+    try {
+      const claudeAgent = e.assistant(AGENT_1, { interpreter: createInterpreter({ provider: "anthropic", apiKey: "k", baseURL: anthropic.url, maxRetries: 0 }) });
+      const geminiAgent = e.assistant(AGENT_2, { interpreter: createInterpreter({ provider: "gemini", apiKey: "k", baseURL: gemini.url, maxRetries: 0 }) });
+      const approved = e.registry.list().map((s) => s.webId);
+
+      const { ctx, result } = await claudeAgent.understand(REQ.user, approved);
+      assert.deepEqual(result.questions.map((q) => q.term), ["current"]);
+      const { confirmed } = await claudeAgent.confirm([...result.proposals, ...claudeAgent.answer(result.questions[0], 0, ctx)], e.device);
+      assert.deepEqual(confirmed.map((r) => r.kind).sort(), ["mandate", "meaning", "requirement"]);
+
+      const second = (await geminiAgent.understand("Get me a current Berlin weather report.", approved)).result;
+      assert.equal(second.questions.length, 0, "no re-asking across providers");
+      assert.ok(second.reused.some((r) => r.kind === "meaning" && r.term === "current"));
+      assert.equal(gemini.requests.length, 1);
+    } finally {
+      await e.close();
+    }
+  });
+});
