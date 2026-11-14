@@ -7,15 +7,18 @@
     "demo": "tsx src/demo/run-demo.ts",
     "demo:interactive": "tsx src/demo/run-demo.ts --interactive",
     "proxy": "tsx src/proxy/cli.ts",
+    "compare:interpreters": "tsx src/llm/compare.ts",
     "test":"tsx --test --test-concurrency=1 test/*.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "license": "SEE LICENSE IN LICENSE.md",
   "dependencies": {
     "@anthropic-ai/sdk": "^1.8.0",
+    "@google/genai": "2.32.0",
     "@solid/community-server": "^7.3.0",
     "@zazuko/env": "^2.5.3",
     "n3": "^2.13.12",
+    "openai": "7.46.0",
     "rdf-validate-shacl": "^0.6.5",
     "viem": "^2.57.19"
   },

@@ -11,8 +11,7 @@ import { PodClient } from "../pod/PodClient.js";
 import { PodLayout } from "../pod/layout.js";
 import { walletToTurtle } from "../pod/wallet.js";
 import { ApprovalDevice, autoApprove, type Decider } from "../grounding/approval.js";
-import { RuleInterpreter } from "../grounding/ruleInterpreter.js";
-import { ClaudeInterpreter } from "../grounding/claudeInterpreter.js";
+import { interpreterFromEnv } from "../grounding/llmInterpreter.js";
 import type { Interpreter } from "../grounding/interpretation.js";
 import { TrustRegistry } from "../trust/registry.js";
 import { startFacilitator, type FacilitatorSim } from "../payments/sim/facilitator.js";
@@ -64,8 +63,9 @@ export async function startCss(): Promise<{ url: string; proc: ChildProcess }> {
   throw new Error("Community Solid Server did not start: " + stderr);
 }
 
+/** Rule-based unless LLM_PROVIDER (or legacy INTERPRETER=claude) selects a provider; see docs/llm-providers.md. */
 export function defaultInterpreter(): Interpreter {
-  return process.env.INTERPRETER === "claude" ? new ClaudeInterpreter() : new RuleInterpreter();
+  return interpreterFromEnv();
 }
 
 export async function startEnvironment(opts: { podUrl?: string; decider?: Decider; authorizationTtlSeconds?: number; ledgerPath?: string } = {}): Promise<Environment> {
