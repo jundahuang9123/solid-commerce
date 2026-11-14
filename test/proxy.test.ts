@@ -160,7 +160,7 @@ describe("402 proxy", () => {
       assert.notEqual(seen["x-forwarded-for"], "6.6.6.6");
       assert.equal(seen["x-forwarded-proto"], "http");
       assert.ok(seen["x-forwarded-host"]);
-      assert.deepEqual(charges(proxy), { x402: 0, l402: 0, "card-psp": 0, [scheme]: { x402: 1, l402: 10, "card-psp": 3 }[scheme] });
+      assert.deepEqual(charges(proxy), { x402: 0, l402: 0, "card-psp": 0, [scheme]: ({ x402: 1, l402: 10, "card-psp": 3 } as Record<string, number>)[scheme] });
       assert.equal(proxy.deliveries, 1);
     }
   });
@@ -216,7 +216,7 @@ describe("402 proxy", () => {
       assert.deepEqual([...concurrent, again].map((r) => r.status), [200, 200, 200, 200], scheme);
       assert.equal(upstream.hits, 4, "each presentation re-delivers");
       assert.equal(signer.payments - paymentsBefore, 1);
-      assert.deepEqual(charges(proxy), { x402: 0, l402: 0, "card-psp": 0, [scheme]: { x402: 1, l402: 10, "card-psp": 3 }[scheme] }, `${scheme}: one charge`);
+      assert.deepEqual(charges(proxy), { x402: 0, l402: 0, "card-psp": 0, [scheme]: ({ x402: 1, l402: 10, "card-psp": 3 } as Record<string, number>)[scheme] }, `${scheme}: one charge`);
       assert.equal(proxy.settlements, 1);
     }
   });
