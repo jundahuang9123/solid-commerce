@@ -21,6 +21,9 @@ function writer(base: string) {
 
 export interface OfferEvaluation { offerId: string; version: number; seller: string; sellerName?: string; acceptable: boolean; score: number; reasons: string[]; price?: string; currency?: string }
 
+/** FulfilmentPending and Cancelled apply to physical orders, which are delivered after payment. */
+export type DeliveryStatus = "Delivered" | "NonCompliant" | "NotDelivered" | "FulfilmentPending" | "Cancelled";
+
 export interface AssistantEvidence {
   docUrl: string;
   transactionId: string;
@@ -37,7 +40,9 @@ export interface AssistantEvidence {
   receipt?: unknown;
   challenge?: unknown;               // the seller's payment challenge (public); lets a later session recover delivery
   recovers?: string;                 // evidence document of the transaction being recovered
-  delivery?: { status: "Delivered" | "NonCompliant" | "NotDelivered"; checks: string[]; contentDigest?: string };
+  delivery?: { status: DeliveryStatus; checks: string[]; contentDigest?: string };
+  checkoutSession?: string;          // ACP-style checkout session the purchase completed
+  fulfilment?: string;               // document tracking a physical order (see fulfilmentEvidenceToTurtle)
   status: string;
   startedAt: string;
   endedAt?: string;
@@ -77,6 +82,8 @@ export async function assistantEvidenceToTurtle(e: AssistantEvidence): Promise<s
   if (e.ledgerDoc) add(t, sc("authorization"), nn(e.ledgerDoc + "#entry"));
   if (e.receipt) add(t, sc("receipt"), JSON.stringify(e.receipt));
   if (e.challenge) add(t, sc("challenge"), JSON.stringify(e.challenge));
+  if (e.checkoutSession) add(t, sc("checkoutSession"), nn(e.checkoutSession));
+  if (e.fulfilment) add(t, sc("fulfilment"), nn(e.fulfilment + "#order"));
   if (e.delivery) {
     const d = `${e.docUrl}#delivery`;
     add(t, sc("deliveryOutcome"), nn(d));
@@ -116,4 +123,91 @@ export async function ledgerEvidenceToTurtle(e: LedgerEvidence): Promise<string>
   return end();
 }
 
-const STATUS_IRI: Record<string, string> = { authorized: "Reserved", pending: "Pending", settled: "Settled", released: "Released", rejected: "Rejected" };
+const STATUS_IRI: Record<string, string> = { authorized: "Reserved", pending: "Pending", settled: "Settled", released: "Released", rejected: "Rejected", refunded: "Refunded" };
+
+// ------------------------------------------------------------------ physical fulfilment
+
+export type OrderState = "created" | "shipped" | "delivered" | "canceled" | "refunded";
+
+export interface FulfilmentEvidence {
+  docUrl: string;
+  transactionId: string;
+  transactionDoc: string;            // the assistant's evidence document for the purchase
+  orderId: string;
+  orderUrl: string;
+  merchant: string;
+  merchantName?: string;
+  orderStatus: OrderState;
+  items: Array<{ id: string; quantity: number }>;
+  total: string;
+  currency: string;
+  deliveryAddress: string;           // IRI of the schema:PostalAddress in the Pod
+  events: Array<{ status: OrderState; at: string; detail?: string }>;
+  paymentStatus?: string;            // the gateway ledger's view, kept apart from the order state
+  delivery: { status: DeliveryStatus; checks: string[] };
+  /** The user's verdict on the goods, signed on the approval device. */
+  acceptance?: { verdict: "Delivered" | "NonCompliant"; checks: string[]; by: string; at: string; keyId: string; termsDigest: string; signature: string };
+  updatedAt: string;
+}
+
+/** schema:OrderStatus individuals per order state. A refund is additionally marked sc:Refunded. */
+const ORDER_STATUS: Record<OrderState, string> = { created: "OrderProcessing", shipped: "OrderInTransit", delivered: "OrderDelivered", canceled: "OrderCancelled", refunded: "OrderCancelled" };
+
+/**
+ * One document per physical order, rewritten as it moves through
+ * created -> shipped -> delivered (or canceled / refunded). Payment status and
+ * delivery outcome are separate properties, so "paid, not shipped" can never
+ * be read as "payment failed".
+ */
+export async function fulfilmentEvidenceToTurtle(e: FulfilmentEvidence): Promise<string> {
+  const { add, end } = writer(e.docUrl);
+  const o = `${e.docUrl}#order`;
+  add(o, NS.rdf + "type", nn(NS.schema + "Order"));
+  add(o, NS.schema + "orderNumber", e.orderId);
+  add(o, NS.schema + "url", nn(e.orderUrl));
+  add(o, NS.schema + "seller", nn(e.merchant));
+  if (e.merchantName) add(o, NS.schema + "name", e.merchantName);
+  add(o, NS.schema + "orderStatus", nn(NS.schema + ORDER_STATUS[e.orderStatus]));
+  if (e.orderStatus === "refunded") add(o, sc("status"), nn(sc("Refunded")));
+  add(o, sc("transactionId"), e.transactionId);
+  add(o, NS.prov + "wasGeneratedBy", nn(e.transactionDoc + "#tx"));
+  add(o, sc("amount"), e.total);
+  add(o, sc("currency"), nn(sc(e.currency)));
+  if (e.paymentStatus) add(o, sc("paymentStatus"), nn(sc(STATUS_IRI[e.paymentStatus] ?? e.paymentStatus)));
+  e.items.forEach((it, i) => {
+    const n = `${e.docUrl}#item-${i + 1}`;
+    add(o, NS.schema + "orderedItem", nn(n));
+    add(n, NS.rdf + "type", nn(NS.schema + "OrderItem"));
+    add(n, NS.schema + "orderedItem", nn(it.id));
+    add(n, NS.schema + "orderQuantity", it.quantity);
+  });
+  const p = `${e.docUrl}#parcel`;
+  add(o, NS.schema + "orderDelivery", nn(p));
+  add(p, NS.rdf + "type", nn(NS.schema + "ParcelDelivery"));
+  add(p, NS.schema + "deliveryAddress", nn(e.deliveryAddress));
+  e.events.forEach((ev, i) => {
+    const n = `${e.docUrl}#event-${i + 1}`;
+    add(p, sc("trackingEvent"), nn(n));
+    add(n, NS.schema + "orderStatus", nn(NS.schema + ORDER_STATUS[ev.status]));
+    add(n, NS.prov + "atTime", lit(ev.at, xsd("dateTime")));
+    if (ev.detail) add(n, NS.rdfs + "comment", ev.detail);
+  });
+  const d = `${e.docUrl}#delivery`;
+  add(o, sc("deliveryOutcome"), nn(d));
+  add(d, sc("status"), nn(sc(e.delivery.status)));
+  for (const c of e.delivery.checks) add(d, NS.rdfs + "comment", c);
+  if (e.acceptance) {
+    const a = `${e.docUrl}#acceptance`;
+    add(d, sc("acceptance"), nn(a));
+    add(a, NS.rdf + "type", nn(sc("DeliveryAcceptance")));
+    add(a, sc("verdict"), nn(sc(e.acceptance.verdict)));
+    for (const c of e.acceptance.checks) add(a, NS.rdfs + "comment", c);
+    add(a, sc("confirmedBy"), nn(e.acceptance.by));
+    add(a, NS.prov + "endedAtTime", lit(e.acceptance.at, xsd("dateTime")));
+    add(a, sc("keyId"), e.acceptance.keyId);
+    add(a, sc("termsDigest"), e.acceptance.termsDigest);
+    add(a, sc("signature"), e.acceptance.signature);
+  }
+  add(o, NS.dct + "modified", lit(e.updatedAt, xsd("dateTime")));
+  return end();
+}

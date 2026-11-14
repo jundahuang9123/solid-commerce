@@ -3,8 +3,12 @@
  * refinements, compares offers, and drives the HTTP 402 flow:
  *   402 -> gateway authorization -> protected signer -> retry with credential.
  * It holds no keys and has no spending authority of its own.
+ *
+ * Shops without HTTP 402 (ACP-style checkout for physical goods) go through
+ * purchaseViaCheckout (./checkoutPurchase.ts): same grounding, ranking,
+ * gateway, signer and evidence, with a checkout session instead of a 402.
  */
-import type { Offer, PurchaseIntention, SpendingMandate } from "../model.js";
+import { SCHEME_CURRENCY, type Criterion, type Offer, type PreferenceRecord, type PurchaseIntention, type SpendingMandate } from "../model.js";
 import { PodClient } from "../pod/PodClient.js";
 import { PodLayout } from "../pod/layout.js";
 import { readWallet } from "../pod/wallet.js";
@@ -22,6 +26,19 @@ import { checkDelivery } from "./delivery.js";
 import { b64json, postJson } from "../util/http.js";
 import { newId, type Signed } from "../util/crypto.js";
 import { fmt } from "../util/money.js";
+import type { WalletDescriptor } from "../pod/wallet.js";
+import { CheckoutPurchaser, type CheckoutPurchaseRequest, type OrderTracking } from "./checkoutPurchase.js";
+
+/** Everything a purchase path needs once grounding and the mandate are loaded. */
+export interface PreparedPurchase {
+  notes: string[];
+  mandate: SpendingMandate;
+  wallet: WalletDescriptor;
+  intention: PurchaseIntention;
+  requirements: Array<{ record: PreferenceRecord; criterion: Criterion }>;
+  preferences: Array<{ record: PreferenceRecord; criterion: Criterion }>;
+  groundedBy: string[];
+}
 
 export interface AssistantConfig {
   agentId: string;
@@ -31,11 +48,13 @@ export interface AssistantConfig {
   enrolledApprovalKeys: JsonWebKey[];
   gatewayUrl: string;
   catalog: string[];                 // offer URLs of known sellers
+  checkoutMerchants?: string[];      // API base URLs of known ACP-style checkout merchants
   log?: (line: string) => void;
   deliveryRetries?: number;
 }
 
-export type PurchaseStatus = "completed" | "completed_noncompliant" | "paid_not_delivered" | "payment_failed" | "blocked" | "no_acceptable_offer";
+/** "fulfilment_pending": paid for physical goods, which arrive later (track with trackOrder). */
+export type PurchaseStatus = "completed" | "completed_noncompliant" | "paid_not_delivered" | "payment_failed" | "blocked" | "no_acceptable_offer" | "fulfilment_pending";
 
 export interface PurchaseResult {
   status: PurchaseStatus;
@@ -51,6 +70,7 @@ export interface PurchaseResult {
   receipt?: Signed<Receipt>;
   delivery?: { status: string; checks: string[] };
   evidence?: string;
+  tracking?: OrderTracking;          // physical orders only
   notes: string[];
 }
 
@@ -69,7 +89,7 @@ export class ShoppingAssistant {
     const ctx = await this.cg.load();
     const interp = await this.cfg.interpreter.interpret(text);
     const wallet = await readWallet(this.cfg.pod, this.cfg.layout.wallet);
-    const schemesFor = (cur: string) => wallet.schemes.filter((s) => ({ x402: "USDC", l402: "SAT", "card-psp": "EUR" })[s] === cur);
+    const schemesFor = (cur: string) => wallet.schemes.filter((s) => SCHEME_CURRENCY[s] === cur);
     const result = this.cg.negotiate(interp, ctx, this.cfg.layout.webId, { approvedSellers, agentIds: [this.cfg.agentId], schemesFor });
     return { ctx, result };
   }
@@ -87,7 +107,12 @@ export class ShoppingAssistant {
 
   // ------------------------------------------------------------ purchasing
 
-  async purchase(req: { text: string; category: string; subject?: string; mandateId: string; hooks?: { afterEvaluation?: () => Promise<void> } }): Promise<PurchaseResult> {
+  /**
+   * Shared start of every purchase: confirmed common ground, the mandate, the
+   * wallet, and the intention written to the Pod. Unconfirmed or tampered
+   * records are ignored and noted.
+   */
+  async prepare(req: { text: string; category: string; subject?: string; mandateId: string }): Promise<PreparedPurchase | PurchaseResult> {
     const notes: string[] = [];
     const ctx = await this.cg.load();
     for (const ig of ctx.ignored) notes.push(`Ignored unconfirmed or tampered record ${ig.id}: ${ig.reason}`);
@@ -103,6 +128,13 @@ export class ShoppingAssistant {
     const preferences = applicable.filter((p) => p.kind === "preference").map((record) => ({ record, criterion: this.cg.effectiveCriterion(ctx, record) }));
     const groundedBy = [...new Set([...applicable.map((p) => p.id), ...applicable.flatMap((p) => (p.groundedIn ? [p.groundedIn] : []))])];
     this.log(`Applying ${requirements.length} requirement(s) and ${preferences.length} preference(s) from the Pod`);
+    return { notes, mandate, wallet, intention, requirements, preferences, groundedBy };
+  }
+
+  async purchase(req: { text: string; category: string; subject?: string; mandateId: string; hooks?: { afterEvaluation?: () => Promise<void> } }): Promise<PurchaseResult> {
+    const prep = await this.prepare(req);
+    if ("status" in prep) return prep;
+    const { notes, mandate, wallet, intention, requirements, preferences, groundedBy } = prep;
 
     const rank = async () => evaluateOffers(await this.fetchOffers(), { category: req.category, subject: req.subject, mandate, walletSchemes: wallet.schemes, requirements, preferences });
     let ranked = await rank();
@@ -230,6 +262,19 @@ export class ShoppingAssistant {
     }
     return out;
   }
+
+  // ------------------------------------------------------------ checkout merchants (physical goods)
+
+  /** Buy from ACP-style checkout merchants. See ./checkoutPurchase.ts. */
+  purchaseViaCheckout(req: CheckoutPurchaseRequest): Promise<PurchaseResult> { return this.checkout.purchase(req); }
+  /** Refresh order and payment state from the merchant and the gateway; updates the fulfilment evidence. */
+  trackOrder(t: OrderTracking): Promise<OrderTracking> { return this.checkout.track(t); }
+  /** Record the user's verdict on delivered goods, signed on the approval device. */
+  acceptDelivery(t: OrderTracking, observed: Record<string, string>, device: ApprovalDevice): Promise<OrderTracking> { return this.checkout.accept(t, observed, device); }
+  /** Cancel before shipment. Budget returns only once the gateway sees the refund at the PSP. */
+  cancelOrder(t: OrderTracking): Promise<OrderTracking> { return this.checkout.cancel(t); }
+
+  private get checkout() { return new CheckoutPurchaser(this.cfg, this, this.log); }
 
   private async finish(evidence: AssistantEvidence, result: PurchaseResult): Promise<PurchaseResult> {
     if (!evidence.transactionId) { evidence.transactionId = newId("tx-"); evidence.docUrl = `${this.cfg.layout.transactions}${evidence.transactionId}.ttl`; result.transactionId ??= evidence.transactionId; }

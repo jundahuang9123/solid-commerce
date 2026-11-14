@@ -9,10 +9,17 @@
  * ever see its public key (enrolled out of band).
  */
 import { Ed25519Key, digestOf, verifyJsonSignature, keyIdOf } from "../util/crypto.js";
-import { confirmableTerms, type GroundRecord } from "../model.js";
+import { confirmableTerms, type Confirmation, type GroundRecord } from "../model.js";
 import { normalizeRecord } from "../rdf/records.js";
 
-export type Decider = (summary: string, record: GroundRecord) => Promise<boolean>;
+/**
+ * A user's verdict on physically delivered goods (e.g. "the soles are not
+ * replaceable after all"). Signed on the device like a record confirmation,
+ * so the evidence shows the user, not an agent, made the call. It grants nothing.
+ */
+export interface DeliveryAttestation { kind: "deliveryAcceptance"; owner: string; transactionId: string; orderId: string; verdict: "Delivered" | "NonCompliant"; checks: string[] }
+
+export type Decider = (summary: string, record: GroundRecord | DeliveryAttestation) => Promise<boolean>;
 
 export const autoApprove: Decider = async () => true;
 
@@ -44,6 +51,13 @@ export class ApprovalDevice {
   get keyId() { return this.key.keyId; }
   setDecider(d: Decider) { this.decide = d; }
 
+  /** Ask the user to sign a delivery verdict. Returns the signature, or undefined if they decline. */
+  async attest(a: DeliveryAttestation): Promise<Confirmation | undefined> {
+    if (a.owner !== this.userWebId) throw new Error("Device only attests for its user");
+    if (!(await this.decide(summarizeAttestation(a), a))) return undefined;
+    return { by: this.userWebId, at: new Date().toISOString(), keyId: this.key.keyId, termsDigest: digestOf(a), signature: this.key.signJson(a) };
+  }
+
   /** Ask the user. Returns the confirmed record, or undefined if rejected. */
   async review<T extends GroundRecord>(proposal: T): Promise<T | undefined> {
     if (proposal.owner !== this.userWebId) throw new Error("Device only approves records owned by its user");
@@ -63,6 +77,15 @@ export class ApprovalDevice {
       },
     };
   }
+}
+
+export function summarizeAttestation(a: DeliveryAttestation): string {
+  return [`DELIVERY ${a.verdict === "Delivered" ? "ACCEPTED" : "NOT AS AGREED"}: order ${a.orderId} (transaction ${a.transactionId})`, ...a.checks.map((c) => "  " + c)].join("\n");
+}
+
+export function verifyAttestation(a: DeliveryAttestation, c: Confirmation, enrolledKeys: JsonWebKey[]): boolean {
+  const key = enrolledKeys.find((k) => keyIdOf(k) === c.keyId);
+  return Boolean(key && c.by === a.owner && c.termsDigest === digestOf(a) && verifyJsonSignature(a, c.signature, key));
 }
 
 export type ConfirmationCheck = { ok: true } | { ok: false; reason: string };

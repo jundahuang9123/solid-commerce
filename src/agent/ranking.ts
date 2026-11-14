@@ -40,14 +40,20 @@ export function offerValue(offer: Offer, leftOperand: string): unknown {
   }
 }
 
-export interface Evaluated { signed: Signed<Offer>; evaluation: OfferEvaluation; option?: Offer["prices"][number] }
+/**
+ * Anything carrying offer terms: a seller-signed offer, or a checkout candidate
+ * (src/checkout) whose terms the gateway re-reads from the merchant before paying.
+ */
+export type OfferLike = { payload: Offer };
 
-export function evaluateOffers(
-  offers: Signed<Offer>[],
+export interface Evaluated<S extends OfferLike = Signed<Offer>> { signed: S; evaluation: OfferEvaluation; option?: Offer["prices"][number] }
+
+export function evaluateOffers<S extends OfferLike = Signed<Offer>>(
+  offers: S[],
   input: { category: string; subject?: string; mandate: SpendingMandate; walletSchemes: string[]; requirements: Array<{ record: PreferenceRecord; criterion: Criterion }>; preferences: Array<{ record: PreferenceRecord; criterion: Criterion }> },
-): Evaluated[] {
+): Evaluated<S>[] {
   const { mandate } = input;
-  const out = offers.map((signed): Evaluated => {
+  const out = offers.map((signed): Evaluated<S> => {
     const o = signed.payload;
     const reasons: string[] = [];
     let acceptable = true;

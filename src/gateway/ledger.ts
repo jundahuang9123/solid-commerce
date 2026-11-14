@@ -8,8 +8,8 @@
  */
 import { DatabaseSync } from "node:sqlite";
 
-export type TxStatus = "authorized" | "pending" | "settled" | "released" | "rejected";
-/** Statuses that consume budget. "pending" counts until reconciled. */
+export type TxStatus = "authorized" | "pending" | "settled" | "released" | "rejected" | "refunded";
+/** Statuses that consume budget. "pending" counts until reconciled; "refunded" (confirmed by the rail) does not. */
 export const COMMITTED: TxStatus[] = ["authorized", "pending", "settled"];
 
 export interface TxRow {
@@ -79,6 +79,11 @@ export class Ledger {
 
   unresolved(): TxRow[] {
     return this.db.prepare("SELECT * FROM transactions WHERE status IN ('authorized','pending')").all() as unknown as TxRow[];
+  }
+
+  /** Settled checkout purchases, which can still be refunded (cancellation, return). */
+  refundable(): TxRow[] {
+    return this.db.prepare("SELECT * FROM transactions WHERE status = 'settled' AND scheme = 'acp-delegated'").all() as unknown as TxRow[];
   }
 
   event(txId: string, type: string, detail?: string) {
