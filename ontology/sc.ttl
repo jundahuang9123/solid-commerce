@@ -1,0 +1,194 @@
+@prefix sc:     <https://w3id.org/solid-commerce#> .
+@prefix rdf:    <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs:   <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix owl:    <http://www.w3.org/2002/07/owl#> .
+@prefix xsd:    <http://www.w3.org/2001/XMLSchema#> .
+@prefix skos:   <http://www.w3.org/2004/02/skos/core#> .
+@prefix prov:   <http://www.w3.org/ns/prov#> .
+@prefix odrl:   <http://www.w3.org/ns/odrl/2/> .
+@prefix schema: <https://schema.org/> .
+@prefix dct:    <http://purl.org/dc/terms/> .
+
+# -----------------------------------------------------------------------------
+# Solid Commerce application profile (v0.1, EXPERIMENTAL)
+#
+# A deliberately small vocabulary. It reuses ODRL 2.2 (spending mandates),
+# SKOS (agreed meanings), PROV-O (provenance), and schema.org (offers). It only
+# adds terms where those vocabularies leave a gap.
+#
+# The namespace IRI is a placeholder. It is not registered at w3id.org and is
+# not a standard.
+# -----------------------------------------------------------------------------
+
+sc: a owl:Ontology ;
+    dct:title "Solid Commerce application profile"@en ;
+    dct:description "Minimal terms for grounded, user-controlled AI purchasing with HTTP 402 payments."@en ;
+    owl:versionInfo "0.1.0" ;
+    rdfs:comment "This is also used as an ODRL profile IRI (odrl:profile sc:)."@en .
+
+# ---------------------------------------------------------------- Common ground
+
+sc:AgreedMeaning a owl:Class ;
+    rdfs:subClassOf skos:Concept ;
+    rdfs:label "Agreed meaning"@en ;
+    rdfs:comment "An interpretation of a term negotiated between user and agent, scoped to a context (e.g. a product category). It grounds later decisions."@en .
+
+sc:term a owl:DatatypeProperty ;
+    rdfs:domain sc:AgreedMeaning ;
+    rdfs:comment "The user's surface term, e.g. \"current\" or \"repairable\"."@en .
+
+sc:scope a owl:ObjectProperty ;
+    rdfs:comment "The category or context in which a meaning, preference or requirement applies, e.g. sc:WeatherReport."@en .
+
+sc:operationalizedAs a owl:ObjectProperty ;
+    rdfs:domain sc:AgreedMeaning ;
+    rdfs:range sc:Criterion ;
+    rdfs:comment "An executable criterion that implements the agreed meaning."@en .
+
+# --------------------------------------------------------- Intentions & criteria
+
+sc:PurchaseIntention a owl:Class ;
+    rdfs:label "Purchase intention"@en ;
+    rdfs:comment "What the user wants to obtain, e.g. a current Berlin weather report."@en .
+
+sc:wants a owl:ObjectProperty ; rdfs:domain sc:PurchaseIntention ;
+    rdfs:comment "The product category sought."@en .
+sc:subject a owl:DatatypeProperty ; rdfs:domain sc:PurchaseIntention ;
+    rdfs:comment "Free-text subject parameter of the intention, e.g. a city."@en .
+sc:governedBy a owl:ObjectProperty ; rdfs:domain sc:PurchaseIntention ; rdfs:range sc:SpendingMandate .
+
+sc:Criterion a owl:Class ;
+    rdfs:comment "A machine-checkable condition over an offer or delivered item: leftOperand operator rightOperand [unit]. Reuses ODRL operators."@en .
+sc:leftOperand a owl:ObjectProperty ; rdfs:domain sc:Criterion .
+sc:operator a owl:ObjectProperty ; rdfs:domain sc:Criterion ;
+    rdfs:comment "One of odrl:eq, odrl:lt, odrl:lteq, odrl:gt, odrl:gteq, odrl:isAnyOf."@en .
+sc:rightOperand a owl:DatatypeProperty ; rdfs:domain sc:Criterion .
+sc:unit a owl:ObjectProperty ; rdfs:domain sc:Criterion .
+
+sc:Preference a owl:Class ;
+    rdfs:label "Preference"@en ;
+    rdfs:comment "Influences ranking only. A preference never grants a privilege (cf. ODRL Community Vocabulary Preference)."@en .
+sc:PurchaseRequirement a owl:Class ;
+    rdfs:label "Purchase requirement"@en ;
+    rdfs:comment "Mandatory condition. Offers that fail it, or cannot be shown to meet it, are not acceptable."@en .
+sc:criterion a owl:ObjectProperty ; rdfs:range sc:Criterion .
+sc:weight a owl:DatatypeProperty ; rdfs:domain sc:Preference ;
+    rdfs:comment "Relative ranking weight in [0,1]."@en .
+sc:appliesTo a owl:ObjectProperty ;
+    rdfs:comment "Category the preference / requirement applies to."@en .
+sc:groundedIn a owl:ObjectProperty ; rdfs:range sc:AgreedMeaning ;
+    rdfs:comment "The agreed meaning that the criterion operationalises."@en .
+sc:owner a owl:ObjectProperty ; rdfs:comment "WebID of the user."@en .
+sc:originalText a owl:DatatypeProperty ; rdfs:comment "Verbatim user statement."@en .
+
+# ----------------------------------------------------- Confirmation & lifecycle
+
+sc:status a owl:ObjectProperty .
+sc:RecordStatus a owl:Class .
+sc:Proposed      a sc:RecordStatus ; rdfs:comment "Suggested by an agent. Not used for decisions."@en .
+sc:UserConfirmed a sc:RecordStatus ; rdfs:comment "Accepted by the user through the protected approval channel."@en .
+sc:Rejected      a sc:RecordStatus .
+sc:Superseded    a sc:RecordStatus .
+
+sc:Confirmation a owl:Class ;
+    rdfs:subClassOf prov:Activity ;
+    rdfs:comment "A user approval made on a trusted device. The signature covers the canonical digest of the record's terms. RDF alone cannot establish consent; the signature and the enrolled approval key do."@en .
+sc:confirmation a owl:ObjectProperty ; rdfs:range sc:Confirmation .
+sc:confirmedBy a owl:ObjectProperty ; rdfs:subPropertyOf prov:wasAssociatedWith .
+sc:termsDigest a owl:DatatypeProperty ; rdfs:comment "sha-256 of the canonical JSON of the confirmed terms."@en .
+sc:signature a owl:DatatypeProperty ; rdfs:comment "Base64url Ed25519 signature."@en .
+sc:keyId a owl:DatatypeProperty .
+sc:revision a owl:DatatypeProperty ; rdfs:comment "Monotonic revision number of a record."@en .
+
+# ---------------------------------------------------------- Spending authority
+
+sc:SpendingMandate a owl:Class ;
+    rdfs:subClassOf odrl:Set ;
+    rdfs:label "Spending mandate"@en ;
+    rdfs:comment "Explicit, user-signed financial authority. It is separate from preferences: changing a preference never changes a mandate."@en .
+sc:purchase a odrl:Action ; rdfs:subClassOf odrl:Action ;
+    rdfs:comment "Action: purchase an item on behalf of the assigner."@en .
+sc:totalSpend a odrl:LeftOperand ;
+    rdfs:comment "Cumulative amount spent plus reserved under the mandate."@en .
+sc:seller a odrl:LeftOperand ; rdfs:comment "Seller WebID."@en .
+sc:paymentScheme a odrl:LeftOperand , owl:ObjectProperty .
+
+# ------------------------------------------------------------------ Payments
+
+sc:PaymentScheme a owl:Class .
+sc:X402    a sc:PaymentScheme ; rdfs:label "x402 (exact, EIP-3009)"@en .
+sc:L402    a sc:PaymentScheme ; rdfs:label "L402-style (macaroon + Lightning-style invoice)"@en .
+sc:CardPSP a sc:PaymentScheme ; rdfs:label "Card / PSP payment intent behind HTTP 402"@en .
+
+sc:Currency a owl:Class .
+sc:USDC a sc:Currency ; sc:decimals 6 .
+sc:SAT  a sc:Currency ; sc:decimals 0 .
+sc:EUR  a sc:Currency ; sc:decimals 2 .
+sc:decimals a owl:DatatypeProperty .
+
+sc:Transaction a owl:Class ; rdfs:subClassOf prov:Activity ;
+    rdfs:comment "One purchase attempt, identified by a unique transaction id (idempotency key)."@en .
+sc:transactionId a owl:DatatypeProperty .
+sc:offerConsidered a owl:ObjectProperty .
+sc:selectedOffer a owl:ObjectProperty .
+sc:authorization a owl:ObjectProperty .
+sc:receipt a owl:ObjectProperty .
+sc:deliveryOutcome a owl:ObjectProperty .
+sc:amount a owl:DatatypeProperty ; rdfs:comment "Amount in atomic units of sc:currency."@en .
+sc:currency a owl:ObjectProperty ; rdfs:range sc:Currency .
+sc:paymentReference a owl:DatatypeProperty ; rdfs:comment "Rail-level reference: tx hash, payment hash, or intent id."@en .
+sc:offerDigest a owl:DatatypeProperty .
+
+sc:TransactionStatus a owl:Class .
+sc:Reserved  a sc:TransactionStatus ; rdfs:comment "Budget reserved, payment not yet attempted."@en .
+sc:Pending   a sc:TransactionStatus ; rdfs:comment "Outcome uncertain. Still counts against the budget until reconciled."@en .
+sc:Settled   a sc:TransactionStatus .
+sc:Released  a sc:TransactionStatus ; rdfs:comment "Reservation returned to the budget; no funds moved."@en .
+sc:Rejected  a sc:TransactionStatus .
+
+sc:DeliveryStatus a owl:Class .
+sc:Delivered     a sc:DeliveryStatus .
+sc:NonCompliant  a sc:DeliveryStatus ; rdfs:comment "Delivered, but fails an agreed requirement."@en .
+sc:NotDelivered  a sc:DeliveryStatus ; rdfs:comment "Paid but nothing (valid) delivered; recoverable by re-presenting the payment proof."@en .
+
+# ----------------------------------------------------- Seller-side extensions
+
+sc:observationMaxAgeMinutes a owl:DatatypeProperty ;
+    rdfs:comment "Offer property: maximum age, in minutes, of the data at delivery."@en .
+sc:observationAgeMinutes a odrl:LeftOperand ;
+    rdfs:comment "Delivered-item property: age of the observation at delivery."@en .
+sc:coverage a owl:DatatypeProperty ; rdfs:comment "Location covered, e.g. Berlin."@en .
+sc:WeatherReport a owl:Class ; rdfs:subClassOf schema:Product .
+sc:Shoes a owl:Class ; rdfs:subClassOf schema:Product .
+sc:signingKey a owl:DatatypeProperty ; rdfs:comment "Seller's Ed25519 public key (JWK, JSON) used to sign offers."@en .
+sc:offerVersion a owl:DatatypeProperty .
+
+# ---------------------------------------------------------- Product properties
+# Offer/item properties referenced by criteria. A real deployment would map
+# these to an established product vocabulary where possible.
+
+sc:includesHourlyForecast a owl:DatatypeProperty ; rdfs:comment "Weather report includes an hourly forecast (\"true\"/\"false\")."@en .
+sc:solesReplaceable a owl:DatatypeProperty ; rdfs:comment "Shoe soles can be replaced."@en .
+sc:manufacturerRepairService a owl:DatatypeProperty ; rdfs:comment "Manufacturer offers a repair service."@en .
+sc:price a odrl:LeftOperand ; rdfs:comment "Offer price in atomic units of the mandate currency."@en .
+sc:minute rdfs:seeAlso <http://qudt.org/vocab/unit/MIN> .
+
+# ------------------------------------------------------------------ Evidence
+
+sc:OfferEvaluation a owl:Class ; rdfs:subClassOf prov:Entity ;
+    rdfs:comment "How one offer was judged against the confirmed common ground: acceptable, score, reasons."@en .
+sc:acceptable a owl:DatatypeProperty ; rdfs:range xsd:boolean .
+sc:score a owl:DatatypeProperty ; rdfs:range xsd:decimal .
+sc:contentDigest a owl:DatatypeProperty ; rdfs:comment "sha-256 of the delivered content."@en .
+sc:challenge a owl:DatatypeProperty ; rdfs:comment "JSON of the seller's HTTP 402 payment challenge that was paid (public information)."@en .
+sc:PaymentAuthorization a owl:Class ; rdfs:subClassOf prov:Entity ;
+    rdfs:comment "Gateway ledger entry: a single-purpose, signed, expiring authorization and its settlement state."@en .
+sc:authorizationId a owl:DatatypeProperty .
+sc:signedAuthorization a owl:DatatypeProperty ; rdfs:comment "JSON envelope signed by the gateway (Ed25519)."@en .
+
+# ------------------------------------------------------------------- Wallet
+
+sc:WalletDescriptor a owl:Class ;
+    rdfs:comment "Public description of how the user can pay. Never contains keys, tokens or card data."@en .
+sc:signerEndpoint a owl:ObjectProperty .
+sc:x402Payer a owl:DatatypeProperty ; rdfs:comment "Public EVM address of the self-custodial x402 wallet."@en .

@@ -1,0 +1,265 @@
+/**
+ * Authorization and transaction gateway: deterministic code, no LLM.
+ *
+ * POST /authorize                  check mandate + seller + offer + challenge, reserve budget, sign an authorization
+ * POST /transactions/:id/outcome   agent reports paid / failed / unknown (with the seller's signed receipt)
+ * POST /reconcile                  resolve authorized/pending transactions against the payment rails
+ * GET  /transactions/:id           ledger row and event history
+ * GET  /budget?mandate=<iri>       limit, committed, settled, available
+ *
+ * Authorization is bound to seller, offer version and digest, resource,
+ * scheme, amount, currency, payee, the exact challenge, an expiry and a unique
+ * transaction id.
+ */
+import type { Offer, SpendingMandate } from "../model.js";
+import { PodClient } from "../pod/PodClient.js";
+import { PodLayout } from "../pod/layout.js";
+import { parseRecord } from "../rdf/records.js";
+import { verifyConfirmation } from "../grounding/approval.js";
+import { TrustRegistry, offerDigest } from "../trust/registry.js";
+import { Ed25519Key, digestOf, newId, signEnvelope, verifyEnvelope, type Signed } from "../util/crypto.js";
+import { json, serve, type RunningServer } from "../util/http.js";
+import { toAtomic, fmt } from "../util/money.js";
+import type { OfferRef, PaymentAuthorization, PaymentOption, Receipt } from "../payments/types.js";
+import { nonceFor } from "../payments/schemes/x402.js";
+import { Ledger, type TxRow } from "./ledger.js";
+import { ledgerEvidenceToTurtle } from "../rdf/evidence.js";
+
+export interface GatewayConfig {
+  pod: PodClient;
+  layout: PodLayout;
+  enrolledApprovalKeys: JsonWebKey[];
+  registry: TrustRegistry;
+  rails: { facilitatorUrl: string; lightningUrl: string; pspUrl: string };
+  payers: { x402?: string };            // public payer identifiers, for reconciliation
+  ledgerPath?: string;
+  authorizationTtlSeconds?: number;
+  gatewayId?: string;
+}
+
+export interface AuthorizeRequest {
+  transactionId: string;
+  agentId: string;
+  mandateId: string;
+  offer: Signed<Offer>;
+  offerRef?: OfferRef;                   // what the 402 response claimed
+  option: PaymentOption;
+}
+
+export type Rejection = { code: string; reason: string };
+
+export interface GatewayHandle extends RunningServer {
+  key: Ed25519Key;
+  ledger: Ledger;
+  reconcile(): Promise<Array<{ txId: string; status: string }>>;
+  /** Register the wallet's public x402 payer address (used to query the rail during reconciliation). */
+  setPayer(x402Address: string): void;
+}
+
+export async function startGateway(cfg: GatewayConfig): Promise<GatewayHandle> {
+  const key = Ed25519Key.generate();
+  const ledger = new Ledger(cfg.ledgerPath);
+  const ttl = cfg.authorizationTtlSeconds ?? 120;
+  const gatewayId = cfg.gatewayId ?? "urn:solid-commerce:gateway";
+
+  const reject = (code: string, reason: string): Rejection => ({ code, reason });
+
+  async function loadMandate(id: string): Promise<SpendingMandate | Rejection> {
+    const res = await cfg.pod.get(id.split("#")[0]);
+    if (!res) return reject("MANDATE_NOT_FOUND", id);
+    let rec;
+    try { rec = parseRecord(res.text, id); } catch (e) { return reject("MANDATE_INVALID", (e as Error).message); }
+    if (rec.kind !== "mandate") return reject("MANDATE_INVALID", "not a spending mandate");
+    const check = verifyConfirmation(rec, cfg.enrolledApprovalKeys);
+    if (!check.ok) return reject("MANDATE_NOT_CONFIRMED", check.reason);
+    return rec;
+  }
+
+  async function authorize(r: AuthorizeRequest): Promise<{ status: number; body: unknown }> {
+    if (!r.transactionId || !r.agentId || !r.mandateId || !r.offer || !r.option) return { status: 400, body: reject("BAD_REQUEST", "missing fields") };
+    const requestDigest = digestOf({ mandateId: r.mandateId, agentId: r.agentId, offer: offerDigest(r.offer.payload), option: r.option });
+
+    // Idempotency: same id + same request returns the same authorization; a different request is a conflict.
+    const existing = ledger.get(r.transactionId);
+    if (existing) {
+      if (existing.request_digest !== requestDigest) return { status: 409, body: reject("IDEMPOTENCY_CONFLICT", "transaction id reused for a different request") };
+      if (existing.status === "rejected") return { status: 403, body: reject("REJECTED", existing.reason ?? "") };
+      return { status: 200, body: { authorization: JSON.parse(existing.auth_json!), replayed: true, status: existing.status } };
+    }
+
+    const fail = (status: number, rj: Rejection) => {
+      // Rejections are recorded too, so the evidence trail shows blocked attempts.
+      try {
+        ledger.insert({ tx_id: r.transactionId, mandate_id: r.mandateId, agent_id: r.agentId, seller: r.offer.payload.seller ?? "?", offer_id: r.offer.payload.offerId ?? "?", offer_version: r.offer.payload.version ?? 0, scheme: r.option.scheme, amount: r.option.amount, currency: r.option.currency, request_digest: requestDigest, status: "rejected", auth_id: null, auth_json: null, rail_reference: null, payer: null, receipt_json: null, reason: `${rj.code}: ${rj.reason}`, expires_at: null });
+      } catch { /* concurrent insert with same id */ }
+      syncEvidence(r.transactionId).catch(() => {});
+      return { status, body: rj };
+    };
+
+    // 1. Mandate: user-signed, current, covers this agent and category
+    const m = await loadMandate(r.mandateId);
+    if ("code" in m) return fail(403, m);
+    if (new Date(m.validUntil) <= new Date()) return fail(403, reject("MANDATE_EXPIRED", m.validUntil));
+    if (!m.assignees.includes(r.agentId)) return fail(403, reject("AGENT_NOT_AUTHORIZED", r.agentId));
+    const offer = r.offer.payload;
+    if (!m.targets.includes(offer.category)) return fail(403, reject("CATEGORY_NOT_AUTHORIZED", offer.category));
+
+    // 2. Seller: approved by the gateway AND allowed by the mandate; offer signed by the pinned key
+    if (!m.allowedSellers.includes(offer.seller)) return fail(403, reject("SELLER_NOT_IN_MANDATE", offer.seller));
+    const oc = cfg.registry.checkOffer(r.offer);
+    if (!oc.ok) return fail(403, reject(oc.code, oc.reason));
+
+    // 3. The 402 challenge must implement exactly the signed offer that was evaluated
+    if (r.offerRef && (r.offerRef.offerId !== offer.offerId || r.offerRef.version !== offer.version || r.offerRef.digest !== oc.digest)) {
+      return fail(409, reject("OFFER_CHANGED", `402 references ${r.offerRef.offerId} v${r.offerRef.version}; evaluated v${offer.version}. Re-fetch and re-evaluate the offer.`));
+    }
+    const o = r.option;
+    const price = offer.prices.find((p) => p.scheme === o.scheme);
+    if (!price || price.amount !== o.amount || price.currency !== o.currency || (price.payTo ?? price.merchantId) !== o.payTo || offer.resource !== o.resource) {
+      return fail(409, reject("OFFER_MISMATCH", "payment challenge does not match the signed offer (amount, currency, payee or resource)"));
+    }
+
+    // 4. Mandate limits
+    if (!m.allowedSchemes.includes(o.scheme)) return fail(403, reject("SCHEME_NOT_AUTHORIZED", o.scheme));
+    if (o.currency !== m.currency) return fail(403, reject("CURRENCY_NOT_AUTHORIZED", `${o.currency} (mandate is ${m.currency})`));
+    const amount = BigInt(o.amount);
+    const perTx = BigInt(toAtomic(m.maxPerTransaction, m.currency));
+    const total = BigInt(toAtomic(m.totalLimit, m.currency));
+    if (amount > perTx) return fail(403, reject("PER_TRANSACTION_LIMIT", `${fmt(amount, o.currency)} > ${fmt(perTx, o.currency)}`));
+
+    // 5. Reserve atomically and sign
+    const authId = newId("auth-");
+    const now = new Date();
+    const payload: PaymentAuthorization = {
+      authId, transactionId: r.transactionId, mandateId: m.id, agentId: r.agentId, seller: offer.seller,
+      offerId: offer.offerId, offerVersion: offer.version, offerDigest: oc.digest, resource: offer.resource,
+      scheme: o.scheme, amount: o.amount, currency: o.currency, payTo: o.payTo, challengeDigest: digestOf(o.challenge),
+      issuedAt: now.toISOString(), expiresAt: new Date(now.getTime() + ttl * 1000).toISOString(),
+    };
+    const signed = signEnvelope(key, payload);
+    const railReference = o.scheme === "x402" ? nonceFor(authId) : o.railReference ?? null;
+    let outcome: { ok: true } | { ok: false; rj: Rejection };
+    try {
+      outcome = ledger.immediate(() => {
+        if (ledger.get(r.transactionId)) return { ok: false as const, rj: reject("IDEMPOTENCY_RACE", "retry with the same request") };
+        const committed = ledger.committed(m.id, m.currency);
+        if (committed + amount > total) {
+          return { ok: false as const, rj: reject("BUDGET_EXCEEDED", `${fmt(committed, m.currency)} committed + ${fmt(amount, m.currency)} > ${fmt(total, m.currency)}`) };
+        }
+        ledger.insert({
+          tx_id: r.transactionId, mandate_id: m.id, agent_id: r.agentId, seller: offer.seller, offer_id: offer.offerId, offer_version: offer.version,
+          scheme: o.scheme, amount: o.amount, currency: o.currency, request_digest: requestDigest, status: "authorized",
+          auth_id: authId, auth_json: JSON.stringify(signed), rail_reference: railReference,
+          payer: o.scheme === "x402" ? cfg.payers.x402 ?? null : null, receipt_json: null, reason: null, expires_at: payload.expiresAt,
+        });
+        return { ok: true as const };
+      });
+    } catch (e) {
+      return { status: 409, body: reject("IDEMPOTENCY_RACE", (e as Error).message) };
+    }
+    if (!outcome.ok) {
+      if (outcome.rj.code === "IDEMPOTENCY_RACE") return { status: 409, body: outcome.rj };
+      return fail(403, outcome.rj);
+    }
+    await syncEvidence(r.transactionId);
+    return { status: 200, body: { authorization: signed, replayed: false, status: "authorized", budget: budget(m) } };
+  }
+
+  function budget(m: SpendingMandate) {
+    const total = BigInt(toAtomic(m.totalLimit, m.currency));
+    const committed = ledger.committed(m.id, m.currency);
+    return { currency: m.currency, limit: total.toString(), committed: committed.toString(), settled: ledger.settled(m.id, m.currency).toString(), available: (total - committed).toString() };
+  }
+
+  async function outcome(txId: string, body: { agentId: string; result: "paid" | "payment_failed" | "unknown"; receipt?: Signed<Receipt>; detail?: string }) {
+    const tx = ledger.get(txId);
+    if (!tx) return { status: 404, body: reject("UNKNOWN_TRANSACTION", txId) };
+    if (tx.agent_id !== body.agentId) return { status: 403, body: reject("NOT_YOUR_TRANSACTION", body.agentId) };
+    if (tx.status === "settled" || tx.status === "released" || tx.status === "rejected") return { status: 200, body: { status: tx.status, unchanged: true } };
+    if (body.result === "paid" && body.receipt) {
+      const err = checkReceipt(tx, body.receipt);
+      if (err) return { status: 422, body: reject("RECEIPT_INVALID", err) };
+      ledger.update(txId, { status: "settled", receipt_json: JSON.stringify(body.receipt), rail_reference: body.receipt.payload.railReference });
+    } else {
+      // Uncertain or failed: hold the reservation until the rail says otherwise.
+      ledger.update(txId, { status: "pending", reason: body.detail ?? body.result });
+      await reconcileOne(ledger.get(txId)!);
+    }
+    await syncEvidence(txId);
+    return { status: 200, body: { status: ledger.get(txId)!.status } };
+  }
+
+  function checkReceipt(tx: TxRow, rc: Signed<Receipt>): string | undefined {
+    const seller = cfg.registry.get(tx.seller);
+    if (!seller || !verifyEnvelope(rc, seller.publicJwk)) return "receipt not signed by the seller's pinned key";
+    const p = rc.payload;
+    if (p.amount !== tx.amount || p.currency !== tx.currency || p.offerId !== tx.offer_id || p.scheme !== tx.scheme) return "receipt does not match the authorized transaction";
+    if (tx.rail_reference && p.railReference !== tx.rail_reference) return "receipt references a different payment";
+    return undefined;
+  }
+
+  /** Ask the rail whether money moved. Release only when it provably cannot. */
+  async function reconcileOne(tx: TxRow): Promise<string> {
+    const expired = tx.expires_at ? new Date(tx.expires_at) <= new Date() : true;
+    let paid: boolean | undefined;
+    try {
+      if (tx.scheme === "x402" && tx.payer && tx.rail_reference) {
+        const r = await (await fetch(`${cfg.rails.facilitatorUrl}/authorization-state?authorizer=${tx.payer}&nonce=${tx.rail_reference}`)).json() as { used: boolean };
+        paid = r.used;
+      } else if (tx.scheme === "l402" && tx.rail_reference) {
+        const r = await fetch(`${cfg.rails.lightningUrl}/invoices/${tx.rail_reference}`);
+        paid = r.ok ? ((await r.json()) as { paid: boolean }).paid : false;
+      } else if (tx.scheme === "card-psp" && tx.rail_reference) {
+        const r = await fetch(`${cfg.rails.pspUrl}/payment_intents/${tx.rail_reference}`);
+        paid = r.ok ? ((await r.json()) as { status: string }).status === "succeeded" : false;
+      }
+    } catch { paid = undefined; }
+    if (paid === true) ledger.update(tx.tx_id, { status: "settled", reason: "confirmed by reconciliation" });
+    else if (paid === false && expired) ledger.update(tx.tx_id, { status: "released", reason: "not paid and authorization expired" });
+    else if (tx.status === "authorized" && expired) ledger.update(tx.tx_id, { status: "pending", reason: "authorization expired, rail state unknown" });
+    return ledger.get(tx.tx_id)!.status;
+  }
+
+  async function reconcile() {
+    const out: Array<{ txId: string; status: string }> = [];
+    for (const tx of ledger.unresolved()) {
+      out.push({ txId: tx.tx_id, status: await reconcileOne(tx) });
+      await syncEvidence(tx.tx_id);
+    }
+    return out;
+  }
+
+  async function syncEvidence(txId: string) {
+    const tx = ledger.get(txId);
+    if (!tx) return;
+    const docUrl = `${cfg.layout.transactions}${encodeURIComponent(txId)}-ledger.ttl`;
+    await cfg.pod.putTurtle(docUrl, await ledgerEvidenceToTurtle({
+      docUrl, transactionId: tx.tx_id, mandate: tx.mandate_id, status: tx.status, scheme: tx.scheme, amount: tx.amount, currency: tx.currency,
+      seller: tx.seller, offerId: tx.offer_id, offerVersion: tx.offer_version, authorizationId: tx.auth_id ?? undefined,
+      authorization: tx.auth_json ? JSON.parse(tx.auth_json) : undefined, railReference: tx.rail_reference ?? undefined,
+      receipt: tx.receipt_json ? JSON.parse(tx.receipt_json) : undefined, reason: tx.reason ?? undefined, updatedAt: tx.updated_at, gateway: gatewayId,
+    })).catch(() => { /* evidence sync is retried on the next status change */ });
+  }
+
+  const srv = await serve(async (req, res) => {
+    const u = new URL(req.url, "http://x");
+    if (req.method === "POST" && u.pathname === "/authorize") {
+      const out = await authorize(JSON.parse(req.body));
+      return json(res, out.status, out.body);
+    }
+    const oc = u.pathname.match(/^\/transactions\/([^/]+)\/outcome$/);
+    if (req.method === "POST" && oc) { const out = await outcome(decodeURIComponent(oc[1]), JSON.parse(req.body)); return json(res, out.status, out.body); }
+    const tx = u.pathname.match(/^\/transactions\/([^/]+)$/);
+    if (req.method === "GET" && tx) {
+      const row = ledger.get(decodeURIComponent(tx[1]));
+      return row ? json(res, 200, { ...row, events: ledger.events(row.tx_id) }) : json(res, 404, { error: "not_found" });
+    }
+    if (req.method === "POST" && u.pathname === "/reconcile") return json(res, 200, { results: await reconcile() });
+    if (req.method === "GET" && u.pathname === "/budget") {
+      const m = await loadMandate(u.searchParams.get("mandate") ?? "");
+      return "code" in m ? json(res, 403, m) : json(res, 200, budget(m));
+    }
+    json(res, 404, { error: "not_found" });
+  });
+  return Object.assign(srv, { key, ledger, reconcile, setPayer: (a: string) => { cfg.payers.x402 = a; } });
+}

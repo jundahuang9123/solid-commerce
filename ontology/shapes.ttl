@@ -1,0 +1,80 @@
+@prefix sh:     <http://www.w3.org/ns/shacl#> .
+@prefix sc:     <https://w3id.org/solid-commerce#> .
+@prefix scsh:   <https://w3id.org/solid-commerce/shapes#> .
+@prefix xsd:    <http://www.w3.org/2001/XMLSchema#> .
+@prefix skos:   <http://www.w3.org/2004/02/skos/core#> .
+@prefix odrl:   <http://www.w3.org/ns/odrl/2/> .
+@prefix prov:   <http://www.w3.org/ns/prov#> .
+
+# SHACL checks structure only. It does not check that an interpretation is
+# right, and it does not enforce budgets. The application does those.
+
+scsh:Criterion a sh:NodeShape ;
+    sh:targetClass sc:Criterion ;
+    sh:property [ sh:path sc:leftOperand ; sh:minCount 1 ; sh:maxCount 1 ; sh:nodeKind sh:IRI ] ;
+    sh:property [ sh:path sc:operator ; sh:minCount 1 ; sh:maxCount 1 ;
+                  sh:in ( odrl:eq odrl:lt odrl:lteq odrl:gt odrl:gteq odrl:isAnyOf ) ] ;
+    sh:property [ sh:path sc:rightOperand ; sh:minCount 1 ] ;
+    sh:property [ sh:path sc:unit ; sh:maxCount 1 ; sh:nodeKind sh:IRI ] .
+
+scsh:Confirmation a sh:NodeShape ;
+    sh:targetClass sc:Confirmation ;
+    sh:property [ sh:path sc:confirmedBy ; sh:minCount 1 ; sh:maxCount 1 ; sh:nodeKind sh:IRI ] ;
+    sh:property [ sh:path prov:endedAtTime ; sh:minCount 1 ; sh:datatype xsd:dateTime ] ;
+    sh:property [ sh:path sc:keyId ; sh:minCount 1 ; sh:datatype xsd:string ] ;
+    sh:property [ sh:path sc:termsDigest ; sh:minCount 1 ; sh:pattern "^sha-256:[0-9a-f]{64}$" ] ;
+    sh:property [ sh:path sc:signature ; sh:minCount 1 ; sh:datatype xsd:string ] .
+
+scsh:Lifecycle a sh:NodeShape ;
+    sh:targetClass sc:AgreedMeaning , sc:Preference , sc:PurchaseRequirement , sc:SpendingMandate ;
+    sh:property [ sh:path sc:owner ; sh:minCount 1 ; sh:maxCount 1 ; sh:nodeKind sh:IRI ] ;
+    sh:property [ sh:path sc:revision ; sh:minCount 1 ; sh:maxCount 1 ; sh:datatype xsd:integer ; sh:minInclusive 1 ] ;
+    sh:property [ sh:path sc:status ; sh:minCount 1 ; sh:maxCount 1 ;
+                  sh:in ( sc:Proposed sc:UserConfirmed sc:Rejected sc:Superseded ) ] .
+
+# A record marked UserConfirmed must carry a confirmation. The signature itself
+# is checked in code against the enrolled approval key.
+scsh:ConfirmedNeedsConfirmation a sh:NodeShape ;
+    sh:targetClass sc:AgreedMeaning , sc:Preference , sc:PurchaseRequirement , sc:SpendingMandate ;
+    sh:or (
+        [ sh:not [ sh:property [ sh:path sc:status ; sh:hasValue sc:UserConfirmed ] ] ]
+        [ sh:property [ sh:path sc:confirmation ; sh:minCount 1 ; sh:maxCount 1 ; sh:class sc:Confirmation ] ]
+    ) ;
+    sh:message "A UserConfirmed record must have exactly one sc:Confirmation." .
+
+scsh:AgreedMeaning a sh:NodeShape ;
+    sh:targetClass sc:AgreedMeaning ;
+    sh:property [ sh:path sc:term ; sh:minCount 1 ; sh:maxCount 1 ] ;
+    sh:property [ sh:path sc:scope ; sh:minCount 1 ; sh:maxCount 1 ; sh:nodeKind sh:IRI ] ;
+    sh:property [ sh:path skos:definition ; sh:minCount 1 ] ;
+    sh:property [ sh:path sc:operationalizedAs ; sh:minCount 1 ; sh:class sc:Criterion ] .
+
+scsh:PreferenceOrRequirement a sh:NodeShape ;
+    sh:targetClass sc:Preference , sc:PurchaseRequirement ;
+    sh:property [ sh:path sc:appliesTo ; sh:minCount 1 ; sh:nodeKind sh:IRI ] ;
+    sh:property [ sh:path sc:criterion ; sh:minCount 1 ; sh:maxCount 1 ; sh:class sc:Criterion ] ;
+    sh:property [ sh:path sc:weight ; sh:maxCount 1 ; sh:datatype xsd:decimal ; sh:minInclusive 0 ; sh:maxInclusive 1 ] .
+
+# Preferences must not carry financial authority.
+scsh:PreferenceGrantsNothing a sh:NodeShape ;
+    sh:targetClass sc:Preference , sc:PurchaseRequirement ;
+    sh:property [ sh:path odrl:permission ; sh:maxCount 0 ;
+                  sh:message "Preferences and requirements cannot grant permissions; use a SpendingMandate." ] .
+
+scsh:SpendingMandate a sh:NodeShape ;
+    sh:targetClass sc:SpendingMandate ;
+    sh:property [ sh:path odrl:profile ; sh:hasValue sc: ] ;
+    sh:property [ sh:path odrl:assigner ; sh:minCount 1 ; sh:maxCount 1 ; sh:nodeKind sh:IRI ] ;
+    sh:property [ sh:path odrl:permission ; sh:minCount 1 ; sh:maxCount 1 ; sh:node scsh:PurchasePermission ] .
+
+scsh:PurchasePermission a sh:NodeShape ;
+    sh:property [ sh:path odrl:action ; sh:hasValue sc:purchase ; sh:maxCount 1 ] ;
+    sh:property [ sh:path odrl:assignee ; sh:minCount 1 ; sh:nodeKind sh:IRI ] ;
+    sh:property [ sh:path odrl:target ; sh:minCount 1 ] ;
+    sh:property [ sh:path odrl:constraint ; sh:minCount 5 ; sh:node scsh:Constraint ] .
+
+scsh:Constraint a sh:NodeShape ;
+    sh:property [ sh:path odrl:leftOperand ; sh:minCount 1 ; sh:maxCount 1 ;
+                  sh:in ( odrl:payAmount sc:totalSpend odrl:dateTime sc:seller sc:paymentScheme ) ] ;
+    sh:property [ sh:path odrl:operator ; sh:minCount 1 ; sh:maxCount 1 ] ;
+    sh:property [ sh:path odrl:rightOperand ; sh:minCount 1 ] .

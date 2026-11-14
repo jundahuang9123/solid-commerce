@@ -1,0 +1,32 @@
+{
+  "name": "solid-commerce",
+  "version": "0.1.0",
+  "description": "Prototype: grounded AI shopping on Solid Pods with HTTP 402 payments (x402, L402-style, card/PSP-style), deterministic authorization and verifiable evidence.",
+  "scripts": {
+    "pod": "community-solid-server -c @css:config/default.json -p 3000 -l warn",
+    "demo": "tsx src/demo/run-demo.ts",
+    "demo:interactive": "tsx src/demo/run-demo.ts --interactive",
+    "test": "tsx --test --test-concurrency=1 test/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "license": "SEE LICENSE IN LICENSE.md",
+  "dependencies": {
+    "@anthropic-ai/sdk": "^1.8.0",
+    "@solid/community-server": "^7.3.0",
+    "@zazuko/env": "^2.5.3",
+    "n3": "^2.13.12",
+    "rdf-validate-shacl": "^0.6.5",
+    "viem": "^2.57.19"
+  },
+  "devDependencies": {
+    "@types/n3": "^1.26.6",
+    "@types/node": "^22.20.5",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  },
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=22.5"
+  }
+}
