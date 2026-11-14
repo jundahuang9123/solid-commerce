@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Solid Commerce live demo</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body class="research">
+<a class="skip" href="#main">Skip to content</a>
+<div class="page">
+<header class="top">
+  <div class="brand">
+    <div class="logo" id="logo"></div>
+    <div>
+      <div class="brand-name">Solid Commerce</div>
+      <div class="brand-sub"><span id="sub-text">Live demo · everything on screen is a real HTTP call; payments are simulated</span> <span id="mode" class="mode-badge">connecting</span></div>
+    </div>
+  </div>
+  <nav aria-label="Scenario" class="tabs" id="tabs">
+    <button type="button" data-tab="weather" aria-current="page">Weather report · HTTP 402</button>
+    <button type="button" data-tab="shoes">Repairable shoes · checkout</button>
+    <button type="button" data-tab="breakit">Break it</button>
+  </nav>
+  <div class="controls">
+    <button type="button" class="btn" id="btn-reset">Reset</button>
+    <button type="button" class="btn weather-only" id="btn-autoplay">Auto-play</button>
+    <button type="button" class="btn primary weather-only" id="btn-next">Next step</button>
+  </div>
+</header>
+
+<div class="toolbar">
+  <fieldset class="seg" aria-label="Audience view">
+    <legend class="sr-only">Audience view</legend>
+    <label><input type="radio" name="view" value="research" checked> Research view</label>
+    <label><input type="radio" name="view" value="business"> Business view</label>
+  </fieldset>
+  <label class="switch"><input type="checkbox" id="auto-approve" role="switch"> Auto-approve on the device</label>
+  <button type="button" class="btn small" id="btn-phone" aria-expanded="false" aria-controls="phone-panel"><span id="phone-icon"></span> Approval device</button>
+  <form id="record-form" class="record live-only">
+    <label for="record-name">Recording name</label>
+    <input id="record-name" name="name" value="talk" autocomplete="off" pattern="[A-Za-z0-9-]+" required>
+    <button type="submit" class="btn small">Record</button>
+  </form>
+  <p id="status" class="status" role="status" aria-live="polite"></p>
+</div>
+<div id="alerts" class="alerts" role="alert"></div>
+<p id="locked" class="locked" hidden>Controls are locked: open the dashboard URL printed in the terminal (it carries the session token). You can still watch.</p>
+
+<main id="main">
+  <section id="tab-weather" data-panel="weather" aria-label="Weather report scenario">
+    <div class="outcomes business-only" id="outcomes" aria-label="Outcomes"></div>
+    <ol class="steps" id="steps" aria-label="Steps"></ol>
+    <div class="cols">
+      <section aria-labelledby="conv-h" class="card conv">
+        <h2 id="conv-h">Conversation</h2>
+        <div id="chat" class="chat"></div>
+        <div id="question"></div>
+        <div id="confirmed"></div>
+        <label class="field">Type a request
+          <input type="text" id="request" placeholder="e.g. Get me a current Berlin weather report. You may spend up to 1 USDC from approved providers.">
+        </label>
+        <details class="research-only agent-log"><summary>Assistant log</summary><ol id="agent-log"></ol></details>
+      </section>
+
+      <section aria-label="What happens on the wire" class="mid">
+        <div class="card">
+          <h2>Offers compared against your common ground</h2>
+          <div id="offers" class="offers"><p class="muted">Offers appear at step 4.</p></div>
+        </div>
+        <div class="card" id="result-card" hidden>
+          <h2>Result</h2>
+          <div id="result"></div>
+        </div>
+        <div class="wire card dark">
+          <div class="wire-head">
+            <h2>On the wire</h2>
+            <div class="wire-tools">
+              <span id="schemes" class="schemes"></span>
+              <label class="wire-filter">Show
+                <select id="wire-filter">
+                  <option value="pay">payment flow</option>
+                  <option value="all">all but Pod</option>
+                  <option value="pod">everything</option>
+                </select>
+              </label>
+            </div>
+          </div>
+          <ol id="wire" class="wire-list" aria-label="HTTP exchanges" tabindex="0"></ol>
+        </div>
+      </section>
+
+      <section aria-labelledby="pod-h" class="card pod">
+        <div class="row-between"><h2 id="pod-h">Your Pod</h2><span id="pod-host" class="muted small"></span></div>
+        <div id="budgets"></div>
+        <ul id="pod-tree" class="pod-tree" aria-label="Pod documents"></ul>
+        <div id="evidence"></div>
+        <figure class="turtle">
+          <figcaption id="doc-caption">Most recent record</figcaption>
+          <div id="doc-picker"></div>
+          <details id="doc-details" open><summary class="business-only">Show Turtle</summary><pre id="doc" tabindex="0"></pre></details>
+        </figure>
+      </section>
+    </div>
+  </section>
+
+  <section id="tab-shoes" data-panel="shoes" aria-label="Repairable shoes scenario" hidden>
+    <div class="row-between wrap">
+      <div>
+        <h1>Repairable shoes</h1>
+        <p class="lead">The shops have no HTTP 402. The assistant uses their checkout API, and the same gateway and signer authorise the payment.</p>
+      </div>
+      <div class="ask">
+        <div id="shoes-ask"></div>
+        <button type="button" class="btn primary" id="btn-buy">Buy with the assistant</button>
+      </div>
+    </div>
+    <div id="shoes-status" class="notes"></div>
+    <div class="cols two">
+      <section aria-labelledby="prod-h" class="card grow">
+        <h2 id="prod-h">Products compared</h2>
+        <div id="products" class="products"><p class="muted">Press "Buy with the assistant".</p></div>
+      </section>
+      <section aria-labelledby="co-h" class="card">
+        <h2 id="co-h">Checkout session</h2>
+        <div id="checkout"><p class="muted">No checkout yet.</p></div>
+      </section>
+    </div>
+    <section aria-labelledby="track-h" class="card delivery">
+      <div class="grow">
+        <h2 id="track-h">Order tracking</h2>
+        <ol id="tracking" class="tracking"></ol>
+        <div class="btn-row">
+          <button type="button" class="btn outline" id="btn-advance">Advance shipment</button>
+          <button type="button" class="btn" id="btn-cancel">Cancel &amp; refund</button>
+        </div>
+        <p class="muted small">"Advance shipment" uses the simulated shop's test control; tracking is then read back through its order API.</p>
+      </div>
+      <div class="inspect" id="inspect"></div>
+    </section>
+    <div class="cols two">
+      <section class="card grow" aria-labelledby="shoes-budget-h"><h2 id="shoes-budget-h">Budget</h2><div id="shoes-budget"></div></section>
+      <section class="card grow research-only" aria-labelledby="shoes-doc-h"><h2 id="shoes-doc-h">Fulfilment evidence</h2><pre id="shoes-doc" tabindex="0"></pre></section>
+    </div>
+  </section>
+
+  <section id="tab-breakit" data-panel="breakit" aria-labelledby="break-h" hidden>
+    <div class="row-between wrap">
+      <div>
+        <h1 id="break-h">Break it</h1>
+        <p class="lead">Each button runs a real attack or failure against the live services. The verdict comes from the gateway, signer, seller or rail, not from the agent.</p>
+      </div>
+      <div id="guard-summary" class="pill-box mono"></div>
+    </div>
+    <div id="guards" class="guards"></div>
+  </section>
+</main>
+</div>
+
+<aside id="phone-panel" class="phone-panel" aria-labelledby="pp-h" hidden>
+  <div class="pp-frame">
+    <div class="row-between"><h2 id="pp-h">Approval device</h2><button type="button" class="btn small" id="pp-close">Hide</button></div>
+    <div id="pp-body"></div>
+    <div class="pp-join">
+      <img id="qr" alt="QR code for the phone approval page" width="148" height="148">
+      <p class="small">Scan to approve on a real phone (same network). <a id="phone-link" href="#" target="_blank" rel="noopener">Open phone page</a></p>
+    </div>
+  </div>
+</aside>
+<script type="module" src="/static/app.js"></script>
+</body>
+</html>

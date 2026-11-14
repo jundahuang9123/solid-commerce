@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#16181D">
+<title>Approval device</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body class="phone-page">
+<main class="phone-screen" aria-labelledby="ph-title">
+  <header class="ph-head">
+    <div class="ph-owner">ALICE'S APPROVAL DEVICE</div>
+    <h1 id="ph-title" class="ph-count" aria-live="polite">Connecting</h1>
+    <p id="ph-mode" class="ph-mode" hidden></p>
+  </header>
+  <div id="ph-error" class="ph-error" role="alert" hidden></div>
+  <div id="ph-item"></div>
+  <div id="ph-history"></div>
+  <p class="ph-foot">This page stands in for a passkey app: the demo server holds the approval key and signs when you approve. Payments are simulated.</p>
+</main>
+<script type="module" src="/static/phone.js"></script>
+</body>
+</html>

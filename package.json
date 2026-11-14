@@ -8,6 +8,7 @@
     "demo:interactive": "tsx src/demo/run-demo.ts --interactive",
     "proxy": "tsx src/proxy/cli.ts",
     "compare:interpreters": "tsx src/llm/compare.ts",
+    "demo:web": "tsx src/web/cli.ts",
     "test":"tsx --test --test-concurrency=1 test/*.test.ts",
     "typecheck": "tsc --noEmit"
   },
@@ -19,6 +20,7 @@
     "@zazuko/env": "^2.5.3",
     "n3": "^2.13.12",
     "openai": "7.46.0",
+    "qrcode": "1.5.4",
     "rdf-validate-shacl": "^0.6.5",
     "viem": "^2.57.19"
   },
