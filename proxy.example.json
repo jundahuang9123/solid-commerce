@@ -1,0 +1,40 @@
+{
+  "$comment": "Example: sell a hypothetical air-quality API through HTTP 402 without changing it. Secrets are referenced by env var or file only; never put them here. The rails must speak the HTTP surfaces of src/payments/sim/ (in this prototype only the simulations do).",
+  "seller": { "name": "Example Air Quality API", "slug": "example-air" },
+  "listen": { "host": "127.0.0.1", "port": 8402 },
+  "upstream": "http://127.0.0.1:9000",
+  "unconfigured": "passthrough",
+  "rails": {
+    "facilitatorUrl": "http://127.0.0.1:4021",
+    "lightningUrl": "http://127.0.0.1:4022",
+    "pspUrl": "http://127.0.0.1:4023"
+  },
+  "keys": {
+    "signingJwk": { "env": "PROXY_SIGNING_JWK", "file": ".data/proxy/offer-signing.jwk.json" },
+    "payTo": { "env": "PROXY_PAY_TO" },
+    "macaroonRootKey": { "env": "PROXY_MACAROON_ROOT_KEY", "file": ".data/proxy/macaroon-root.hex" }
+  },
+  "routes": [
+    {
+      "id": "current-aqi",
+      "method": "GET",
+      "path": "/v1/aqi/current",
+      "category": "AirQualityReport",
+      "coverage": "Berlin",
+      "properties": { "observationMaxAgeMinutes": 15 },
+      "prices": { "x402": "0.005", "l402": 8, "cardEur": 1 },
+      "description": "Current air-quality index for Berlin"
+    },
+    {
+      "id": "station-history",
+      "method": "GET",
+      "path": "/v1/stations/",
+      "prefix": true,
+      "category": "AirQualityHistory",
+      "coverage": "Germany",
+      "properties": { "historyDays": 30 },
+      "prices": { "x402": "0.02", "l402": 30 },
+      "description": "30-day history for one measuring station (one payment per station path)"
+    }
+  ]
+}

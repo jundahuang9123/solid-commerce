@@ -6,7 +6,8 @@
     "pod": "community-solid-server -c @css:config/default.json -p 3000 -l warn",
     "demo": "tsx src/demo/run-demo.ts",
     "demo:interactive": "tsx src/demo/run-demo.ts --interactive",
-    "test": "tsx --test --test-concurrency=1 test/*.test.ts",
+    "proxy": "tsx src/proxy/cli.ts",
+    "test":"tsx --test --test-concurrency=1 test/*.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "license": "SEE LICENSE IN LICENSE.md",
