@@ -61,8 +61,13 @@ export interface AcpProduct {
 
 export interface AcpProductFeed { merchant: { id: string; webId: string; name: string }; products: AcpProduct[] }
 
-/** Simulation-only order view (ACP itself reports order updates to the agent via webhooks). */
-export type OrderStatus = "created" | "shipped" | "delivered" | "canceled" | "refunded";
+/**
+ * Simulation-only order view (ACP itself reports order updates to the agent via webhooks).
+ * "canceled" without a refund: the buyer canceled and the refund has not gone through
+ * yet (repeating the cancellation retries it). "refunded": canceled before shipment and
+ * refunded. "returned": refunded after the goods were shipped.
+ */
+export type OrderStatus = "created" | "shipped" | "delivered" | "canceled" | "refunded" | "returned";
 export interface AcpOrder {
   id: string;
   checkout_session_id: string;
@@ -76,8 +81,16 @@ export interface AcpOrder {
   permalink_url: string;
 }
 
-/** Delegated payment allowance (modelled on ACP's delegate_payment). */
-export interface Allowance { reason: "one_time"; max_amount: number; currency: string; checkout_session_id: string; merchant_id: string; expires_at: string }
+/**
+ * Delegated payment allowance (modelled on ACP's delegate_payment).
+ * `checkout_snapshot_digest` is an EXTENSION of this prototype, not an ACP
+ * field: the digest of the session snapshot the gateway authorized
+ * (`snapshotDigest`). The merchant states the digest of the session it is
+ * charging for and the PSP refuses the charge unless the two match, so a
+ * session re-addressed or re-itemized after authorization cannot be paid with
+ * this token.
+ */
+export interface Allowance { reason: "one_time"; max_amount: number; currency: string; checkout_session_id: string; merchant_id: string; expires_at: string; checkout_snapshot_digest: string }
 
 /** The scheme-specific challenge for "acp-delegated": what the signer is allowed to delegate payment for. */
 export interface CheckoutChallenge { checkout_session_id: string; merchant_id: string; provider: string; snapshot_digest: string }
@@ -88,7 +101,8 @@ export const sessionUrl = (apiBase: string, id: string) => `${apiBase}/checkout_
 
 /**
  * The parts of a session that money and delivery depend on. The gateway binds
- * its authorization to this digest. Messages and links are left out: they
+ * its authorization to this digest, and the delegated token carries it to the
+ * point of payment (see `Allowance`). Messages and links are left out: they
  * carry no terms.
  */
 export function snapshotOf(s: AcpCheckoutSession) {

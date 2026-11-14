@@ -7,6 +7,14 @@
  * derives the amount, payee, items and shipping address from that. The
  * authorization is then bound to a digest of the session snapshot it read.
  *
+ * These checks hold at the moment of authorization; the session can still be
+ * updated afterwards (ACP allows updates until completion). What carries them
+ * to the payment is the digest: it is part of the gateway-signed challenge,
+ * the signer copies it into the delegated token's allowance, and the PSP
+ * charges the token only for a completion whose snapshot has that digest (see
+ * src/payments/sim/psp.ts for what that does and does not protect against).
+ * One live authorization per session (Ledger.liveCheckout) keeps it to one token.
+ *
  * Reconciliation asks the PSP, never the agent or the merchant, whether the
  * delegated token minted for an authorization was charged or refunded.
  */
@@ -66,7 +74,8 @@ export async function bindCheckout(deps: { registry: TrustRegistry; pod: PodClie
   if (subtotal === undefined || total === undefined || fulfillment === undefined || !option || option.subtotal !== fulfillment) return no(409, "CHECKOUT_MISMATCH", "session total does not include a selected fulfilment option");
   if (subtotal + fulfillment + tax !== total) return no(409, "CHECKOUT_MISMATCH", "session totals do not add up");
 
-  // Goods go to the user's address in the Pod, not one an agent put in the session.
+  // Goods go to the user's address in the Pod, not one an agent put in the session
+  // (after authorization, the snapshot digest in the token keeps it that way).
   const address = await readAddress(deps.pod, deps.layout.address());
   if (!address) return no(403, "NO_SHIPPING_ADDRESS", "no shipping address in the Pod");
   if (canonicalJson(s.fulfillment_address) !== canonicalJson(toAcpAddress(address))) return no(409, "ADDRESS_MISMATCH", "session ships to an address other than the user's");

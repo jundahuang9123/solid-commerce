@@ -15,10 +15,21 @@
  *      GET  /agentic_commerce/delegated_tokens?checkout_session_id=   reconciliation lookup
  *      GET  /agentic_commerce/delegated_tokens/{id}
  *    The allowance is enforced here, at the rail: one use, at most max_amount,
- *    in its currency, only by its merchant, only for its checkout session, and
- *    only before expires_at. So a merchant that changes its total after the
- *    gateway authorized it cannot charge more, and an expired, unused token
- *    can provably never be charged.
+ *    in its currency, only by its merchant, only for its checkout session, only
+ *    for the session snapshot the gateway authorized, and only before
+ *    expires_at. So a merchant that changes its total after the gateway
+ *    authorized it cannot charge more, a session re-addressed or re-itemized
+ *    after authorization cannot be charged, and an expired, unused token can
+ *    provably never be charged.
+ *
+ *    Limit, stated plainly: the PSP cannot see the session. The snapshot check
+ *    relies on the merchant reporting the digest of the session it is actually
+ *    completing. That stops an agent (or anyone else holding the session id)
+ *    from changing the session after authorization at an honest merchant; a
+ *    dishonest merchant could report the authorized digest and ship anywhere,
+ *    as it could ignore the order altogether. Against that the protection is
+ *    the trust registry (only approved merchants are paid), the amount cap and
+ *    the user's signed delivery verdict, not this check.
  *
  * Raw card numbers never appear. The signer holds only an opaque card token,
  * as with a real PSP vault, and lookups never return it.
@@ -48,6 +59,8 @@ export interface PspSim extends RunningServer {
   registerMerchant(merchantId: string): string;
   /** Test control: decline the next N delegated-token charges as if the issuer refused them. */
   declineNextCharges(n?: number): void;
+  /** Test control: fail the next N refunds as if the PSP were having an outage (502, nothing refunded). */
+  failNextRefunds(n?: number): void;
 }
 
 const err = (code: string, message: string) => ({ type: "invalid_request", code, message });
@@ -63,6 +76,7 @@ export async function startPsp(): Promise<PspSim> {
   /** ACP-style idempotency: key -> (request, response). Same key with another request is a conflict. */
   const acpIdem = new Map<string, { request: string; status: number; body: unknown }>();
   let declines = 0;
+  let refundFailures = 0;
 
   /** The merchant authenticated by its API key, if any. */
   const merchantOf = (auth: string | undefined) => {
@@ -79,7 +93,7 @@ export async function startPsp(): Promise<PspSim> {
     const a = body?.allowance as Allowance | undefined;
     const pm = body?.payment_method;
     if (!a || a.reason !== "one_time") return { status: 400, body: err("invalid_allowance", "allowance.reason must be one_time") };
-    if (!Number.isInteger(a.max_amount) || a.max_amount <= 0 || !a.currency || !a.checkout_session_id || !a.merchant_id || !a.expires_at) return { status: 400, body: err("invalid_allowance", "max_amount, currency, checkout_session_id, merchant_id and expires_at are required") };
+    if (!Number.isInteger(a.max_amount) || a.max_amount <= 0 || !a.currency || !a.checkout_session_id || !a.merchant_id || !a.expires_at || !a.checkout_snapshot_digest) return { status: 400, body: err("invalid_allowance", "max_amount, currency, checkout_session_id, merchant_id, expires_at and checkout_snapshot_digest are required") };
     if (new Date(a.expires_at) <= new Date()) return { status: 400, body: err("invalid_allowance", "expires_at is in the past") };
     if (pm?.type !== "card" || !cards.has(pm.token)) return { status: 402, body: err("invalid_payment_method", "unknown card token") };
     const t: DelegatedToken = { id: "vt_" + randomHex(12), created: new Date().toISOString(), status: "active", allowance: { ...a }, metadata: { ...(body.metadata ?? {}) }, paymentMethod: pm.token };
@@ -97,6 +111,7 @@ export async function startPsp(): Promise<PspSim> {
     if (t.status === "used") return { status: 409, body: err("token_already_used", "one-time token has already been charged") };
     if (new Date(a.expires_at) <= new Date()) return { status: 403, body: err("token_expired", "allowance expired") };
     if (String(body.currency).toLowerCase() !== a.currency.toLowerCase()) return { status: 403, body: err("currency_mismatch", `allowance is in ${a.currency}`) };
+    if (body.checkout_snapshot_digest !== a.checkout_snapshot_digest) return { status: 403, body: err("checkout_snapshot_mismatch", "the checkout session changed after this payment was authorized") };
     if (!Number.isInteger(body.amount) || body.amount <= 0) return { status: 400, body: err("invalid_amount", "amount must be a positive integer") };
     if (body.amount > a.max_amount) return { status: 402, body: err("amount_exceeds_allowance", `${body.amount} > max_amount ${a.max_amount}`) };
     const card = cards.get(t.paymentMethod)!;
@@ -114,6 +129,7 @@ export async function startPsp(): Promise<PspSim> {
     if (!merchant) return { status: 401, body: err("unauthenticated", "merchant API key required") };
     const c = charges.get(body?.charge_id);
     if (!c || c.merchant_id !== merchant) return { status: 404, body: err("no_such_charge", "unknown charge") };
+    if (refundFailures > 0) { refundFailures--; return { status: 502, body: err("provider_unavailable", "refund could not be processed, retry later") }; }
     const amount = body.amount ?? c.amount - c.amount_refunded;
     if (!Number.isInteger(amount) || amount <= 0 || c.amount_refunded + amount > c.amount) return { status: 400, body: err("invalid_amount", "refund exceeds the charge") };
     c.amount_refunded += amount;
@@ -186,5 +202,6 @@ export async function startPsp(): Promise<PspSim> {
     intents, cards, merchantBalances, tokens, charges,
     registerMerchant: (id: string) => { const k = "sk_sim_" + randomHex(12); merchantKeys.set(k, id); return k; },
     declineNextCharges: (n = 1) => { declines = n; },
+    failNextRefunds: (n = 1) => { refundFailures = n; },
   });
 }
