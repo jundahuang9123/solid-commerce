@@ -6,7 +6,14 @@
  *
  * The "macaroon" here is a simplified HMAC-bound token: base64url JSON
  * caveats plus an HMAC by the seller's root key. It is not a libmacaroons
- * macaroon. It binds payment hash, resource, amount and expiry.
+ * macaroon. It binds payment hash, resource, offer (id and version), amount
+ * and expiry.
+ *
+ * expiresAt is the pay-by time: the invoice's own expiry. The Lightning node
+ * refuses to pay an expired invoice, so a valid preimage already proves the
+ * token was paid in time. Verification therefore does not refuse a token
+ * presented after expiresAt: that would only strand a buyer who has paid, and
+ * would break re-delivery of a paid token.
  */
 import { createHash } from "node:crypto";
 import { hmac, safeEqual } from "../../util/crypto.js";
@@ -20,6 +27,10 @@ export function mintMacaroon(rootKey: string, c: L402Caveats): string {
   return `${body}.${hmac(rootKey, body)}`;
 }
 
+/**
+ * Check the token's HMAC, resource and preimage. The caveats state the price, so a seller must
+ * also check caveats.offerId against the offer it is presented for (src/payments/serverSide.ts).
+ */
 export function verifyL402(rootKey: string, authorization: string, resource: string): { ok: true; caveats: L402Caveats; preimage: string } | { ok: false; reason: string } {
   const m = authorization.match(/^L402\s+([\w-]+\.[\w-]+):([0-9a-f]{64})$/i);
   if (!m) return { ok: false, reason: "malformed" };
@@ -29,11 +40,13 @@ export function verifyL402(rootKey: string, authorization: string, resource: str
   if (caveats.resource !== resource) return { ok: false, reason: "wrong_resource" };
   const hash = createHash("sha256").update(Buffer.from(m[2], "hex")).digest("hex");
   if (hash !== caveats.paymentHash) return { ok: false, reason: "bad_preimage" };
-  // Expiry bounds when an unpaid challenge may be used. A paid token stays valid for re-delivery.
   return { ok: true, caveats, preimage: m[2] };
 }
 
-export const l402Challenge = (macaroon: string, invoice: string) => `L402 macaroon="${macaroon}", invoice="${invoice}"`;
+/** When the invoice stops being payable: the macaroon's expiresAt. */
+export const invoiceExpiresAt = (paymentRequest: string) => decodeInvoice(paymentRequest).expiresAt;
+
+export const l402Challenge =(macaroon: string, invoice: string) => `L402 macaroon="${macaroon}", invoice="${invoice}"`;
 
 export function parseL402(wwwAuthenticate: string | null, resourceUrl: string): PaymentOption[] {
   if (!wwwAuthenticate) return [];

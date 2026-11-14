@@ -2,53 +2,116 @@
  * The 402 proxy in front of a plain node:http upstream that knows nothing
  * about payment. Payments go through the real protected signer, against
  * authorizations signed by a test gateway key (the gateway's own checks are
- * covered in e2e.test.ts), and settle on the simulated rails.
+ * covered in e2e.test.ts), and settle on the simulated rails. The proxy
+ * reaches each rail through a tap that records its calls and can fail or
+ * hold them, so tests can assert on what the proxy itself sends to the rails.
  */
 import { after, before, describe, test } from "node:test";
 import assert from "node:assert/strict";
 import { generateKeyPairSync } from "node:crypto";
-import { createServer, type IncomingHttpHeaders, type Server } from "node:http";
+import { createServer, request as httpRequest, type IncomingHttpHeaders, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
+import { setTimeout as delay } from "node:timers/promises";
+import { getAddress } from "viem";
+import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { startFacilitator, type FacilitatorSim } from "../src/payments/sim/facilitator.js";
 import { startLightning, type LightningSim } from "../src/payments/sim/lightning.js";
 import { startPsp, type PspSim } from "../src/payments/sim/psp.js";
 import { startSigner, type SignerHandle } from "../src/signer/signerService.js";
-import { startPaymentProxy, type PaymentProxyConfig, type PaymentProxyHandle } from "../src/proxy/paymentProxy.js";
+import { OUTCOME_HEADER, startPaymentProxy, type PaymentProxyConfig, type PaymentProxyHandle } from "../src/proxy/paymentProxy.js";
+import type { PaidRoute } from "../src/proxy/routes.js";
 import { loadKeyMaterial } from "../src/proxy/keys.js";
+import { PaymentAcceptor, priceOptionsFor } from "../src/payments/serverSide.js";
+import { parseL402 } from "../src/payments/schemes/l402.js";
 import { parse402 } from "../src/payments/http402.js";
 import { RECEIPT_HEADER, type PaymentAuthorization, type PaymentCredential, type Receipt } from "../src/payments/types.js";
-import type { SchemeId, SpendingMandate } from "../src/model.js";
+import type { Offer, SchemeId, SpendingMandate } from "../src/model.js";
 import { digestOf, Ed25519Key, newId, randomHex, sha256Hex, signEnvelope, verifyEnvelope, type Signed } from "../src/util/crypto.js";
 import { b64json, postJson } from "../src/util/http.js";
 import { offerDigest } from "../src/trust/registry.js";
 import { startEnvironment } from "../src/demo/environment.js";
 
+/**
+ * An HTTP pass-through in front of a rail. It records "METHOD /path" for every
+ * call, can answer 503 for chosen paths, and can hold the next call to a path
+ * until released. A lost upstream response is passed on as a lost response.
+ */
+interface Tap {
+  url: string;
+  calls: string[];
+  failing: Set<string>;
+  hold(path: string): { arrived: Promise<void>; release(): void };
+  close(): Promise<void>;
+}
+async function startTap(target: string): Promise<Tap> {
+  const holds = new Map<string, { arrived: () => void; gate: Promise<void> }>();
+  const t = { url: "", calls: [] as string[], failing: new Set<string>() } as Tap;
+  const server = createServer(async (req, res) => {
+    const path = new URL(req.url ?? "/", "http://x").pathname;
+    t.calls.push(`${req.method} ${path}`);
+    const chunks: Buffer[] = [];
+    for await (const c of req) chunks.push(c as Buffer);
+    if (t.failing.has(path)) { res.writeHead(503, { "content-type": "text/plain" }); return res.end("tap: failing"); }
+    const h = holds.get(path);
+    if (h) { holds.delete(path); h.arrived(); await h.gate; }
+    const headers: Record<string, string> = {};
+    for (const [k, v] of Object.entries(req.headers)) if (typeof v === "string" && !["host", "connection", "content-length"].includes(k)) headers[k] = v;
+    let r: Response;
+    try { r = await fetch(target + req.url, { method: req.method, headers, body: chunks.length ? Buffer.concat(chunks) : undefined }); }
+    catch { return req.socket.destroy(); }
+    res.writeHead(r.status, { "content-type": r.headers.get("content-type") ?? "application/json" });
+    res.end(Buffer.from(await r.arrayBuffer()));
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  t.url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  t.hold = (path) => {
+    let arrived!: () => void, release!: () => void;
+    const a = new Promise<void>((r) => { arrived = r; });
+    holds.set(path, { arrived, gate: new Promise<void>((r) => { release = r; }) });
+    return { arrived: a, release };
+  };
+  t.close = () => new Promise((r) => { server.closeAllConnections(); server.close(() => r()); });
+  return t;
+}
+
 const gatewayKey = Ed25519Key.generate();
 const lnAccount = "acct-" + randomHex(4);
 const cardToken = "tok_" + randomHex(6);
 let facilitator: FacilitatorSim, lightning: LightningSim, psp: PspSim, signer: SignerHandle;
+let facTap: Tap, lnTap: Tap, pspTap: Tap;
 const cleanup: Array<{ close(): Promise<void> }> = [];
 
 before(async () => {
   [facilitator, lightning, psp] = await Promise.all([startFacilitator(), startLightning(), startPsp()]);
-  signer = await startSigner({ gatewayPublicJwk: gatewayKey.publicJwk, lightning: { url: lightning.url, accountToken: lnAccount }, card: { token: cardToken, allowedProviders: [psp.url] } });
+  [facTap, lnTap, pspTap] = await Promise.all([startTap(facilitator.url), startTap(lightning.url), startTap(psp.url)]);
+  // The 402's card challenge names the proxy's PSP URL, which is the tap.
+  signer = await startSigner({ gatewayPublicJwk: gatewayKey.publicJwk, lightning: { url: lightning.url, accountToken: lnAccount }, card: { token: cardToken, allowedProviders: [psp.url, pspTap.url] } });
   facilitator.chain.mint(signer.evmAddress, 100_000_000n);
   lightning.balances.set(lnAccount, 100_000);
   psp.cards.set(cardToken, { limit: 100_000, spent: 0 });
-  cleanup.push(facilitator, lightning, psp, signer);
+  cleanup.push(facTap, lnTap, pspTap, facilitator, lightning, psp, signer);
 });
 after(async () => { await Promise.all(cleanup.map((s) => s.close())); });
 
-/** A plain API that counts hits and records the headers it was sent. */
-interface Upstream { url: string; hits: number; seen: IncomingHttpHeaders[]; mode: "ok" | "down" | "error"; close(): Promise<void> }
+/** A plain API that counts hits and records what it was sent. */
+interface Upstream { url: string; hits: number; seen: IncomingHttpHeaders[]; paths: string[]; bodies: string[]; mode: "ok" | "down" | "error" | "busy"; close(): Promise<void> }
+/** The upstream's ETag: a request carrying it in If-None-Match gets 304. */
+const ETAG = '"v1"';
 async function startUpstream(): Promise<Upstream> {
-  const u: Upstream = { url: "", hits: 0, seen: [], mode: "ok", close: async () => {} };
-  const server: Server = createServer((req, res) => {
+  const u: Upstream = { url: "", hits: 0, seen: [], paths: [], bodies: [], mode: "ok", close: async () => {} };
+  const server: Server = createServer(async (req, res) => {
     if (u.mode === "down") return req.socket.destroy();
+    const chunks: Buffer[] = [];
+    for await (const c of req) chunks.push(c as Buffer);
     u.hits++;
     u.seen.push(req.headers);
+    u.paths.push(req.url ?? "");
+    u.bodies.push(Buffer.concat(chunks).toString());
     if (u.mode === "error") { res.writeHead(500); return res.end("boom"); }
-    res.writeHead(200, { "content-type": "application/json", "x-upstream": "yes" });
+    if (u.mode === "busy") { res.writeHead(429, { "retry-after": "1" }); return res.end("slow down"); }
+    if (req.url?.includes("missing")) { res.writeHead(404, { "content-type": "application/json" }); return res.end(JSON.stringify({ error: "no such station" })); }
+    if (req.headers["if-none-match"] === ETAG) { res.writeHead(304, { etag: ETAG }); return res.end(); }
+    res.writeHead(200, { "content-type": "application/json", "x-upstream": "yes", etag: ETAG });
     res.end(JSON.stringify({ path: req.url, hit: u.hits, at: Date.now() }));
   });
   await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
@@ -59,19 +122,20 @@ async function startUpstream(): Promise<Upstream> {
 }
 
 const SAME_PRICES = { x402: "0.01", l402: 10, cardEur: 3 };
+const ROUTES: PaidRoute[] = [
+  // a and b deliberately cost the same, so only the route binding keeps them apart
+  { id: "a", path: "/v1/a", category: "Data", coverage: "Berlin", properties: { quality: "high" }, prices: SAME_PRICES, description: "Route A" },
+  { id: "b", path: "/v1/b", category: "Data", prices: SAME_PRICES, description: "Route B" },
+  { id: "stations", path: "/v1/stations/", prefix: true, category: "Data", prices: { x402: "0.02" }, description: "One station" },
+];
 async function setup(over: Partial<PaymentProxyConfig> = {}) {
   const upstream = await startUpstream();
   const proxy = await startPaymentProxy({
     // Payee ids derive from the slug and the rails are shared across tests, so keep it unique.
     seller: { name: "Test API", slug: `test-api-${randomHex(3)}` }, upstream: upstream.url,
-    rails: { facilitatorUrl: facilitator.url, lightningUrl: lightning.url, pspUrl: psp.url },
+    rails: { facilitatorUrl: facTap.url, lightningUrl: lnTap.url, pspUrl: pspTap.url },
     unconfigured: "passthrough",
-    routes: [
-      // a and b deliberately cost the same, so only the route binding keeps them apart
-      { id: "a", path: "/v1/a", category: "Data", coverage: "Berlin", properties: { quality: "high" }, prices: SAME_PRICES, description: "Route A" },
-      { id: "b", path: "/v1/b", category: "Data", prices: SAME_PRICES, description: "Route B" },
-      { id: "stations", path: "/v1/stations/", prefix: true, category: "Data", prices: { x402: "0.02" }, description: "One station" },
-    ],
+    routes: ROUTES,
     ...over,
   });
   cleanup.push(proxy);
@@ -79,8 +143,8 @@ async function setup(over: Partial<PaymentProxyConfig> = {}) {
 }
 
 /** What a buyer does after a 402: get a gateway-style authorization and let the real signer pay. */
-async function buy(proxy: PaymentProxyHandle, url: string, scheme: SchemeId): Promise<PaymentCredential> {
-  const r = await fetch(url);
+async function buy(proxy: PaymentProxyHandle, url: string, scheme: SchemeId, method = "GET"): Promise<PaymentCredential> {
+  const r = await fetch(url, { method });
   assert.equal(r.status, 402);
   const ch = parse402(r, url);
   const option = ch.options.find((o) => o.scheme === scheme)!;
@@ -97,6 +161,28 @@ async function buy(proxy: PaymentProxyHandle, url: string, scheme: SchemeId): Pr
   return pay.body.credential;
 }
 const present = (url: string, c: PaymentCredential, extra: Record<string, string> = {}) => fetch(url, { headers: { [c.header.name]: c.header.value, ...extra } });
+/** The x402 credential with its (unsigned) resource field rewritten. */
+function rewriteResource(c: PaymentCredential, url: string): PaymentCredential {
+  const p = b64json.decode(c.header.value);
+  return { ...c, header: { ...c.header, value: b64json.encode({ ...p, resource: { ...p.resource, url } }) } };
+}
+
+/**
+ * A request sent exactly as given. fetch() normalises the path (dot segments) before sending and
+ * refuses an Expect header, so it cannot send what these tests need to send.
+ */
+function rawRequest(url: string, method: string, path: string, headers: Record<string, string> = {}, body?: string): Promise<{ status: number; headers: IncomingHttpHeaders; body: string }> {
+  const u = new URL(url);
+  return new Promise((resolve, reject) => {
+    const r = httpRequest({ host: u.hostname, port: u.port, method, path, headers }, (res) => {
+      const chunks: Buffer[] = [];
+      res.on("data", (c: Buffer) => chunks.push(c));
+      res.on("end", () => resolve({ status: res.statusCode ?? 0, headers: res.headers, body: Buffer.concat(chunks).toString() }));
+    });
+    r.on("error", reject);
+    r.end(body);
+  });
+}
 
 /** Money received by this proxy on each rail. */
 function charges(p: PaymentProxyHandle) {
@@ -209,15 +295,26 @@ describe("402 proxy", () => {
     for (const scheme of SCHEMES) {
       const { upstream, proxy } = await setup();
       const url = proxy.resourceUrl("a");
-      const paymentsBefore = signer.payments;
       const cred = await buy(proxy, url, scheme);
+      // What the proxy itself sends to the rails is what could charge twice, so count that.
+      const since = [facTap, lnTap, pspTap].map((t) => t.calls.length);
+      const railCalls = () => [facTap, lnTap, pspTap].flatMap((t, i) => t.calls.slice(since[i]));
       const concurrent = await Promise.all([present(url, cred), present(url, cred), present(url, cred)]);
+      const afterConcurrent = railCalls().length;
       const again = await present(url, cred);
       assert.deepEqual([...concurrent, again].map((r) => r.status), [200, 200, 200, 200], scheme);
       assert.equal(upstream.hits, 4, "each presentation re-delivers");
-      assert.equal(signer.payments - paymentsBefore, 1);
+      if (scheme === "x402") {
+        // One verify and one settle in all: concurrent presentations wait for the one in flight.
+        assert.deepEqual(railCalls().sort(), ["POST /settle", "POST /verify"], "x402: the proxy settles once");
+      } else {
+        // L402's preimage and card's confirmed intent are the proof: the proxy only reads, never charges.
+        assert.ok(railCalls().every((c) => c.startsWith("GET /payment_intents/")), `${scheme}: ${railCalls()}`);
+      }
+      assert.equal(railCalls().length, afterConcurrent, `${scheme}: a settled credential re-delivers without touching the rail`);
       assert.deepEqual(charges(proxy), { x402: 0, l402: 0, "card-psp": 0, [scheme]: ({ x402: 1, l402: 10, "card-psp": 3 } as Record<string, number>)[scheme] }, `${scheme}: one charge`);
       assert.equal(proxy.settlements, 1);
+      assert.equal(proxy.deliveries, 4);
     }
   });
 
@@ -279,6 +376,193 @@ describe("402 proxy", () => {
     assert.equal((await present(url, cred)).status, 402);
     assert.equal(charges(proxy).x402, 0);
     assert.equal(upstream.hits, 0);
+  });
+
+  test("an L402 token is honoured at the price its macaroon was minted for, even after a price change", async () => {
+    // x402 moves no money before redemption, so an old-price x402 credential is simply refused
+    // (above). An L402 buyer has already paid the invoice, which could only be paid before it
+    // expired; the macaroon is the seller's signed quote, so it is honoured at that price.
+    const { upstream, proxy } = await setup();
+    const url = proxy.resourceUrl("a");
+    const cred = await buy(proxy, url, "l402");
+    proxy.setPrice("a", { l402: 50 });
+    const r = await present(url, cred);
+    assert.equal(r.status, 200);
+    const receipt = b64json.decode<Signed<Receipt>>(r.headers.get(RECEIPT_HEADER)!).payload;
+    assert.deepEqual([receipt.amount, receipt.currency, receipt.offerVersion], ["10", "SAT", 1], "the receipt states the quoted price");
+    assert.equal(charges(proxy).l402, 10);
+    assert.equal(upstream.hits, 1);
+  });
+
+  test("an L402 token bought from a cheap offer never unlocks a pricier one", async () => {
+    // Routes that would share a resource URL are refused at configuration: every scheme binds a
+    // payment to the resource, so they could not be told apart.
+    const route = (id: string, path: string, extra: Partial<PaidRoute> = {}): PaidRoute => ({ id, path, category: "Data", prices: { l402: 1 }, description: id, ...extra });
+    for (const routes of [
+      [route("cheap", "/v1/x"), route("dear", "/v1/x", { method: "POST", prices: { l402: 5000 } })],
+      [route("one", "/v1/s"), route("all", "/v1/s/", { prefix: true })],
+      [route("lower", "/v1/x"), route("upper", "/V1/X")],
+    ]) await assert.rejects(setup({ routes }), /same resource/, routes.map((r) => r.path).join(" vs "));
+
+    // Below that, the macaroon names its offer, and the acceptor checks it.
+    const payees = { payTo: getAddress(privateKeyToAccount(generatePrivateKey()).address), lightningPayee: `ln:t-${randomHex(3)}`, merchantId: `m_t-${randomHex(3)}` };
+    const acceptor = new PaymentAcceptor({ rails: { facilitatorUrl: facTap.url, lightningUrl: lnTap.url, pspUrl: pspTap.url }, payees, macaroonRootKey: randomHex(32) });
+    const base = { version: 1, seller: "urn:test:seller", sellerName: "S", category: "Data", resource: "http://s.test/v1/x", coverage: "", properties: {}, validUntil: new Date(Date.now() + 60_000).toISOString() };
+    const cheap: Offer = { ...base, offerId: "http://s.test/offers/cheap#offer", prices: priceOptionsFor({ l402: 1 }, payees) };
+    const dear: Offer = { ...base, offerId: "http://s.test/offers/dear#offer", prices: priceOptionsFor({ l402: 5000 }, payees) };
+    const [opt] = parseL402((await acceptor.challenge(cheap, "cheap")).headers["www-authenticate"], cheap.resource);
+    const ch = opt.challenge as { macaroon: string; invoice: string };
+    const paid = await postJson(`${lightning.url}/pay`, { paymentRequest: ch.invoice }, { "x-account": lnAccount });
+    const auth = { authorization: `L402 ${ch.macaroon}:${paid.body.preimage}` };
+    const onDear = await acceptor.accept(auth, dear, { resource: dear.resource, target: "POST /v1/x" });
+    assert.deepEqual(onDear, { kind: "rejected", status: 402, reason: "L402 rejected: wrong_offer" });
+    const onCheap = await acceptor.accept(auth, cheap, { resource: cheap.resource, target: "GET /v1/x" });
+    assert.equal(onCheap.kind === "paid" && onCheap.settlement.amount, "1");
+  });
+
+  test("an authorization state the facilitator cannot report is 'unknown', never 'unpaid'", async () => {
+    const { upstream, proxy } = await setup();
+    const url = proxy.resourceUrl("a");
+    const cred = await buy(proxy, url, "x402");
+    facilitator.failNextSettle("timeout-after-settle");
+    assert.equal((await present(url, cred)).status, 502);
+    assert.equal(charges(proxy).x402, 1, "the money moved");
+    facTap.failing.add("/authorization-state");
+    try {
+      const r = await present(url, cred);
+      const body = await r.json() as { paid: unknown; retry: string };
+      assert.equal(r.status, 502, "not a 402: the buyer must not pay again");
+      assert.deepEqual([body.paid, body.retry], ["unknown", "re-present the same payment credential"]);
+      // The claim is held meanwhile, so the payment cannot be redeemed on another route.
+      const elsewhere = await present(proxy.resourceUrl("b"), rewriteResource(cred, proxy.resourceUrl("b")));
+      assert.equal(((await elsewhere.json()) as { error: string }).error, "credential is bound to another resource");
+    } finally { facTap.failing.delete("/authorization-state"); }
+    assert.equal((await present(url, cred)).status, 200, "confirmed once the rail answers");
+    assert.equal(charges(proxy).x402, 1);
+    assert.deepEqual(upstream.paths, ["/v1/a"]);
+  });
+
+  test("a settlement in flight is neither released by a retry nor credited to another binding", async () => {
+    const { upstream, proxy } = await setup();
+    const a = proxy.resourceUrl("a"), b = proxy.resourceUrl("b");
+    const cred = await buy(proxy, a, "x402");
+    const settleCalls = () => facTap.calls.filter((c) => c === "POST /settle").length;
+    const settlesBefore = settleCalls();
+    const held = facTap.hold("/settle");
+    const r1 = present(a, cred);
+    await held.arrived;
+    // While R1's settle is in flight, R2 retries after a price change. If R2 could release R1's
+    // claim, R3 (the same credential, resource rewritten) could claim route B, and R1's settlement
+    // would then be credited to B as well as delivering A.
+    proxy.setPrice("a", { x402: "0.05" });
+    const r2 = present(a, cred);
+    await Promise.race([r2, delay(300)]);
+    const r3 = present(b, rewriteResource(cred, b));
+    await Promise.race([r3, delay(300)]);
+    held.release();
+    const statuses = (await Promise.all([r1, r2, r3])).map((r) => r.status);
+    assert.deepEqual(statuses, [200, 200, 402], "A delivered (twice, one payment), B refused");
+    assert.ok(!upstream.paths.includes("/v1/b"), "B was never delivered");
+    assert.equal(settleCalls() - settlesBefore, 1);
+    assert.equal(charges(proxy).x402, 1);
+  });
+
+  test("respelled paid paths (case, trailing slash, escapes, empty segments, path parameters) are refused, never passed through", async () => {
+    const { upstream, proxy } = await setup();
+    // Each of these reaches the paid handler on a common lenient upstream (Express ignores case and
+    // a trailing slash; most frameworks decode %XX; Tomcat drops ";params").
+    for (const path of ["/v1/a/", "/V1/A", "/v1/A/", "/v1/%61", "/v1//a", "/v1/a;x=1", "/V1/stations/berlin", "/v1//stations/berlin"]) {
+      const r = await rawRequest(proxy.url, "GET", path);
+      assert.equal(r.status, 404, path);
+      assert.equal(r.headers.link, `<${path.toLowerCase().includes("stations") ? "/v1/stations/" : "/v1/a"}>; rel="canonical"`, path);
+    }
+    // Escapes whose meaning depends on the upstream's decoder are refused on every path.
+    for (const path of ["/v1/stations%2fberlin", "/v1/stations/..%2f..%2fv1%2fa", "/v1/%2561", "/free%2fx", "/v1/a%00", "/v1/%zz"]) {
+      assert.equal((await rawRequest(proxy.url, "GET", path)).status, 400, path);
+    }
+    // Dot segments are resolved before matching, and the resolved path is what would be forwarded.
+    for (const path of ["/v1/x/../a", "/v1/x/%2e%2e/a", "/free/../v1/a"]) assert.equal((await rawRequest(proxy.url, "GET", path)).status, 402, path);
+    assert.equal(upstream.hits, 0);
+    assert.equal((await rawRequest(proxy.url, "GET", "/free/../free")).status, 200, "free paths still pass through");
+    assert.deepEqual(upstream.paths, ["/free"]);
+  });
+
+  test("other methods and the bare prefix of a paid path are refused; a prefix ends at a segment boundary", async () => {
+    const { upstream, proxy } = await setup({ routes: [...ROUTES, { id: "st", path: "/v1/st", prefix: true, category: "Data", prices: { x402: "0.01" }, description: "st" }] });
+    for (const method of ["HEAD", "POST", "PUT", "OPTIONS"]) {
+      const r = await rawRequest(proxy.url, method, "/v1/a");
+      assert.deepEqual([r.status, r.headers.allow], [405, "GET"], method);
+    }
+    assert.equal((await rawRequest(proxy.url, "DELETE", "/v1/stations/berlin")).status, 405);
+    assert.equal((await rawRequest(proxy.url, "GET", "/v1/stations")).status, 404, "the prefix without its slash");
+    assert.equal(upstream.hits, 0);
+    assert.equal((await rawRequest(proxy.url, "GET", "/v1/st/x")).status, 402);
+    assert.equal((await rawRequest(proxy.url, "GET", "/v1/st")).status, 402);
+    const sibling = await rawRequest(proxy.url, "GET", "/v1/stx");
+    assert.equal(sibling.status, 200, "/v1/stx is not under the prefix /v1/st");
+    assert.deepEqual(upstream.paths, ["/v1/stx"]);
+  });
+
+  test("a paid request with 'Expect: 100-continue' is delivered", async () => {
+    const submit: PaidRoute = { id: "submit", method: "POST", path: "/v1/submit", category: "Data", prices: SAME_PRICES, description: "Submit" };
+    const { upstream, proxy } = await setup({ routes: [...ROUTES, submit] });
+    const url = proxy.resourceUrl("submit");
+    const cred = await buy(proxy, url, "x402", "POST");
+    const big = "x".repeat(4096); // curl sends Expect: 100-continue for any body over 1 KiB
+    const r = await rawRequest(proxy.url, "POST", "/v1/submit", { [cred.header.name]: cred.header.value, expect: "100-continue", "content-type": "text/plain" }, big);
+    assert.equal(r.status, 200, r.body);
+    assert.equal(upstream.bodies.at(-1), big);
+    assert.equal(upstream.seen.at(-1)!.expect, undefined, "Expect is hop-by-hop");
+    assert.ok(r.headers[RECEIPT_HEADER], "delivered with a receipt");
+    const passthrough = await rawRequest(proxy.url, "POST", "/free", { expect: "100-continue", "content-type": "text/plain" }, big);
+    assert.equal(passthrough.status, 200);
+  });
+
+  test("a paid target the upstream refuses (404) delivers nothing, says so, and lets the payment move once", async () => {
+    const { upstream, proxy } = await setup();
+    const typo = `${proxy.url}/v1/stations/missing-typo`, berlin = `${proxy.url}/v1/stations/berlin`;
+    const cred = await buy(proxy, typo, "x402");
+    const r1 = await present(typo, cred);
+    assert.equal(r1.status, 404, "the upstream's own answer, not a 502 asking for a pointless retry");
+    assert.deepEqual(await r1.json(), { error: "no such station" });
+    assert.equal(r1.headers.get(RECEIPT_HEADER), null);
+    const note = JSON.parse(r1.headers.get(OUTCOME_HEADER)!);
+    assert.deepEqual([note.paid, note.delivered, note.upstreamStatus, note.railReference], [true, false, 404, cred.railReference]);
+    assert.equal(b64json.decode(r1.headers.get("payment-response")!).success, true);
+
+    const r2 = await present(berlin, cred);
+    assert.equal(r2.status, 200, "the payment moves to the target the buyer meant");
+    const receipt = b64json.decode<Signed<Receipt>>(r2.headers.get(RECEIPT_HEADER)!).payload;
+    assert.equal(receipt.resource, proxy.resourceUrl("stations"));
+    assert.equal((await present(`${proxy.url}/v1/stations/hamburg`, cred)).status, 402, "once delivered, it stays put");
+    assert.equal((await present(typo, cred)).status, 402);
+    assert.equal((await present(berlin, cred)).status, 200);
+    assert.equal(charges(proxy).x402, 1);
+    assert.deepEqual([proxy.settlements, proxy.deliveries], [1, 2]);
+  });
+
+  test("upstream answers after payment: no 304 for a paid GET, 4xx relayed, retryable statuses keep the retry path", async () => {
+    const { upstream, proxy } = await setup();
+    const url = proxy.resourceUrl("a");
+    const cred = await buy(proxy, url, "card-psp");
+    // The buyer's cache validator would make the upstream answer 304 with no body: nothing to attest.
+    const r = await present(url, cred, { "if-none-match": ETAG });
+    assert.equal(r.status, 200);
+    const receipt = b64json.decode<Signed<Receipt>>(r.headers.get(RECEIPT_HEADER)!).payload;
+    assert.equal(receipt.contentDigest, "sha-256:" + sha256Hex(Buffer.from(await r.arrayBuffer())));
+    assert.equal(upstream.seen.at(-1)!["if-none-match"], undefined);
+    assert.equal((await fetch(`${proxy.url}/free`, { headers: { "if-none-match": ETAG } })).status, 304, "free traffic keeps its caching");
+
+    // An exact route: a query the upstream rejects is relayed, and the payment can move to a good query.
+    const cred2 = await buy(proxy, `${url}?id=missing`, "l402");
+    const bad = await present(`${url}?id=missing`, cred2);
+    assert.deepEqual([bad.status, JSON.parse(bad.headers.get(OUTCOME_HEADER)!).delivered], [404, false]);
+    upstream.mode = "busy";
+    const busy = await present(`${url}?id=good`, cred2);
+    assert.deepEqual([busy.status, ((await busy.json()) as { upstreamStatus: number; paid: boolean }).upstreamStatus], [502, 429], "429 is a retry, not a refusal");
+    upstream.mode = "ok";
+    assert.equal((await present(`${url}?id=good`, cred2)).status, 200);
+    assert.deepEqual(charges(proxy), { x402: 0, l402: 10, "card-psp": 3 });
   });
 
   test("unconfigured paths follow the configured policy", async () => {

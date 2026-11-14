@@ -8,13 +8,21 @@
  *   GET /offers/<route>   signed, versioned offer (JSON envelope; schema.org Turtle on Accept: text/turtle)
  *   <paid route>          no credential -> 402 with x402 v2, L402-style and card/PSP challenges;
  *                         valid credential -> forwarded upstream, returned with a seller-signed receipt
+ *   respellings of a paid path, other methods on it, ambiguous escapes
+ *                         refused here (404 / 405 / 400), never forwarded (see routes.ts)
  *   anything else         forwarded free ("passthrough") or 404 ("not-found")
  *
  * The upstream is only reached after payment is settled. The receipt's
  * contentDigest is computed over the exact bytes returned to the client.
- * If the upstream fails after settlement the client gets 502 with paid:true;
- * the payment is remembered, so re-presenting the same credential delivers
- * without a second charge.
+ * What the upstream answers after settlement decides what the buyer gets:
+ *   2xx                         the content, with a receipt
+ *   no answer, 5xx, 408/425/429 502 paid:true; re-presenting the same credential
+ *                               delivers later without a second charge
+ *   any other 3xx/4xx           the upstream's own answer, relayed unchanged with no
+ *                               receipt and an sc-payment-outcome header (paid, not
+ *                               delivered). The answer is deterministic, so retrying is
+ *                               pointless; instead the payment may be presented once for
+ *                               another target of the same resource (see SettlementBook.lookup)
  */
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -27,10 +35,20 @@ import { offerToTurtle } from "../rdf/records.js";
 import { RECEIPT_HEADER, type Receipt } from "../payments/types.js";
 import { DEFAULT_NETWORK, DEFAULT_USDC } from "../payments/schemes/x402.js";
 import {
-  PaymentAcceptor, priceOptionsFor, type Acceptance, type Payees, type RailUrls, type SchemePrices, type Settlement, type X402Asset,
+  PaymentAcceptor, priceOptionsFor, type Acceptance, type DeliveryOutcome, type Payees, type RailUrls, type SchemePrices, type Settlement, type X402Asset,
 } from "../payments/serverSide.js";
 import { forward, readRawBody, type UpstreamResponse } from "./forward.js";
-import { matchRoute, RESERVED, validateRoutes, type PaidRoute } from "./routes.js";
+import { matchRequest, RESERVED, validateRoutes, type PaidRoute } from "./routes.js";
+
+/** Header on a paid request that delivered nothing because the upstream refused it. */
+export const OUTCOME_HEADER = "sc-payment-outcome";
+/** 4xx answers that say "try again later", not "this request is wrong". */
+const RETRYABLE_4XX = new Set([408, 425, 429]);
+
+function outcomeOf(up: UpstreamResponse | undefined): DeliveryOutcome {
+  if (!up || up.status >= 500 || RETRYABLE_4XX.has(up.status)) return "transient";
+  return up.status >= 200 && up.status <= 299 ? "delivered" : "refused";
+}
 
 export interface PaymentProxyConfig {
   seller: { name: string; slug: string };
@@ -143,11 +161,14 @@ export async function startPaymentProxy(cfg: PaymentProxyConfig, port = 0, host 
       return send(res, 200, signed);
     }
     const body = await readRawBody(req);
-    const route = matchRoute([...states.values()].map((st) => st.route), method, u.pathname);
-    if (route) return paid(req, res, body, stateOf(route.id), `${method} ${u.pathname}${u.search}`);
+    // Matched and forwarded as the same parsed path, so the upstream sees what was classified.
+    const pathAndQuery = u.pathname + u.search;
+    const m = matchRequest([...states.values()].map((st) => st.route), method, u.pathname);
+    if (m.kind === "paid") return paid(req, res, body, stateOf(m.route.id), pathAndQuery, `${method} ${pathAndQuery}`);
+    if (m.kind === "refused") return send(res, m.status, { error: m.error }, m.headers);
     if (cfg.unconfigured === "passthrough") {
       let up: UpstreamResponse;
-      try { up = await forward(req, body, { upstreamBase: cfg.upstream, publicUrl, paidRoute: false, timeoutMs }); }
+      try { up = await forward(req, body, { upstreamBase: cfg.upstream, pathAndQuery, publicUrl, paidRoute: false, timeoutMs }); }
       catch { return send(res, 502, { error: "upstream_unavailable" }); }
       res.writeHead(up.status, up.headers);
       return res.end(up.body);
@@ -155,14 +176,14 @@ export async function startPaymentProxy(cfg: PaymentProxyConfig, port = 0, host 
     send(res, 404, { error: "not_found" });
   }
 
-  async function paid(req: IncomingMessage, res: ServerResponse, body: Buffer, st: RouteState, target: string) {
+  async function paid(req: IncomingMessage, res: ServerResponse, body: Buffer, st: RouteState, pathAndQuery: string, target: string) {
     const o = current(st).payload;
     const a: Acceptance = await acceptor.accept(req.headers, o, { resource: o.resource, target });
     switch (a.kind) {
       case "none": return challenge(res, st, o);
       case "rejected": return a.status === 402 ? challenge(res, st, o, a.reason) : send(res, 400, { error: a.reason });
       case "failed": return send(res, a.status, a.body);
-      case "paid": return deliver(req, res, body, a.settlement, a.responseHeaders);
+      case "paid": return deliver(req, res, body, pathAndQuery, a.settlement, a.responseHeaders);
     }
   }
 
@@ -171,14 +192,24 @@ export async function startPaymentProxy(cfg: PaymentProxyConfig, port = 0, host 
     send(res, 402, c.body, c.headers);
   }
 
-  async function deliver(req: IncomingMessage, res: ServerResponse, body: Buffer, s: Settlement, paymentHeaders: Record<string, string>) {
+  async function deliver(req: IncomingMessage, res: ServerResponse, body: Buffer, pathAndQuery: string, s: Settlement, paymentHeaders: Record<string, string>) {
+    // Started before the first await: while it runs, the payment cannot move to another target.
+    acceptor.book.deliveryStarted(s.key);
     let up: UpstreamResponse | undefined;
-    try { up = await forward(req, body, { upstreamBase: cfg.upstream, publicUrl, paidRoute: true, paymentReference: `${s.scheme}:${s.railReference}`, timeoutMs }); }
+    try { up = await forward(req, body, { upstreamBase: cfg.upstream, pathAndQuery, publicUrl, paidRoute: true, paymentReference: `${s.scheme}:${s.railReference}`, timeoutMs }); }
     catch { up = undefined; }
-    // Only a 2xx counts as delivery. Anything else is the seller's failure after the buyer paid:
-    // never charge again, and say so in a way a client can act on.
-    if (!up || up.status < 200 || up.status > 299) {
+    const outcome = outcomeOf(up);
+    acceptor.book.deliveryEnded(s.key, outcome);
+    // Never charge again after this point, and say what happened in a way a client can act on.
+    if (outcome === "transient" || !up) {
       return send(res, 502, { error: "upstream_unavailable", paid: true, upstreamStatus: up?.status ?? null, railReference: s.railReference, retry: "re-present the same payment credential" }, paymentHeaders);
+    }
+    if (outcome === "refused") {
+      // The upstream's real answer (a 404's message, a redirect's Location) is what the buyer needs;
+      // a 502 would hide it and suggest a retry that cannot succeed.
+      const note = { paid: true, delivered: false, upstreamStatus: up.status, railReference: s.railReference, recovery: "present the same credential for another target of this resource" };
+      res.writeHead(up.status, { ...up.headers, [OUTCOME_HEADER]: JSON.stringify(note), ...paymentHeaders });
+      return res.end(up.body);
     }
     // A fresh receipt per delivery: re-delivered content may differ (e.g. newer data), and the
     // receipt must attest the bytes actually returned. Amount and offer version are what was paid.
