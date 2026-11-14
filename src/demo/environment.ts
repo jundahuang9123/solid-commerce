@@ -23,6 +23,9 @@ import { startSigner, type SignerHandle } from "../signer/signerService.js";
 import { startGateway, type GatewayHandle } from "../gateway/gatewayService.js";
 import { ShoppingAssistant } from "../agent/assistant.js";
 import { randomHex } from "../util/crypto.js";
+import { readWallet } from "../pod/wallet.js";
+import { addressToTurtle, type PostalAddress } from "../pod/address.js";
+import { startAcpMerchant, type AcpMerchantHandle, type ShippingRate } from "../payments/sim/acpMerchant.js";
 
 export const AGENT_1 = "urn:solid-commerce:agent:assistant-1";
 export const AGENT_2 = "urn:solid-commerce:agent:assistant-2";
@@ -115,6 +118,53 @@ export async function startEnvironment(opts: { podUrl?: string; decider?: Decide
     async close() {
       await Promise.all([gateway, signer, spree, havel, shady, facilitator, lightning, psp].map((s) => s.close()));
       css?.proc.kill();
+    },
+  };
+}
+
+// ----------------------------------------------------------------- checkout merchants (physical goods)
+//
+// Shops selling shoes through an ACP-style checkout API (no HTTP 402). They
+// reuse the environment's PSP (now also issuing delegated tokens), gateway and
+// signer; only the merchants, their registry entries, the buyer's shipping
+// address and the wallet's extra scheme are added here.
+
+export interface CheckoutEnvironment extends Environment {
+  /** billig: cheap, soles not replaceable · atelier: fits, but 123.90 EUR with delivery · sohle: fits · outlet: NOT approved */
+  merchants: { billig: AcpMerchantHandle; atelier: AcpMerchantHandle; sohle: AcpMerchantHandle; outlet: AcpMerchantHandle };
+  address: PostalAddress;
+  checkoutAssistant(agentId?: string, opts?: { interpreter?: Interpreter; log?: (l: string) => void }): ShoppingAssistant;
+}
+
+export const BUYER_ADDRESS: PostalAddress = { name: "Alice Example", streetAddress: "Musterstraße 1", locality: "Berlin", postalCode: "10115", country: "DE" };
+
+export async function startCheckoutEnvironment(opts: Parameters<typeof startEnvironment>[0] = {}): Promise<CheckoutEnvironment> {
+  const env = await startEnvironment(opts);
+  const psp = env.rails.psp;
+  const shoe = (slug: string, name: string, title: string, price: number, properties: Record<string, string>, shipping: ShippingRate[]) =>
+    startAcpMerchant({ slug, name, products: [{ id: `${slug}-1`, title, category: "Shoes", price: { amount: price, currency: "eur" }, properties }], shipping, psp: { url: psp.url, apiKey: psp.registerMerchant(`acct_${slug}`) } });
+  const standard = (amount: number): ShippingRate => ({ id: "standard", title: "Standard", carrier: "DHL", amount, countries: ["DE", "AT"] });
+  const [billig, atelier, sohle, outlet] = await Promise.all([
+    shoe("billig-schuh", "Billig Schuh", "Canvas sneaker", 3995, { solesReplaceable: "false", manufacturerRepairService: "false" }, [standard(495)]),
+    shoe("atelier-leder", "Atelier Leder", "Goodyear-welted derby", 10900, { solesReplaceable: "true", manufacturerRepairService: "true" }, [{ id: "express", title: "Insured express", carrier: "UPS", amount: 1490, countries: ["DE"] }]),
+    shoe("sohle-und-co", "Sohle & Co", "Resoleable leather boot", 8900, { solesReplaceable: "true", manufacturerRepairService: "false" }, [standard(590), { id: "express", title: "Express", carrier: "DHL", amount: 1290, countries: ["DE"] }]),
+    shoe("schnaeppchen-outlet", "Schnäppchen Outlet", "Resoleable boot (outlet)", 5900, { solesReplaceable: "true" }, [standard(0)]),
+  ]);
+  // Outlet is deliberately not approved.
+  for (const m of [billig, atelier, sohle]) env.registry.approveMerchant({ webId: m.webId, name: m.name, merchantId: m.merchantId, apiBase: m.url, paymentProvider: psp.url });
+
+  for (const card of psp.cards.values()) card.limit = 50_000;     // EUR 500.00 of test funds for physical goods
+  await env.pod.putTurtle(env.layout.address().split("#")[0], addressToTurtle(env.layout.address(), BUYER_ADDRESS));
+  const wallet = await readWallet(env.pod, env.layout.wallet);
+  await env.pod.putTurtle(env.layout.wallet, walletToTurtle(env.layout.wallet, { ...wallet, schemes: [...wallet.schemes, "acp-delegated"] }));
+
+  const merchantApis = [billig, atelier, sohle, outlet].map((m) => m.url);
+  return {
+    ...env, merchants: { billig, atelier, sohle, outlet }, address: BUYER_ADDRESS,
+    checkoutAssistant: (agentId = AGENT_1, o = {}) => new ShoppingAssistant({ agentId, pod: env.pod, layout: env.layout, interpreter: o.interpreter ?? defaultInterpreter(), enrolledApprovalKeys: [env.device.publicJwk], gatewayUrl: env.gateway.url, catalog: [], checkoutMerchants: merchantApis, log: o.log }),
+    async close() {
+      await Promise.all([billig, atelier, sohle, outlet].map((m) => m.close()));
+      await env.close();
     },
   };
 }

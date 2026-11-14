@@ -119,6 +119,8 @@ sc:PaymentScheme a owl:Class .
 sc:X402    a sc:PaymentScheme ; rdfs:label "x402 (exact, EIP-3009)"@en .
 sc:L402    a sc:PaymentScheme ; rdfs:label "L402-style (macaroon + Lightning-style invoice)"@en .
 sc:CardPSP a sc:PaymentScheme ; rdfs:label "Card / PSP payment intent behind HTTP 402"@en .
+sc:ACPDelegated a sc:PaymentScheme ; rdfs:label "ACP-style checkout with a delegated single-use payment token"@en ;
+    rdfs:comment "For shops without HTTP 402. Modelled on the public description of the Agentic Commerce Protocol (checkout sessions, delegate_payment); not a conformance claim. The gateway re-reads the checkout session from the approved merchant and authorizes its total including delivery and tax."@en .
 
 sc:Currency a owl:Class .
 sc:USDC a sc:Currency ; sc:decimals 6 .
@@ -144,12 +146,33 @@ sc:Reserved  a sc:TransactionStatus ; rdfs:comment "Budget reserved, payment not
 sc:Pending   a sc:TransactionStatus ; rdfs:comment "Outcome uncertain. Still counts against the budget until reconciled."@en .
 sc:Settled   a sc:TransactionStatus .
 sc:Released  a sc:TransactionStatus ; rdfs:comment "Reservation returned to the budget; no funds moved."@en .
+sc:Refunded  a sc:TransactionStatus ; rdfs:comment "Funds moved and were fully refunded, as confirmed by the payment provider (not by the agent or merchant). No longer counts against the budget."@en .
 sc:Rejected  a sc:TransactionStatus .
 
 sc:DeliveryStatus a owl:Class .
 sc:Delivered     a sc:DeliveryStatus .
 sc:NonCompliant  a sc:DeliveryStatus ; rdfs:comment "Delivered, but fails an agreed requirement."@en .
 sc:NotDelivered  a sc:DeliveryStatus ; rdfs:comment "Paid but nothing (valid) delivered; recoverable by re-presenting the payment proof."@en .
+sc:FulfilmentPending a sc:DeliveryStatus ; rdfs:comment "Physical goods paid for and not yet accepted: awaiting shipment, in transit, or delivered by the carrier but not yet inspected by the user."@en .
+sc:Cancelled     a sc:DeliveryStatus ; rdfs:comment "Order canceled after payment. Whether the money came back is the payment status (sc:Refunded), recorded separately."@en .
+
+# ------------------------------------------------- Checkout and physical fulfilment
+# Orders reuse schema.org: schema:Order, schema:orderStatus with schema:OrderStatus
+# individuals (OrderProcessing, OrderInTransit, OrderDelivered, OrderCancelled),
+# schema:OrderItem, schema:ParcelDelivery and schema:deliveryAddress -> schema:PostalAddress.
+
+sc:checkoutSession a owl:ObjectProperty ; rdfs:domain sc:Transaction ;
+    rdfs:comment "The merchant checkout session (ACP-style) that the transaction paid."@en .
+sc:fulfilment a owl:ObjectProperty ; rdfs:domain sc:Transaction ; rdfs:range schema:Order ;
+    rdfs:comment "The order document tracking physical delivery for this transaction."@en .
+sc:paymentStatus a owl:ObjectProperty ; rdfs:range sc:TransactionStatus ;
+    rdfs:comment "The gateway ledger's payment status, kept apart from the order status."@en .
+sc:trackingEvent a owl:ObjectProperty ; rdfs:domain schema:ParcelDelivery ;
+    rdfs:comment "One order status change reported by the merchant."@en .
+sc:DeliveryAcceptance a owl:Class ; rdfs:subClassOf prov:Activity ;
+    rdfs:comment "The user's verdict on delivered goods, checked against the agreed requirements and signed on the approval device. It grants nothing."@en .
+sc:acceptance a owl:ObjectProperty ; rdfs:range sc:DeliveryAcceptance .
+sc:verdict a owl:ObjectProperty ; rdfs:range sc:DeliveryStatus ; rdfs:comment "sc:Delivered or sc:NonCompliant."@en .
 
 # ----------------------------------------------------- Seller-side extensions
 

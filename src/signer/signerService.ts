@@ -2,7 +2,9 @@
  * Protected signer / payment vault. A separate service holding:
  *   - an EVM private key (x402, self-custodial)
  *   - a Lightning wallet account token (L402-style)
- *   - an opaque card token at a PSP (card / externally funded)
+ *   - an opaque card token at a PSP (card / externally funded). For ACP-style
+ *     checkout it mints a single-use delegated token from it (./delegatedPayment.ts);
+ *     the card token itself is only ever sent to the PSP
  *
  * It pays ONLY when given an authorization signed by the gateway that matches
  * the exact challenge. It is idempotent per authorization id: a retry gets the
@@ -16,6 +18,10 @@ import type { PaymentAuthorization, PaymentCredential } from "../payments/types.
 import { createX402Payment } from "../payments/schemes/x402.js";
 import { createL402Payment } from "../payments/schemes/l402.js";
 import { createCardPayment } from "../payments/schemes/cardPsp.js";
+import { createDelegatedPayment } from "./delegatedPayment.js";
+import type { DelegatedCredential } from "../checkout/acp.js";
+
+type Credential = PaymentCredential | DelegatedCredential;
 
 export interface SignerConfig {
   gatewayPublicJwk: JsonWebKey;
@@ -29,14 +35,14 @@ export interface SignerHandle extends RunningServer { evmAddress: string; lightn
 export async function startSigner(cfg: SignerConfig): Promise<SignerHandle> {
   const evmKey = cfg.evmPrivateKey ?? generatePrivateKey();
   const evmAddress = privateKeyToAccount(evmKey).address;
-  const done = new Map<string, { challengeDigest: string; credential: PaymentCredential }>();
-  const inFlight = new Map<string, Promise<PaymentCredential>>();
+  const done = new Map<string, { challengeDigest: string; credential: Credential }>();
+  const inFlight = new Map<string, Promise<Credential>>();
   let payments = 0;
 
   const srv = await serve(async (req, res) => {
     const u = new URL(req.url, "http://x");
     if (req.method === "GET" && u.pathname === "/info") {
-      return json(res, 200, { x402: { address: evmAddress }, schemes: [ "x402", ...(cfg.lightning ? ["l402"] : []), ...(cfg.card ? ["card-psp"] : [])] });
+      return json(res, 200, { x402: { address: evmAddress }, schemes: [ "x402", ...(cfg.lightning ? ["l402"] : []), ...(cfg.card ? ["card-psp", "acp-delegated"] : [])] });
     }
     if (req.method !== "POST" || u.pathname !== "/pay") return json(res, 404, { error: "not_found" });
 
@@ -53,11 +59,13 @@ export async function startSigner(cfg: SignerConfig): Promise<SignerHandle> {
     // Coalesce concurrent duplicate requests for the same authorization.
     let p = inFlight.get(a.authId);
     if (!p) {
-      p = (async () => {
+      p = (async (): Promise<Credential> => {
         switch (a.scheme) {
           case "x402": return createX402Payment(evmKey, a, challenge as any);
           case "l402": if (!cfg.lightning) throw new Error("no lightning wallet"); return createL402Payment(cfg.lightning.url, cfg.lightning.accountToken, a, challenge as any);
           case "card-psp": if (!cfg.card) throw new Error("no card"); return createCardPayment(cfg.card.token, cfg.card.allowedProviders, a, challenge as any);
+          case "acp-delegated": if (!cfg.card) throw new Error("no card"); return createDelegatedPayment(cfg.card.token, cfg.card.allowedProviders, a, challenge as any);
+          default: throw new Error(`unsupported scheme ${a.scheme}`);
         }
       })();
       inFlight.set(a.authId, p);

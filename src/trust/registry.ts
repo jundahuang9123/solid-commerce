@@ -10,15 +10,29 @@ import { digestOf, keyIdOf, verifyEnvelope, type Signed } from "../util/crypto.j
 
 export interface ApprovedSeller { webId: string; name: string; publicJwk: JsonWebKey; approvedAt: string }
 
+/**
+ * An approved checkout merchant (ACP-style, src/checkout). These shops sign no
+ * offers, so trust is anchored differently: the gateway only ever talks to the
+ * pinned API base URL, server to server, and reads the checkout terms there
+ * itself. `merchantId` is the payee as known to the pinned payment provider.
+ */
+export interface ApprovedMerchant { webId: string; name: string; merchantId: string; apiBase: string; paymentProvider: string; approvedAt: string }
+
 export type OfferCheck = { ok: true; digest: string } | { ok: false; code: "SELLER_NOT_APPROVED" | "BAD_SIGNATURE" | "OFFER_EXPIRED" | "KEY_MISMATCH"; reason: string };
 
 export class TrustRegistry {
   private sellers = new Map<string, ApprovedSeller>();
+  private merchants = new Map<string, ApprovedMerchant>();
   approve(s: Omit<ApprovedSeller, "approvedAt">) { this.sellers.set(s.webId, { ...s, approvedAt: new Date().toISOString() }); }
   revoke(webId: string) { this.sellers.delete(webId); }
   get(webId: string) { return this.sellers.get(webId); }
   list() { return [...this.sellers.values()]; }
   isApproved(webId: string) { return this.sellers.has(webId); }
+
+  approveMerchant(m: Omit<ApprovedMerchant, "approvedAt">) { this.merchants.set(m.webId, { ...m, apiBase: m.apiBase.replace(/\/$/, ""), approvedAt: new Date().toISOString() }); }
+  revokeMerchant(webId: string) { this.merchants.delete(webId); }
+  getMerchant(webId: string) { return this.merchants.get(webId); }
+  listMerchants() { return [...this.merchants.values()]; }
 
   checkOffer(signed: Signed<Offer>, now = new Date()): OfferCheck {
     const seller = this.sellers.get(signed?.payload?.seller);

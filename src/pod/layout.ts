@@ -10,6 +10,7 @@
  *   <pod>/commerce/history/<slug>-r<n>.ttl   superseded revisions
  *   <pod>/commerce/intentions/<id>.ttl       purchase intentions
  *   <pod>/commerce/transactions/<id>.ttl     offers considered, authorization, receipt, delivery
+ *   <pod>/commerce/addresses/default.ttl     shipping address (schema:PostalAddress); shared only with the merchant being paid
  *   <pod>/commerce/wallet.ttl                wallet descriptor (schemes, signer endpoint), no secrets
  */
 import { NS } from "../rdf/namespaces.js";
@@ -30,6 +31,8 @@ export class PodLayout {
   get intentions() { return this.commerce + "intentions/"; }
   get transactions() { return this.commerce + "transactions/"; }
   get wallet() { return this.commerce + "wallet.ttl"; }
+  get addresses() { return this.commerce + "addresses/"; }
+  address(slug = "default") { return `${this.addresses}${slug}.ttl#it`; }
 
   meaning(slug: string) { return `${this.commonGround}${slug}.ttl#it`; }
   preference(slug: string) { return `${this.preferences}${slug}.ttl#it`; }
@@ -61,6 +64,8 @@ export function buildAcls(layout: PodLayout, agentWebIds: string[], gatewayWebId
     [layout.mandates + ".acl"]: head + ownerRule(layout.mandates) + rule("readers", layout.mandates, [...agentWebIds, gatewayWebId], ["Read"]),
     [layout.proposals + ".acl"]: head + ownerRule(layout.proposals) + rule("agents", layout.proposals, agentWebIds, ["Read", "Append"]),
     [layout.intentions + ".acl"]: head + ownerRule(layout.intentions) + rule("agents", layout.intentions, agentWebIds, ["Read", "Write"]),
+    // Agents need the address to check out; only the owner can change where goods are sent.
+    [layout.addresses + ".acl"]: head + ownerRule(layout.addresses) + rule("readers", layout.addresses, [...agentWebIds, gatewayWebId], ["Read"]),
     [layout.transactions + ".acl"]: head + ownerRule(layout.transactions) + rule("writers", layout.transactions, [...agentWebIds, gatewayWebId], ["Read", "Write"]),
   };
 }

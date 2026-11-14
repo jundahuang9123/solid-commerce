@@ -4,12 +4,20 @@
  * POST /authorize                  check mandate + seller + offer + challenge, reserve budget, sign an authorization
  * POST /transactions/:id/outcome   agent reports paid / failed / unknown (with the seller's signed receipt)
  * POST /reconcile                  resolve authorized/pending transactions against the payment rails
+ * POST /transactions/:id/reconcile one transaction, including refunds of settled checkout purchases
  * GET  /transactions/:id           ledger row and event history
  * GET  /budget?mandate=<iri>       limit, committed, settled, available
  *
  * Authorization is bound to seller, offer version and digest, resource,
  * scheme, amount, currency, payee, the exact challenge, an expiry and a unique
  * transaction id.
+ *
+ * Two kinds of terms are accepted:
+ *  - a seller-signed offer plus the HTTP 402 challenge that implements it (x402, L402-style, card/PSP);
+ *  - an ACP-style checkout session ("acp-delegated"), which the gateway re-reads
+ *    from the approved merchant itself (./checkoutBinding.ts).
+ * Everything after that binding step (mandate limits, atomic reservation,
+ * signing, reconciliation) is shared.
  */
 import type { Offer, SpendingMandate } from "../model.js";
 import { PodClient } from "../pod/PodClient.js";
@@ -24,6 +32,7 @@ import type { OfferRef, PaymentAuthorization, PaymentOption, Receipt } from "../
 import { nonceFor } from "../payments/schemes/x402.js";
 import { Ledger, type TxRow } from "./ledger.js";
 import { ledgerEvidenceToTurtle } from "../rdf/evidence.js";
+import { bindCheckout, delegatedPaymentState, type Binding, type CheckoutClaim } from "./checkoutBinding.js";
 
 export interface GatewayConfig {
   pod: PodClient;
@@ -41,8 +50,9 @@ export interface AuthorizeRequest {
   transactionId: string;
   agentId: string;
   mandateId: string;
-  offer: Signed<Offer>;
+  offer?: Signed<Offer>;                 // 402 schemes
   offerRef?: OfferRef;                   // what the 402 response claimed
+  checkout?: CheckoutClaim;              // acp-delegated
   option: PaymentOption;
 }
 
@@ -75,9 +85,34 @@ export async function startGateway(cfg: GatewayConfig): Promise<GatewayHandle> {
     return rec;
   }
 
+  /** 402 schemes: the challenge must implement exactly the signed offer that was evaluated. */
+  function bindSignedOffer(r: AuthorizeRequest, m: SpendingMandate): { ok: true; binding: Binding } | { ok: false; status: number; rj: Rejection } {
+    const offer = r.offer!.payload;
+    if (!m.targets.includes(offer.category)) return { ok: false, status: 403, rj: reject("CATEGORY_NOT_AUTHORIZED", offer.category) };
+
+    // Seller: approved by the gateway AND allowed by the mandate; offer signed by the pinned key
+    if (!m.allowedSellers.includes(offer.seller)) return { ok: false, status: 403, rj: reject("SELLER_NOT_IN_MANDATE", offer.seller) };
+    const oc = cfg.registry.checkOffer(r.offer!);
+    if (!oc.ok) return { ok: false, status: 403, rj: reject(oc.code, oc.reason) };
+
+    // The 402 challenge must implement exactly the signed offer that was evaluated
+    if (r.offerRef && (r.offerRef.offerId !== offer.offerId || r.offerRef.version !== offer.version || r.offerRef.digest !== oc.digest)) {
+      return { ok: false, status: 409, rj: reject("OFFER_CHANGED", `402 references ${r.offerRef.offerId} v${r.offerRef.version}; evaluated v${offer.version}. Re-fetch and re-evaluate the offer.`) };
+    }
+    const o = r.option;
+    const price = offer.prices.find((p) => p.scheme === o.scheme);
+    if (!price || price.amount !== o.amount || price.currency !== o.currency || (price.payTo ?? price.merchantId) !== o.payTo || offer.resource !== o.resource) {
+      return { ok: false, status: 409, rj: reject("OFFER_MISMATCH", "payment challenge does not match the signed offer (amount, currency, payee or resource)") };
+    }
+    return { ok: true, binding: { seller: offer.seller, offerId: offer.offerId, offerVersion: offer.version, offerDigest: oc.digest, resource: offer.resource, railReference: o.railReference } };
+  }
+
   async function authorize(r: AuthorizeRequest): Promise<{ status: number; body: unknown }> {
-    if (!r.transactionId || !r.agentId || !r.mandateId || !r.offer || !r.option) return { status: 400, body: reject("BAD_REQUEST", "missing fields") };
-    const requestDigest = digestOf({ mandateId: r.mandateId, agentId: r.agentId, offer: offerDigest(r.offer.payload), option: r.option });
+    const isCheckout = r.option?.scheme === "acp-delegated";
+    if (!r.transactionId || !r.agentId || !r.mandateId || !r.option || (isCheckout ? !r.checkout : !r.offer)) return { status: 400, body: reject("BAD_REQUEST", "missing fields") };
+    const requestDigest = digestOf(isCheckout
+      ? { mandateId: r.mandateId, agentId: r.agentId, checkout: r.checkout, option: r.option }
+      : { mandateId: r.mandateId, agentId: r.agentId, offer: offerDigest(r.offer!.payload), option: r.option });
 
     // Idempotency: same id + same request returns the same authorization; a different request is a conflict.
     const existing = ledger.get(r.transactionId);
@@ -90,7 +125,7 @@ export async function startGateway(cfg: GatewayConfig): Promise<GatewayHandle> {
     const fail = (status: number, rj: Rejection) => {
       // Rejections are recorded too, so the evidence trail shows blocked attempts.
       try {
-        ledger.insert({ tx_id: r.transactionId, mandate_id: r.mandateId, agent_id: r.agentId, seller: r.offer.payload.seller ?? "?", offer_id: r.offer.payload.offerId ?? "?", offer_version: r.offer.payload.version ?? 0, scheme: r.option.scheme, amount: r.option.amount, currency: r.option.currency, request_digest: requestDigest, status: "rejected", auth_id: null, auth_json: null, rail_reference: null, payer: null, receipt_json: null, reason: `${rj.code}: ${rj.reason}`, expires_at: null });
+        ledger.insert({ tx_id: r.transactionId, mandate_id: r.mandateId, agent_id: r.agentId, seller: r.offer?.payload?.seller ?? r.checkout?.merchant ?? "?", offer_id: r.offer?.payload?.offerId ?? r.option.resource ?? "?", offer_version: r.offer?.payload?.version ?? 0, scheme: r.option.scheme, amount: r.option.amount, currency: r.option.currency, request_digest: requestDigest, status: "rejected", auth_id: null, auth_json: null, rail_reference: null, payer: null, receipt_json: null, reason: `${rj.code}: ${rj.reason}`, expires_at: null });
       } catch { /* concurrent insert with same id */ }
       syncEvidence(r.transactionId).catch(() => {});
       return { status, body: rj };
@@ -101,23 +136,19 @@ export async function startGateway(cfg: GatewayConfig): Promise<GatewayHandle> {
     if ("code" in m) return fail(403, m);
     if (new Date(m.validUntil) <= new Date()) return fail(403, reject("MANDATE_EXPIRED", m.validUntil));
     if (!m.assignees.includes(r.agentId)) return fail(403, reject("AGENT_NOT_AUTHORIZED", r.agentId));
-    const offer = r.offer.payload;
-    if (!m.targets.includes(offer.category)) return fail(403, reject("CATEGORY_NOT_AUTHORIZED", offer.category));
 
-    // 2. Seller: approved by the gateway AND allowed by the mandate; offer signed by the pinned key
-    if (!m.allowedSellers.includes(offer.seller)) return fail(403, reject("SELLER_NOT_IN_MANDATE", offer.seller));
-    const oc = cfg.registry.checkOffer(r.offer);
-    if (!oc.ok) return fail(403, reject(oc.code, oc.reason));
-
-    // 3. The 402 challenge must implement exactly the signed offer that was evaluated
-    if (r.offerRef && (r.offerRef.offerId !== offer.offerId || r.offerRef.version !== offer.version || r.offerRef.digest !== oc.digest)) {
-      return fail(409, reject("OFFER_CHANGED", `402 references ${r.offerRef.offerId} v${r.offerRef.version}; evaluated v${offer.version}. Re-fetch and re-evaluate the offer.`));
+    // 2-3. Bind to terms the gateway verifies itself: a signed offer, or the merchant's own checkout session
+    let binding: Binding;
+    if (isCheckout) {
+      const b = await bindCheckout(cfg, m, r.checkout, r.option);
+      if (!b.ok) return fail(b.status, reject(b.code, b.reason));
+      binding = b.binding;
+    } else {
+      const b = bindSignedOffer(r, m);
+      if (!b.ok) return fail(b.status, b.rj);
+      binding = b.binding;
     }
     const o = r.option;
-    const price = offer.prices.find((p) => p.scheme === o.scheme);
-    if (!price || price.amount !== o.amount || price.currency !== o.currency || (price.payTo ?? price.merchantId) !== o.payTo || offer.resource !== o.resource) {
-      return fail(409, reject("OFFER_MISMATCH", "payment challenge does not match the signed offer (amount, currency, payee or resource)"));
-    }
 
     // 4. Mandate limits
     if (!m.allowedSchemes.includes(o.scheme)) return fail(403, reject("SCHEME_NOT_AUTHORIZED", o.scheme));
@@ -131,13 +162,13 @@ export async function startGateway(cfg: GatewayConfig): Promise<GatewayHandle> {
     const authId = newId("auth-");
     const now = new Date();
     const payload: PaymentAuthorization = {
-      authId, transactionId: r.transactionId, mandateId: m.id, agentId: r.agentId, seller: offer.seller,
-      offerId: offer.offerId, offerVersion: offer.version, offerDigest: oc.digest, resource: offer.resource,
+      authId, transactionId: r.transactionId, mandateId: m.id, agentId: r.agentId, seller: binding.seller,
+      offerId: binding.offerId, offerVersion: binding.offerVersion, offerDigest: binding.offerDigest, resource: binding.resource,
       scheme: o.scheme, amount: o.amount, currency: o.currency, payTo: o.payTo, challengeDigest: digestOf(o.challenge),
       issuedAt: now.toISOString(), expiresAt: new Date(now.getTime() + ttl * 1000).toISOString(),
     };
     const signed = signEnvelope(key, payload);
-    const railReference = o.scheme === "x402" ? nonceFor(authId) : o.railReference ?? null;
+    const railReference = o.scheme === "x402" ? nonceFor(authId) : binding.railReference ?? null;
     let outcome: { ok: true } | { ok: false; rj: Rejection };
     try {
       outcome = ledger.immediate(() => {
@@ -147,7 +178,7 @@ export async function startGateway(cfg: GatewayConfig): Promise<GatewayHandle> {
           return { ok: false as const, rj: reject("BUDGET_EXCEEDED", `${fmt(committed, m.currency)} committed + ${fmt(amount, m.currency)} > ${fmt(total, m.currency)}`) };
         }
         ledger.insert({
-          tx_id: r.transactionId, mandate_id: m.id, agent_id: r.agentId, seller: offer.seller, offer_id: offer.offerId, offer_version: offer.version,
+          tx_id: r.transactionId, mandate_id: m.id, agent_id: r.agentId, seller: binding.seller, offer_id: binding.offerId, offer_version: binding.offerVersion,
           scheme: o.scheme, amount: o.amount, currency: o.currency, request_digest: requestDigest, status: "authorized",
           auth_id: authId, auth_json: JSON.stringify(signed), rail_reference: railReference,
           payer: o.scheme === "x402" ? cfg.payers.x402 ?? null : null, receipt_json: null, reason: null, expires_at: payload.expiresAt,
@@ -175,8 +206,12 @@ export async function startGateway(cfg: GatewayConfig): Promise<GatewayHandle> {
     const tx = ledger.get(txId);
     if (!tx) return { status: 404, body: reject("UNKNOWN_TRANSACTION", txId) };
     if (tx.agent_id !== body.agentId) return { status: 403, body: reject("NOT_YOUR_TRANSACTION", body.agentId) };
-    if (tx.status === "settled" || tx.status === "released" || tx.status === "rejected") return { status: 200, body: { status: tx.status, unchanged: true } };
-    if (body.result === "paid" && body.receipt) {
+    if (tx.status === "settled" || tx.status === "released" || tx.status === "rejected" || tx.status === "refunded") return { status: 200, body: { status: tx.status, unchanged: true } };
+    if (tx.scheme === "acp-delegated") {
+      // A checkout has no seller receipt. Whatever the agent reports, only the payment provider decides.
+      await reconcileOne(tx);
+      if (ledger.get(txId)!.status === "authorized") ledger.update(txId, { status: "pending", reason: `agent reported ${body.result}${body.detail ? ": " + body.detail : ""}; awaiting the payment provider` });
+    } else if (body.result === "paid" && body.receipt) {
       const err = checkReceipt(tx, body.receipt);
       if (err) return { status: 422, body: reject("RECEIPT_INVALID", err) };
       ledger.update(txId, { status: "settled", receipt_json: JSON.stringify(body.receipt), rail_reference: body.receipt.payload.railReference });
@@ -198,8 +233,32 @@ export async function startGateway(cfg: GatewayConfig): Promise<GatewayHandle> {
     return undefined;
   }
 
+  /**
+   * Checkout purchases, asked of the PSP that holds the delegated token:
+   *  - token charged          -> settled, at the charged amount (the PSP caps it at the authorized amount)
+   *  - charge fully refunded  -> refunded: no longer counts against the budget, but only once the
+   *                              PSP confirms the refund, never on the agent's or merchant's word
+   *  - no charge, expired     -> released: the PSP refuses expired tokens, so it can never be charged
+   * A partial refund is noted and keeps the full charge committed (conservative).
+   */
+  async function reconcileCheckout(tx: TxRow, expired: boolean): Promise<string> {
+    const provider = cfg.registry.getMerchant(tx.seller)?.paymentProvider ?? cfg.rails.pspUrl;
+    const st = tx.rail_reference && tx.auth_id ? await delegatedPaymentState(provider, tx.rail_reference, tx.auth_id) : undefined;
+    const charge = st?.token?.charge;
+    if (charge?.status === "succeeded") {
+      if (charge.amount_refunded >= charge.amount) ledger.update(tx.tx_id, { status: "refunded", amount: String(charge.amount), reason: `refund of ${charge.id} confirmed by the payment provider` });
+      else if (tx.status !== "settled") ledger.update(tx.tx_id, { status: "settled", amount: String(charge.amount), reason: `charge ${charge.id} confirmed by the payment provider` });
+      else if (charge.amount_refunded > 0 && !tx.reason?.includes("partial refund")) ledger.update(tx.tx_id, { reason: `partial refund of ${charge.amount_refunded}; budget stays committed` });
+    } else if (tx.status === "authorized" || tx.status === "pending") {
+      if (st && expired) ledger.update(tx.tx_id, { status: "released", reason: "no charge and the delegated token has expired" });
+      else if (tx.status === "authorized" && expired) ledger.update(tx.tx_id, { status: "pending", reason: "authorization expired, payment provider state unknown" });
+    }
+    return ledger.get(tx.tx_id)!.status;
+  }
+
   /** Ask the rail whether money moved. Release only when it provably cannot. */
   async function reconcileOne(tx: TxRow): Promise<string> {
+    if (tx.scheme === "acp-delegated") return reconcileCheckout(tx, tx.expires_at ? new Date(tx.expires_at) <= new Date() : true);
     const expired = tx.expires_at ? new Date(tx.expires_at) <= new Date() : true;
     let paid: boolean | undefined;
     try {
@@ -222,7 +281,7 @@ export async function startGateway(cfg: GatewayConfig): Promise<GatewayHandle> {
 
   async function reconcile() {
     const out: Array<{ txId: string; status: string }> = [];
-    for (const tx of ledger.unresolved()) {
+    for (const tx of [...ledger.unresolved(), ...ledger.refundable()]) {
       out.push({ txId: tx.tx_id, status: await reconcileOne(tx) });
       await syncEvidence(tx.tx_id);
     }
@@ -249,6 +308,14 @@ export async function startGateway(cfg: GatewayConfig): Promise<GatewayHandle> {
     }
     const oc = u.pathname.match(/^\/transactions\/([^/]+)\/outcome$/);
     if (req.method === "POST" && oc) { const out = await outcome(decodeURIComponent(oc[1]), JSON.parse(req.body)); return json(res, out.status, out.body); }
+    const rc = u.pathname.match(/^\/transactions\/([^/]+)\/reconcile$/);
+    if (req.method === "POST" && rc) {
+      const row = ledger.get(decodeURIComponent(rc[1]));
+      if (!row) return json(res, 404, reject("UNKNOWN_TRANSACTION", rc[1]));
+      const status = row.status === "rejected" || row.status === "released" ? row.status : await reconcileOne(row);
+      await syncEvidence(row.tx_id);
+      return json(res, 200, { status });
+    }
     const tx = u.pathname.match(/^\/transactions\/([^/]+)$/);
     if (req.method === "GET" && tx) {
       const row = ledger.get(decodeURIComponent(tx[1]));

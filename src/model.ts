@@ -5,8 +5,16 @@
 
 export type RecordStatus = "Proposed" | "UserConfirmed" | "Rejected" | "Superseded";
 export type Operator = "eq" | "lt" | "lteq" | "gt" | "gteq" | "isAnyOf";
-export type SchemeId = "x402" | "l402" | "card-psp";
-export const SCHEME_IRI_NAME: Record<SchemeId, string> = { x402: "X402", l402: "L402", "card-psp": "CardPSP" };
+/**
+ * Payment schemes. The first three are answered behind HTTP 402. "acp-delegated"
+ * is an ACP-style checkout with a delegated, single-use payment token
+ * (src/checkout): there is no 402, but the adapter synthesizes the same
+ * internal decision point, so the gateway and signer stay the only authority.
+ */
+export type SchemeId = "x402" | "l402" | "card-psp" | "acp-delegated";
+export const SCHEME_IRI_NAME: Record<SchemeId, string> = { x402: "X402", l402: "L402", "card-psp": "CardPSP", "acp-delegated": "ACPDelegated" };
+/** The currency each scheme settles in. Used to propose which schemes a mandate in a currency may use. */
+export const SCHEME_CURRENCY: Record<SchemeId, string> = { x402: "USDC", l402: "SAT", "card-psp": "EUR", "acp-delegated": "EUR" };
 
 /** A machine-checkable condition. leftOperand is a local name in the sc: vocabulary. */
 export interface Criterion {
