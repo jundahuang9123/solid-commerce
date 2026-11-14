@@ -6,8 +6,9 @@
  * Instead of paying, the vault asks the PSP to mint a single-use token whose
  * allowance is exactly what the gateway authorized: at most that amount, in
  * that currency, for that merchant and checkout session, until the
- * authorization expires. The merchant charges the token; the PSP enforces the
- * allowance. The vault's card token is sent only to the PSP.
+ * authorization expires, and only for the session snapshot the gateway read.
+ * The merchant charges the token; the PSP enforces the allowance. The vault's
+ * card token is sent only to the PSP.
  */
 import type { PaymentAuthorization } from "../payments/types.js";
 import type { Allowance, CheckoutChallenge, DelegatedCredential } from "../checkout/acp.js";
@@ -19,9 +20,13 @@ export async function createDelegatedPayment(cardToken: string, allowedProviders
   // The challenge digest already binds these; checking them again keeps the allowance derivation obviously correct.
   if (challenge.merchant_id !== auth.payTo) throw new Error("challenge merchant differs from the authorized payee");
   if (!auth.resource.endsWith(`/checkout_sessions/${encodeURIComponent(challenge.checkout_session_id)}`)) throw new Error("challenge session differs from the authorized resource");
+  if (challenge.snapshot_digest !== auth.offerDigest) throw new Error("challenge snapshot differs from the authorized session snapshot");
+  // The snapshot digest travels in the allowance, so the PSP refuses to charge
+  // the token for a session that was changed after the gateway read it.
   const allowance: Allowance = {
     reason: "one_time", max_amount: Number(auth.amount), currency: auth.currency.toLowerCase(),
     checkout_session_id: challenge.checkout_session_id, merchant_id: auth.payTo, expires_at: auth.expiresAt,
+    checkout_snapshot_digest: auth.offerDigest,
   };
   // Idempotency-Key = authId: a retried call can never mint a second token for one authorization.
   const r = await postJson(`${challenge.provider}/agentic_commerce/delegate_payment`,

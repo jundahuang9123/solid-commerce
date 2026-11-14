@@ -4,7 +4,8 @@
  * POST /authorize                  check mandate + seller + offer + challenge, reserve budget, sign an authorization
  * POST /transactions/:id/outcome   agent reports paid / failed / unknown (with the seller's signed receipt)
  * POST /reconcile                  resolve authorized/pending transactions against the payment rails
- * POST /transactions/:id/reconcile one transaction, including refunds of settled checkout purchases
+ * POST /transactions/:id/reconcile the transaction's agent asks for one transaction to be reconciled,
+ *                                  including refunds of settled checkout purchases
  * GET  /transactions/:id           ledger row and event history
  * GET  /budget?mandate=<iri>       limit, committed, settled, available
  *
@@ -30,7 +31,7 @@ import { json, serve, type RunningServer } from "../util/http.js";
 import { toAtomic, fmt } from "../util/money.js";
 import type { OfferRef, PaymentAuthorization, PaymentOption, Receipt } from "../payments/types.js";
 import { nonceFor } from "../payments/schemes/x402.js";
-import { Ledger, type TxRow } from "./ledger.js";
+import { Ledger, type TxRow, type TxStatus } from "./ledger.js";
 import { ledgerEvidenceToTurtle } from "../rdf/evidence.js";
 import { bindCheckout, delegatedPaymentState, type Binding, type CheckoutClaim } from "./checkoutBinding.js";
 
@@ -57,6 +58,9 @@ export interface AuthorizeRequest {
 }
 
 export type Rejection = { code: string; reason: string };
+
+/** Statuses whose payment outcome is not known yet; only these may become settled or released. */
+const UNRESOLVED: TxStatus[] = ["authorized", "pending"];
 
 export interface GatewayHandle extends RunningServer {
   key: Ed25519Key;
@@ -169,13 +173,19 @@ export async function startGateway(cfg: GatewayConfig): Promise<GatewayHandle> {
     };
     const signed = signEnvelope(key, payload);
     const railReference = o.scheme === "x402" ? nonceFor(authId) : binding.railReference ?? null;
-    let outcome: { ok: true } | { ok: false; rj: Rejection };
+    let outcome: { ok: true } | { ok: false; status: number; rj: Rejection };
     try {
       outcome = ledger.immediate(() => {
-        if (ledger.get(r.transactionId)) return { ok: false as const, rj: reject("IDEMPOTENCY_RACE", "retry with the same request") };
+        if (ledger.get(r.transactionId)) return { ok: false as const, status: 409, rj: reject("IDEMPOTENCY_RACE", "retry with the same request") };
+        // One live authorization per checkout session, checked under the same lock as the budget:
+        // each authorization gets its own one-time token, so two would let one basket be charged twice.
+        const live = isCheckout && railReference ? ledger.liveCheckout(binding.seller, railReference) : undefined;
+        if (live) {
+          return { ok: false as const, status: 409, rj: reject("CHECKOUT_ALREADY_AUTHORIZED", `checkout session ${railReference} is already covered by transaction ${live.tx_id} (${live.status}); reconcile it before authorizing again`) };
+        }
         const committed = ledger.committed(m.id, m.currency);
         if (committed + amount > total) {
-          return { ok: false as const, rj: reject("BUDGET_EXCEEDED", `${fmt(committed, m.currency)} committed + ${fmt(amount, m.currency)} > ${fmt(total, m.currency)}`) };
+          return { ok: false as const, status: 403, rj: reject("BUDGET_EXCEEDED", `${fmt(committed, m.currency)} committed + ${fmt(amount, m.currency)} > ${fmt(total, m.currency)}`) };
         }
         ledger.insert({
           tx_id: r.transactionId, mandate_id: m.id, agent_id: r.agentId, seller: binding.seller, offer_id: binding.offerId, offer_version: binding.offerVersion,
@@ -190,7 +200,7 @@ export async function startGateway(cfg: GatewayConfig): Promise<GatewayHandle> {
     }
     if (!outcome.ok) {
       if (outcome.rj.code === "IDEMPOTENCY_RACE") return { status: 409, body: outcome.rj };
-      return fail(403, outcome.rj);
+      return fail(outcome.status, outcome.rj);
     }
     await syncEvidence(r.transactionId);
     return { status: 200, body: { authorization: signed, replayed: false, status: "authorized", budget: budget(m) } };
@@ -210,14 +220,14 @@ export async function startGateway(cfg: GatewayConfig): Promise<GatewayHandle> {
     if (tx.scheme === "acp-delegated") {
       // A checkout has no seller receipt. Whatever the agent reports, only the payment provider decides.
       await reconcileOne(tx);
-      if (ledger.get(txId)!.status === "authorized") ledger.update(txId, { status: "pending", reason: `agent reported ${body.result}${body.detail ? ": " + body.detail : ""}; awaiting the payment provider` });
+      ledger.move(txId, ["authorized"], { status: "pending", reason: `agent reported ${body.result}${body.detail ? ": " + body.detail : ""}; awaiting the payment provider` });
     } else if (body.result === "paid" && body.receipt) {
       const err = checkReceipt(tx, body.receipt);
       if (err) return { status: 422, body: reject("RECEIPT_INVALID", err) };
-      ledger.update(txId, { status: "settled", receipt_json: JSON.stringify(body.receipt), rail_reference: body.receipt.payload.railReference });
+      ledger.move(txId, UNRESOLVED, { status: "settled", receipt_json: JSON.stringify(body.receipt), rail_reference: body.receipt.payload.railReference });
     } else {
       // Uncertain or failed: hold the reservation until the rail says otherwise.
-      ledger.update(txId, { status: "pending", reason: body.detail ?? body.result });
+      ledger.move(txId, UNRESOLVED, { status: "pending", reason: body.detail ?? body.result });
       await reconcileOne(ledger.get(txId)!);
     }
     await syncEvidence(txId);
@@ -240,42 +250,53 @@ export async function startGateway(cfg: GatewayConfig): Promise<GatewayHandle> {
    *                              PSP confirms the refund, never on the agent's or merchant's word
    *  - no charge, expired     -> released: the PSP refuses expired tokens, so it can never be charged
    * A partial refund is noted and keeps the full charge committed (conservative).
+   *
+   * Every transition names the statuses it may leave (Ledger.move), so a stale
+   * row or a concurrent pass cannot, say, release a settled purchase.
    */
   async function reconcileCheckout(tx: TxRow, expired: boolean): Promise<string> {
     const provider = cfg.registry.getMerchant(tx.seller)?.paymentProvider ?? cfg.rails.pspUrl;
     const st = tx.rail_reference && tx.auth_id ? await delegatedPaymentState(provider, tx.rail_reference, tx.auth_id) : undefined;
     const charge = st?.token?.charge;
     if (charge?.status === "succeeded") {
-      if (charge.amount_refunded >= charge.amount) ledger.update(tx.tx_id, { status: "refunded", amount: String(charge.amount), reason: `refund of ${charge.id} confirmed by the payment provider` });
-      else if (tx.status !== "settled") ledger.update(tx.tx_id, { status: "settled", amount: String(charge.amount), reason: `charge ${charge.id} confirmed by the payment provider` });
+      if (charge.amount_refunded >= charge.amount) ledger.move(tx.tx_id, [...UNRESOLVED, "settled"], { status: "refunded", amount: String(charge.amount), reason: `refund of ${charge.id} confirmed by the payment provider` });
+      else if (tx.status !== "settled") ledger.move(tx.tx_id, UNRESOLVED, { status: "settled", amount: String(charge.amount), reason: `charge ${charge.id} confirmed by the payment provider` });
       else if (charge.amount_refunded > 0 && !tx.reason?.includes("partial refund")) ledger.update(tx.tx_id, { reason: `partial refund of ${charge.amount_refunded}; budget stays committed` });
-    } else if (tx.status === "authorized" || tx.status === "pending") {
-      if (st && expired) ledger.update(tx.tx_id, { status: "released", reason: "no charge and the delegated token has expired" });
-      else if (tx.status === "authorized" && expired) ledger.update(tx.tx_id, { status: "pending", reason: "authorization expired, payment provider state unknown" });
+    } else if (st && expired) {
+      // The PSP answered, shows no charge, and refuses expired tokens: it can never be charged.
+      ledger.move(tx.tx_id, UNRESOLVED, { status: "released", reason: "no charge and the delegated token has expired" });
+    } else if (expired) {
+      ledger.move(tx.tx_id, ["authorized"], { status: "pending", reason: "authorization expired, payment provider state unknown" });
     }
     return ledger.get(tx.tx_id)!.status;
   }
 
-  /** Ask the rail whether money moved. Release only when it provably cannot. */
+  /**
+   * Ask the rail whether money moved. Release only when it provably cannot.
+   * For the 402 schemes only unresolved rows are looked at: once settled
+   * (receipt or rail), nothing a rail answers later un-pays it. A rail that
+   * answers with an error proves nothing either way, so it holds the row.
+   */
   async function reconcileOne(tx: TxRow): Promise<string> {
-    if (tx.scheme === "acp-delegated") return reconcileCheckout(tx, tx.expires_at ? new Date(tx.expires_at) <= new Date() : true);
     const expired = tx.expires_at ? new Date(tx.expires_at) <= new Date() : true;
+    if (tx.scheme === "acp-delegated") return reconcileCheckout(tx, expired);
+    if (!UNRESOLVED.includes(tx.status)) return tx.status;
     let paid: boolean | undefined;
     try {
       if (tx.scheme === "x402" && tx.payer && tx.rail_reference) {
-        const r = await (await fetch(`${cfg.rails.facilitatorUrl}/authorization-state?authorizer=${tx.payer}&nonce=${tx.rail_reference}`)).json() as { used: boolean };
-        paid = r.used;
+        const r = await fetch(`${cfg.rails.facilitatorUrl}/authorization-state?authorizer=${tx.payer}&nonce=${tx.rail_reference}`);
+        paid = r.ok ? ((await r.json()) as { used: boolean }).used : undefined;
       } else if (tx.scheme === "l402" && tx.rail_reference) {
         const r = await fetch(`${cfg.rails.lightningUrl}/invoices/${tx.rail_reference}`);
-        paid = r.ok ? ((await r.json()) as { paid: boolean }).paid : false;
+        paid = r.ok ? ((await r.json()) as { paid: boolean }).paid : undefined;
       } else if (tx.scheme === "card-psp" && tx.rail_reference) {
         const r = await fetch(`${cfg.rails.pspUrl}/payment_intents/${tx.rail_reference}`);
-        paid = r.ok ? ((await r.json()) as { status: string }).status === "succeeded" : false;
+        paid = r.ok ? ((await r.json()) as { status: string }).status === "succeeded" : undefined;
       }
     } catch { paid = undefined; }
-    if (paid === true) ledger.update(tx.tx_id, { status: "settled", reason: "confirmed by reconciliation" });
-    else if (paid === false && expired) ledger.update(tx.tx_id, { status: "released", reason: "not paid and authorization expired" });
-    else if (tx.status === "authorized" && expired) ledger.update(tx.tx_id, { status: "pending", reason: "authorization expired, rail state unknown" });
+    if (paid === true) ledger.move(tx.tx_id, UNRESOLVED, { status: "settled", reason: "confirmed by reconciliation" });
+    else if (paid === false && expired) ledger.move(tx.tx_id, UNRESOLVED, { status: "released", reason: "not paid and authorization expired" });
+    else if (expired) ledger.move(tx.tx_id, ["authorized"], { status: "pending", reason: "authorization expired, rail state unknown" });
     return ledger.get(tx.tx_id)!.status;
   }
 
@@ -312,7 +333,11 @@ export async function startGateway(cfg: GatewayConfig): Promise<GatewayHandle> {
     if (req.method === "POST" && rc) {
       const row = ledger.get(decodeURIComponent(rc[1]));
       if (!row) return json(res, 404, reject("UNKNOWN_TRANSACTION", rc[1]));
-      const status = row.status === "rejected" || row.status === "released" ? row.status : await reconcileOne(row);
+      const { agentId } = JSON.parse(req.body || "{}") as { agentId?: string };
+      if (row.agent_id !== agentId) return json(res, 403, reject("NOT_YOUR_TRANSACTION", String(agentId)));
+      // Unresolved rows, plus settled checkout purchases (which can still be refunded). Nothing else moves.
+      const open = UNRESOLVED.includes(row.status) || (row.status === "settled" && row.scheme === "acp-delegated");
+      const status = open ? await reconcileOne(row) : row.status;
       await syncEvidence(row.tx_id);
       return json(res, 200, { status });
     }

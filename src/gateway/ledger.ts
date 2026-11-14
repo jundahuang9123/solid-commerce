@@ -70,11 +70,35 @@ export class Ledger {
     this.event(row.tx_id, row.status, row.reason ?? undefined);
   }
 
-  update(txId: string, fields: Partial<TxRow>) {
+  /** Change fields other than the status (notes, evidence). Status changes go through `move`. */
+  update(txId: string, fields: Partial<Omit<TxRow, "status">>) {
+    this.write(txId, fields, []);
+  }
+
+  /**
+   * Status transition, applied only if the row is still in one of `from`.
+   * Every caller names the statuses it may leave, so a stale read or a
+   * concurrent reconciliation can never move a row backwards (e.g. settled ->
+   * released, which would free budget for money that moved). Returns whether it applied.
+   */
+  move(txId: string, from: TxStatus[], fields: Partial<TxRow> & { status: TxStatus }): boolean {
+    return this.write(txId, fields, from);
+  }
+
+  private write(txId: string, fields: Partial<TxRow>, from: TxStatus[]): boolean {
     const f = { ...fields, updated_at: new Date().toISOString() };
     const cols = Object.keys(f);
-    this.db.prepare(`UPDATE transactions SET ${cols.map((c) => `${c} = ?`).join(", ")} WHERE tx_id = ?`).run(...(Object.values(f) as any[]), txId);
-    if (fields.status) this.event(txId, fields.status, fields.reason ?? undefined);
+    const guard = from.length ? ` AND status IN (${from.map(() => "?").join(",")})` : "";
+    const r = this.db.prepare(`UPDATE transactions SET ${cols.map((c) => `${c} = ?`).join(", ")} WHERE tx_id = ?${guard}`).run(...(Object.values(f) as any[]), txId, ...from);
+    if (r.changes > 0 && fields.status) this.event(txId, fields.status, fields.reason ?? undefined);
+    return r.changes > 0;
+  }
+
+  /** A checkout session's authorization that still holds budget, if any (authorized, pending or settled). */
+  liveCheckout(seller: string, sessionId: string): TxRow | undefined {
+    return this.db.prepare(
+      `SELECT * FROM transactions WHERE scheme = 'acp-delegated' AND seller = ? AND rail_reference = ? AND status IN (${COMMITTED.map(() => "?").join(",")}) LIMIT 1`,
+    ).get(seller, sessionId, ...COMMITTED) as TxRow | undefined;
   }
 
   unresolved(): TxRow[] {

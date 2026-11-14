@@ -127,7 +127,7 @@ const STATUS_IRI: Record<string, string> = { authorized: "Reserved", pending: "P
 
 // ------------------------------------------------------------------ physical fulfilment
 
-export type OrderState = "created" | "shipped" | "delivered" | "canceled" | "refunded";
+export type OrderState = "created" | "shipped" | "delivered" | "canceled" | "refunded" | "returned";
 
 export interface FulfilmentEvidence {
   docUrl: string;
@@ -150,12 +150,16 @@ export interface FulfilmentEvidence {
   updatedAt: string;
 }
 
-/** schema:OrderStatus individuals per order state. A refund is additionally marked sc:Refunded. */
-const ORDER_STATUS: Record<OrderState, string> = { created: "OrderProcessing", shipped: "OrderInTransit", delivered: "OrderDelivered", canceled: "OrderCancelled", refunded: "OrderCancelled" };
+/**
+ * schema:OrderStatus individuals per order state. A refund is additionally
+ * marked sc:Refunded: "refunded" is a cancellation before shipment, "returned"
+ * a refund after the goods went out, so the two are never confused.
+ */
+const ORDER_STATUS: Record<OrderState, string> = { created: "OrderProcessing", shipped: "OrderInTransit", delivered: "OrderDelivered", canceled: "OrderCancelled", refunded: "OrderCancelled", returned: "OrderReturned" };
 
 /**
  * One document per physical order, rewritten as it moves through
- * created -> shipped -> delivered (or canceled / refunded). Payment status and
+ * created -> shipped -> delivered (or canceled / refunded, or returned). Payment status and
  * delivery outcome are separate properties, so "paid, not shipped" can never
  * be read as "payment failed".
  */
@@ -168,7 +172,7 @@ export async function fulfilmentEvidenceToTurtle(e: FulfilmentEvidence): Promise
   add(o, NS.schema + "seller", nn(e.merchant));
   if (e.merchantName) add(o, NS.schema + "name", e.merchantName);
   add(o, NS.schema + "orderStatus", nn(NS.schema + ORDER_STATUS[e.orderStatus]));
-  if (e.orderStatus === "refunded") add(o, sc("status"), nn(sc("Refunded")));
+  if (e.orderStatus === "refunded" || e.orderStatus === "returned") add(o, sc("status"), nn(sc("Refunded")));
   add(o, sc("transactionId"), e.transactionId);
   add(o, NS.prov + "wasGeneratedBy", nn(e.transactionDoc + "#tx"));
   add(o, sc("amount"), e.total);

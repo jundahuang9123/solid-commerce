@@ -10,18 +10,23 @@
  *   GET  /checkout_sessions/{id}              current state; totals are recomputed from current prices
  *   POST /checkout_sessions/{id}              update { items?, fulfillment_address?, fulfillment_option_id? }
  *   POST /checkout_sessions/{id}/complete     { payment_data: { token, provider } }: charges the delegated token at the PSP
+ *                                             for the session's current snapshot (refused if it changed since authorization)
  *   POST /checkout_sessions/{id}/cancel
  *   GET  /orders/{id}                         order state (simulation convenience; ACP reports orders via webhooks)
- *   POST /orders/{id}/cancel                  buyer cancellation before shipment: refunds at the PSP
+ *   POST /orders/{id}/cancel                  buyer cancellation before shipment: refunds at the PSP; repeating it
+ *                                             retries a refund that failed
  *
  * Every POST honours Idempotency-Key: a repeated key replays the stored
- * response, and the same key with a different body is refused (409).
+ * response (a duplicate that arrives while the first is still running waits
+ * for its result), and the same key with a different body is refused (409).
+ * Completions of one session are also serialized whatever their keys, so
+ * two tokens for one session can never both be charged.
  */
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { canonicalJson, randomHex } from "../../util/crypto.js";
 import { json, postJson, serve, type RunningServer } from "../../util/http.js";
 import {
-  IDEMPOTENCY_HEADER, type AcpAddress, type AcpCheckoutSession, type AcpFulfillmentOption, type AcpOrder, type AcpProduct, type AcpTotal, type OrderStatus,
+  IDEMPOTENCY_HEADER, snapshotDigest, type AcpAddress, type AcpCheckoutSession, type AcpFulfillmentOption, type AcpOrder, type AcpProduct, type AcpTotal, type OrderStatus,
 } from "../../checkout/acp.js";
 
 export interface ShippingRate { id: string; title: string; carrier: string; amount: number; countries: string[] }
@@ -67,7 +72,10 @@ export async function startAcpMerchant(cfg: AcpMerchantConfig): Promise<AcpMerch
   const sessions = new Map<string, AcpCheckoutSession>();
   const orders = new Map<string, AcpOrder>();
   const receivedAddresses: AcpMerchantHandle["receivedAddresses"] = [];
-  const idem = new Map<string, { request: string; out: Out }>();
+  /** Idempotency-Key -> (request, result). The result is a promise so that in-flight duplicates share it. */
+  const idem = new Map<string, { request: string; out: Promise<Out> }>();
+  /** Session id -> the completion currently running for it. */
+  const completing = new Map<string, Promise<Out>>();
   let loseResponses = 0;
   let completions = 0;
   let base = "";
@@ -120,16 +128,33 @@ export async function startAcpMerchant(cfg: AcpMerchantConfig): Promise<AcpMerch
     if (body.fulfillment_option_id) s.fulfillment_option_id = body.fulfillment_option_id;
   }
 
-  async function complete(s: AcpCheckoutSession, body: any): Promise<Out> {
+  /**
+   * One completion per session at a time: the "already completed" check and
+   * the charge are separated by an await, so without this two completions
+   * with different tokens (or keys) could both pass the check and both charge.
+   * A completion that arrives while another runs waits, then re-checks.
+   */
+  function complete(s: AcpCheckoutSession, body: any): Promise<Out> {
+    const running = completing.get(s.id);
+    if (running) return running.then(() => complete(s, body), () => complete(s, body));
+    const p = completeNow(s, body).finally(() => completing.delete(s.id));
+    completing.set(s.id, p);
+    return p;
+  }
+
+  async function completeNow(s: AcpCheckoutSession, body: any): Promise<Out> {
     if (s.status === "completed") return { status: 200, body: s };  // already paid: never charge again
     refresh(s);
     if (s.status !== "ready_for_payment") return error(409, "not_ready_for_payment", "checkout session is not ready for payment");
     const token = body?.payment_data?.token;
     if (!token || body.payment_data.provider !== cfg.psp.url) return error(400, "invalid_payment_data", "a delegated token from this shop's payment provider is required");
     const total = s.totals.find((t) => t.type === "total")!.amount;
+    // Report the snapshot being charged for; the PSP refuses it unless it is the one the gateway
+    // authorized. It is part of the PSP idempotency key because a changed session is a different charge.
+    const digest = snapshotDigest(s);
     const ch = await postJson(`${cfg.psp.url}/agentic_commerce/charges`,
-      { token, amount: total, currency: s.currency, merchant_id: merchantId, checkout_session_id: s.id },
-      { authorization: `Bearer ${cfg.psp.apiKey}`, [IDEMPOTENCY_HEADER]: `${s.id}:${token}` });
+      { token, amount: total, currency: s.currency, merchant_id: merchantId, checkout_session_id: s.id, checkout_snapshot_digest: digest },
+      { authorization: `Bearer ${cfg.psp.apiKey}`, [IDEMPOTENCY_HEADER]: `${s.id}:${token}:${digest}` });
     if (ch.status !== 200) return error(402, ch.body?.code ?? "payment_failed", ch.body?.message ?? "charge failed", "processing_error");
     const orderId = "ord_" + randomHex(6);
     const order: AcpOrder = {
@@ -143,12 +168,23 @@ export async function startAcpMerchant(cfg: AcpMerchantConfig): Promise<AcpMerch
     return { status: 200, body: s };
   }
 
+  /**
+   * Refund the order's charge in full. The order changes only once the PSP
+   * confirmed the refund, so a failure leaves it retryable. Idempotency-Key
+   * refund:<order> makes a retry after a lost PSP response refund once.
+   */
   async function refund(o: AcpOrder, detail: string): Promise<Out> {
-    const r = await postJson(`${cfg.psp.url}/agentic_commerce/refunds`, { charge_id: o.charge_id }, { authorization: `Bearer ${cfg.psp.apiKey}`, [IDEMPOTENCY_HEADER]: `refund:${o.id}` });
+    let r: { status: number; body: any };
+    try {
+      r = await postJson(`${cfg.psp.url}/agentic_commerce/refunds`, { charge_id: o.charge_id }, { authorization: `Bearer ${cfg.psp.apiKey}`, [IDEMPOTENCY_HEADER]: `refund:${o.id}` });
+    } catch (e) {
+      return error(502, "refund_failed", `payment provider unreachable: ${(e as Error).message}`, "processing_error");
+    }
     if (r.status !== 200) return error(502, "refund_failed", r.body?.message ?? "refund failed", "processing_error");
     o.refund = { id: r.body.id, amount: r.body.amount };
-    o.status = "refunded";
-    o.events.push({ status: "refunded", at: new Date().toISOString(), detail });
+    // Goods that went out and came back are a return, not a cancellation.
+    o.status = o.status === "shipped" || o.status === "delivered" ? "returned" : "refunded";
+    o.events.push({ status: o.status, at: new Date().toISOString(), detail });
     return { status: 200, body: o };
   }
 
@@ -172,6 +208,8 @@ export async function startAcpMerchant(cfg: AcpMerchantConfig): Promise<AcpMerch
       if (req.method !== "POST") return undefined;
       if (m[2] === "/complete") return complete(s, body);
       if (s.status === "completed" || s.status === "canceled") return error(409, `session_${s.status}`, `checkout session is ${s.status}`);
+      // While a charge is in flight the session must not change under it (the order is built from it).
+      if (completing.has(s.id)) return error(409, "completion_in_progress", "checkout session is being completed");
       if (m[2] === "/cancel") { s.status = "canceled"; return { status: 200, body: s }; }
       applyUpdate(s, body);
       return { status: 200, body: refresh(s) };
@@ -183,9 +221,14 @@ export async function startAcpMerchant(cfg: AcpMerchantConfig): Promise<AcpMerch
       if (req.method === "GET" && !o[2]) return { status: 200, body: order };
       if (req.method === "POST" && o[2]) {
         if (order.status === "refunded") return { status: 200, body: order };
-        if (order.status !== "created") return error(409, "order_already_shipped", `order is ${order.status}; return it instead`);
-        order.status = "canceled";
-        order.events.push({ status: "canceled", at: new Date().toISOString(), detail: "canceled by the buyer before shipment" });
+        if (order.status === "returned") return error(409, "order_returned", "order was returned and refunded");
+        if (order.status === "shipped" || order.status === "delivered") return error(409, "order_already_shipped", `order is ${order.status}; return it instead`);
+        // The cancellation stands even if the refund fails, so the order is not shipped;
+        // "canceled" without a refund is what a repeated cancellation retries.
+        if (order.status === "created") {
+          order.status = "canceled";
+          order.events.push({ status: "canceled", at: new Date().toISOString(), detail: "canceled by the buyer before shipment" });
+        }
         return refund(order, "refund for buyer cancellation");
       }
     }
@@ -200,11 +243,20 @@ export async function startAcpMerchant(cfg: AcpMerchantConfig): Promise<AcpMerch
     const key = req.headers[IDEMPOTENCY_HEADER] as string | undefined;
     const scoped = key && req.method === "POST" ? `${new URL(req.url, "http://x").pathname}:${key}` : undefined;
     const request = canonicalJson(req.body ? JSON.parse(req.body) : {});
-    const prior = scoped ? idem.get(scoped) : undefined;
-    if (prior && prior.request !== request) return json(res, 409, { type: "invalid_request", code: "idempotency_conflict", message: "Idempotency-Key reused for a different request" });
-    const out = prior?.out ?? (await route(req)) ?? { status: 404, body: { type: "invalid_request", code: "not_found", message: "not found" } };
-    // Only successes are stored: a declined charge may be retried under the same key.
-    if (scoped && !prior && out.status < 300) idem.set(scoped, { request, out });
+    let entry = scoped ? idem.get(scoped) : undefined;
+    if (entry && entry.request !== request) return json(res, 409, { type: "invalid_request", code: "idempotency_conflict", message: "Idempotency-Key reused for a different request" });
+    if (!entry) {
+      // Registered before the first await, so a duplicate arriving meanwhile shares this result.
+      const fresh = { request, out: route(req).then((o) => o ?? { status: 404, body: { type: "invalid_request", code: "not_found", message: "not found" } }) };
+      if (scoped) {
+        idem.set(scoped, fresh);
+        // Only successes are kept: a declined charge may be retried under the same key.
+        const forget = () => { if (idem.get(scoped) === fresh) idem.delete(scoped); };
+        fresh.out.then((o) => { if (o.status >= 300) forget(); }, forget);
+      }
+      entry = fresh;
+    }
+    const out = await entry.out;
     if (/\/complete$/.test(req.url) && loseResponses > 0 && out.status === 200) {
       loseResponses--;
       req.socket.destroy();                     // processed, but the buyer never hears back

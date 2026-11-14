@@ -193,7 +193,7 @@ export class CheckoutPurchaser {
     const order = await this.adapter.order(t.orderUrl);
     if (!order) throw new Error(`cannot read order ${t.orderUrl}`);
     // Refunds are confirmed by the gateway at the PSP; the merchant's order status alone moves no budget.
-    const gw = await postJson(`${this.cfg.gatewayUrl}/transactions/${encodeURIComponent(t.transactionId)}/reconcile`, {});
+    const gw = await postJson(`${this.cfg.gatewayUrl}/transactions/${encodeURIComponent(t.transactionId)}/reconcile`, { agentId: this.cfg.agentId });
     const next: OrderTracking = { ...t, orderStatus: order.status, events: order.events, paymentStatus: gw.body?.status ?? t.paymentStatus };
     next.delivery = deliveryState(next);
     this.log(`Order ${t.orderId}: ${order.status}; payment ${next.paymentStatus}`);
@@ -225,7 +225,8 @@ export class CheckoutPurchaser {
 
   async cancel(t: OrderTracking): Promise<OrderTracking> {
     const r = await this.adapter.cancelOrder(t.orderUrl);
-    if (r.status !== 200) this.log(`Merchant refused cancellation: ${r.body?.code ?? r.status} ${r.body?.message ?? ""}`);
+    if (r.body?.code === "refund_failed") this.log(`Merchant canceled the order but its refund failed (${r.body.message}); cancel again to retry the refund`);
+    else if (r.status !== 200) this.log(`Merchant refused cancellation: ${r.body?.code ?? r.status} ${r.body?.message ?? ""}`);
     return this.track(t);
   }
 
@@ -252,15 +253,26 @@ export class CheckoutPurchaser {
   }
 }
 
-/** Fulfilment outcome from the order state and the user's verdict. "Delivered" needs the user, not the carrier. */
+/**
+ * Fulfilment outcome from the order state and the user's verdict. "Delivered"
+ * needs the user, not the carrier, and a later return or refund never
+ * replaces the user's signed verdict: it is recorded alongside it.
+ */
 function deliveryState(t: OrderTracking): OrderTracking["delivery"] {
+  const refund = t.paymentStatus === "refunded" ? "refund confirmed by the payment provider, budget released" : "refund not yet confirmed by the payment provider, budget still committed";
   switch (t.orderStatus) {
     case "created": return { status: "FulfilmentPending", checks: [`paid (${t.paymentStatus}); awaiting shipment`] };
     case "shipped": return { status: "FulfilmentPending", checks: ["in transit"] };
     case "delivered":
       return t.acceptance ? { status: t.acceptance.verdict, checks: t.acceptance.checks } : { status: "FulfilmentPending", checks: ["delivered by the carrier; awaiting the user's inspection"] };
     case "canceled":
+      // Canceled, but the merchant's refund has not gone through: cancelling again retries it.
+      return { status: "Cancelled", checks: [`order canceled; ${refund}; cancel again to retry the refund`] };
     case "refunded":
-      return { status: "Cancelled", checks: [t.paymentStatus === "refunded" ? "order canceled; refund confirmed by the payment provider, budget released" : "order canceled; refund not yet confirmed by the payment provider, budget still committed"] };
+      return { status: "Cancelled", checks: [`order canceled; ${refund}`] };
+    case "returned":
+      return t.acceptance
+        ? { status: t.acceptance.verdict, checks: [...t.acceptance.checks, `returned; ${refund}`] }
+        : { status: "Cancelled", checks: [`returned before the user's inspection; ${refund}`] };
   }
 }
