@@ -10,7 +10,8 @@
  */
 import { GoogleGenAI, type GenerateContentResponse, type GoogleGenAIOptions } from "@google/genai";
 import { toLlmError } from "../structured.js";
-import type { AdapterOptions, ChatAdapter, Completion, CompletionRequest } from "../types.js";
+import { assertSecureTransport, envUrl } from "../transport.js";
+import { LlmError, type AdapterOptions, type ChatAdapter, type Completion, type CompletionRequest } from "../types.js";
 
 export const GEMINI_DEFAULT_MODEL = "gemini-2.5-flash";
 
@@ -33,6 +34,14 @@ export class GeminiAdapter implements ChatAdapter {
   constructor(readonly model: string, private readonly client: GeminiLike, private readonly maxOutputTokens = 16000) {}
 
   static create(o: AdapterOptions & { vertex?: GeminiVertexOptions }): GeminiAdapter {
+    // Either an API key or an ADC access token is always sent. The SDK reads its own base-URL variables.
+    const envBase = o.vertex ? "GOOGLE_VERTEX_BASE_URL" : "GOOGLE_GEMINI_BASE_URL";
+    assertSecureTransport("gemini", o.baseURL ?? envUrl(envBase), true, o.baseURL ? "base URL" : envBase);
+    if (o.vertex && !o.apiKey && !o.vertex.googleAuthOptions?.credentials && !(o.vertex.project ?? envUrl("GOOGLE_CLOUD_PROJECT"))) {
+      // Without a project (and without location) the SDK keeps GEMINI_API_KEY / GOOGLE_API_KEY from
+      // process.env and sends it to the Vertex express endpoint instead of using ADC. Refuse that.
+      throw new LlmError("config", "Vertex AI with Application Default Credentials needs a project: set GOOGLE_CLOUD_PROJECT (and GOOGLE_CLOUD_LOCATION), or LLM_API_KEY for Vertex AI express mode", "gemini");
+    }
     const client = new GoogleGenAI({
       ...(o.vertex ? { vertexai: true, project: o.vertex.project, location: o.vertex.location, googleAuthOptions: o.vertex.googleAuthOptions } : { vertexai: false }),
       apiKey: o.apiKey,
