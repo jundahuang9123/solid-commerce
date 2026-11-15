@@ -456,5 +456,12 @@ describe("ACP-style checkout (physical goods)", () => {
     assert.match(doc, /sc:NonCompliant/);
     assert.match(doc, /sc:Refunded/);
     assert.doesNotMatch(doc, /schema:OrderCancelled/);
+
+    // A retried merchant refund changes nothing: still a return, verdict intact, nothing refunded twice.
+    await e.merchants.sohle.refundOrder(t.orderId);
+    t = await a.trackOrder(t);
+    assert.deepEqual([t.orderStatus, t.paymentStatus, t.delivery.status], ["returned", "refunded", "NonCompliant"]);
+    assert.doesNotMatch((await e.pod.get(t.fulfilment))!.text, /schema:OrderCancelled/);
+    assert.equal(e.rails.psp.merchantBalances.get(e.merchants.sohle.merchantId), 0);
   });
 });

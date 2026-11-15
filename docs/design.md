@@ -43,6 +43,18 @@ The gateway checks, in order:
 
 The signer pays only if the gateway's signature verifies and the challenge it receives hashes to `challengeDigest`. That stops payee substitution after authorization.
 
+### Checkout merchants (no 402, no signed offer)
+
+For an ACP-style checkout there is no seller signature to check, so steps 2–3 change. The gateway takes only identifiers from the agent (merchant, session id, line items). It fetches the session itself, server to server, from the merchant's pinned API base URL. From that copy it derives the amount (the session total, which must include delivery and tax), the payee, the items, the category (from the merchant's own feed) and the shipping address, which must match the Pod.
+
+The authorization is bound to a digest of the session snapshot. The signer copies that digest into the one-time delegated token's allowance, and the PSP charges the token only once, at most the authorized amount, for that merchant, session and snapshot, before expiry. Only one live authorization per session exists, so concurrent completions cannot mint two tokens.
+
+What this does not cover: a merchant that ships something other than what its own session says. That is caught only after delivery, by the user's signed verdict.
+
+### Proxy route binding (seller side)
+
+The proxy (`src/payments/serverSide.ts`) binds each settled payment to one resource and one request target before money moves. x402's `resource` field is not signed, so this binding, not the signature, keeps an x402 credential on its route. Nonces are canonicalised before use. A settled credential re-delivers only for GET; for other methods a delivered payment is consumed. Route matching is canonical, so a paid path cannot be reached through a respelling.
+
 ## Idempotency and replay
 
 | Layer | Mechanism |

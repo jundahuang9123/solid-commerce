@@ -3,10 +3,12 @@
 A working prototype of grounded AI shopping:
 
 - **Solid Pods** hold what the user wants: agreed meanings, preferences, requirements and explicit spending mandates. All are user-controlled and versioned.
-- **Approved sellers** publish signed offers.
+- **Approved sellers** publish signed offers. A reusable **402 proxy** lets any existing HTTP API sell through HTTP 402 without code changes.
 - **HTTP 402** is the payment decision point. One 402 response can offer several payment protocols.
+- Shops that will never speak 402 (physical goods) are reached through an **ACP-style checkout adapter**. The same gateway and signer stay the only authority.
 - A deterministic **gateway** reserves budget and authorises each payment, and a separate **signer** holds the keys.
-- Every step leaves **evidence** in the Pod.
+- The interpreter runs on **any major LLM provider** (Claude, OpenAI, Gemini, Ollama, OpenAI-compatible endpoints) or offline rules.
+- Every step leaves **evidence** in the Pod, and a **web demo** shows it all live.
 
 > **Status: prototype. All payments are simulated.** Signatures are real (EIP-712, Ed25519), protocols run over real HTTP, and the Pod is a real Community Solid Server. Settlement happens in in-memory simulations of the payment rails. Do not use with real funds.
 
@@ -20,7 +22,9 @@ No. RFC 9110 reserves `402 Payment Required` but gives it no semantics. The stat
 | **L402-style** | `WWW-Authenticate: L402 macaroon="…", invoice="…"` | `Authorization: L402 <macaroon>:<preimage>` | Lightning-style invoice, preimage = proof | Simplified HMAC "macaroon" and a simulated node. Not BOLT11, not libmacaroons |
 | **Card / PSP intent** | `WWW-Authenticate: Payment method="card-psp", id="pi_…", …` | `Authorization: Payment <base64url>` | PSP payment intent, confirmed by the vault with a card token | Loosely modelled on the "Payment" HTTP auth scheme of recent machine-payment proposals. Not a spec implementation |
 
-The same pattern carries over to bank payment initiation or ACP-style delegated checkout: the 402 names a provider-side payment object, the buyer's vault completes it, and the seller checks it with the provider. To add a scheme, add a parser in `src/payments/http402.ts`, a payer in `src/signer`, a verifier in the seller, and a reconciler in the gateway.
+The same pattern carries over to bank payment initiation: the 402 names a provider-side payment object, the buyer's vault completes it, and the seller checks it with the provider. To add a scheme, add a parser in `src/payments/http402.ts`, a payer in `src/signer`, a verifier in `src/payments/serverSide.ts` (used by the proxy), and a reconciler in the gateway.
+
+And when the seller has no 402 at all, the buyer side can synthesize the same decision point from the seller's checkout API (see [Physical goods](#physical-goods-acp-style-checkout)). The gateway and signer do not depend on the status code. They need a payment request bound to terms they can check.
 
 ## Run it
 
@@ -39,18 +43,25 @@ npm run demo:interactive
 ```
 
 ```bash
+npm run demo:web
+```
+
+```bash
 npm test
 ```
 
-- `npm run demo` runs the full Berlin weather scenario with auto-answers.
+- `npm run demo` runs the full Berlin weather scenario in the terminal with auto-answers.
 - `npm run demo:interactive` lets you answer the clarification and approve on the "device".
-- `npm test` runs 12 unit tests and 11 end-to-end tests. The end-to-end tests start a real Community Solid Server.
+- `npm run demo:web` starts the web demo: live dashboard, phone approval by QR code, "Break it" and the shoes checkout (see [Web demo](#web-demo)).
+- `npm test` runs the unit, end-to-end, proxy, checkout, LLM-provider and web-demo suites. The end-to-end suites start a real Community Solid Server.
 
 Options:
 
-- `INTERPRETER=claude npm run demo` uses Claude instead of the offline rule-based interpreter. It needs Anthropic credentials (`ANTHROPIC_API_KEY` or an `ant auth login` profile). Set `CLAUDE_MODEL` to change the model.
+- `LLM_PROVIDER=anthropic|openai|gemini|ollama|openai-compatible` (with `LLM_MODEL`, and the provider's usual API-key variable) runs the interpreter on an LLM instead of the offline rules. See [`docs/llm-providers.md`](docs/llm-providers.md). The older `INTERPRETER=claude` still works.
 - `POD_URL=http://localhost:3000/ npm run demo` uses an already running Solid server (`npm run pod` starts one).
 - `npm run demo -- --export-examples ontology/examples` writes the generated Pod documents to disk.
+- `npm run proxy -- --config proxy.example.json` runs the 402 proxy in front of an API of your own.
+- `npm run compare:interpreters` runs the same requests through every configured LLM provider and reports where they differ.
 
 ### What the demo shows
 
@@ -73,9 +84,12 @@ Options:
 ```mermaid
 flowchart LR
   U[User + approval device] -- confirms / signs --> POD[(Buyer Solid Pod<br/>common ground · mandates · evidence)]
-  A[Buyer assistant<br/>LLM or rules] -- reads / proposes --> POD
-  A -- GET resource --> S[Seller service<br/>signed offers · 402]
+  A[Buyer assistant<br/>any LLM or rules] -- reads / proposes --> POD
+  A -- GET resource --> S[Seller API behind 402 proxy<br/>signed offers · 402]
   S -- 402: x402 + L402 + card --> A
+  A -- checkout session --> M[Checkout merchant<br/>ACP-style, no 402]
+  G -- re-reads session --> M
+  M -- charges delegated token --> R
   A -- authorize --> G[Gateway<br/>policy · SQLite ledger]
   G -- reads mandate, writes ledger evidence --> POD
   G -- signed authorization --> A
@@ -92,13 +106,17 @@ flowchart LR
 | Ontology | `ontology/sc.ttl`, `ontology/shapes.ttl` | Small application profile reusing ODRL, SKOS, PROV-O, schema.org, QUDT; SHACL shapes |
 | RDF mapping | `src/rdf/records.ts`, `src/rdf/evidence.ts` | Deterministic record ↔ Turtle; evidence documents |
 | Pod | `src/pod/` | Solid LDP client, Pod layout, WAC policy, wallet descriptor (no secrets) |
-| Grounding | `src/grounding/` | Interpreters (rules / Claude), validation, clarification, revisions, user confirmation |
-| Assistant | `src/agent/` | Offer ranking, 402 flow, delivery checks, recovery |
-| Trust | `src/trust/registry.ts` | Approved sellers bound to pinned offer-signing keys |
-| Seller | `src/seller/sellerServer.ts` | Identity, signed offers (JSON + schema.org Turtle), paid resource with multi-scheme 402, signed receipts |
-| Gateway | `src/gateway/` | Mandate verification, offer/challenge binding, atomic budget reservation, idempotency, reconciliation |
-| Signer | `src/signer/signerService.ts` | Pays only against gateway-signed authorizations, idempotently |
-| Payment schemes | `src/payments/` | x402, L402-style and card/PSP parsers and payers, plus simulated rails |
+| Grounding | `src/grounding/` | Rule-based and LLM interpreters, validation, clarification, revisions, user confirmation |
+| LLM providers | `src/llm/` | Provider-neutral structured generation: Anthropic, OpenAI/Azure, Gemini/Vertex, Ollama, OpenAI-compatible; local schema validation and one repair attempt |
+| Assistant | `src/agent/` | Offer ranking, 402 flow, checkout purchases, delivery checks, order tracking, recovery |
+| Trust | `src/trust/registry.ts` | Approved sellers bound to pinned offer-signing keys; approved checkout merchants bound to pinned API addresses |
+| 402 proxy | `src/proxy/`, `src/payments/serverSide.ts` | Sells any upstream API through HTTP 402: identity, signed offers, multi-scheme challenges, settlement, route binding, signed receipts |
+| Seller | `src/seller/sellerServer.ts` | Demo weather sellers: a plain API with the 402 proxy in front |
+| Checkout | `src/checkout/`, `src/agent/checkoutPurchase.ts` | ACP-style checkout adapter for physical goods: feed → candidates, session, delegated payment, tracking |
+| Gateway | `src/gateway/` | Mandate verification, offer/challenge or checkout-snapshot binding, atomic budget reservation, idempotency, reconciliation |
+| Signer | `src/signer/` | Pays only against gateway-signed authorizations, idempotently; mints one-time delegated card tokens |
+| Payment schemes | `src/payments/` | x402, L402-style and card/PSP parsers and payers, plus simulated rails, PSP and checkout merchants |
+| Web demo | `src/web/` | Live dashboard, wire trace, phone approval, Break it, shoes checkout, recording and replay |
 
 See [`docs/design.md`](docs/design.md) for the design decisions and threat model.
 
@@ -117,9 +135,60 @@ Every record carries `sc:revision`, `sc:status` (`Proposed` / `UserConfirmed` / 
 
 Real generated examples are in [`ontology/examples/`](ontology/examples/). The `sc:` namespace (`https://w3id.org/solid-commerce#`) is a placeholder and not a registered standard.
 
+## Selling through HTTP 402: the proxy
+
+A real seller does not need to rewrite its API. `src/proxy/` is a reverse proxy, similar in spirit to Aperture for L402, that sits in front of any HTTP API:
+
+- It publishes the seller's identity (`/profile/card`, with the offer-signing key) and one signed, versioned offer per paid route.
+- An unpaid request to a paid route gets one 402 with x402, L402-style and card challenges. A paid request is settled first, then forwarded upstream with all payment headers stripped. The response carries a seller-signed receipt over the exact bytes returned.
+- Each payment is bound to one resource and one request target. A credential bought for one route never opens another. Re-presenting a settled credential re-delivers a GET without charging again; for other methods a delivered payment is used up.
+- Route matching is canonical. Respellings of a paid path, other methods on it and ambiguous escapes are refused (404 / 405 / 400), never passed through for free.
+- If the upstream fails after payment, the buyer gets `502` with `paid: true` and can retry with the same credential.
+
+```bash
+npm run proxy -- --config proxy.example.json
+```
+
+Keys come only from environment variables or files named in the config, never from the config itself. Missing keys are generated for the process with a loud warning. The demo weather sellers are themselves plain APIs behind this proxy.
+
+## Physical goods: ACP-style checkout
+
+Most shops will never answer with 402. For them the assistant uses an ACP-style checkout API (checkout sessions, totals including delivery and tax, delegated payment). It is modelled on the public description of the Agentic Commerce Protocol and has not been checked against the specification.
+
+1. **Compare** products from approved merchants' feeds with the same ranking, requirements and preferences as 402 offers. Example: "repairable shoes" is clarified to *replaceable soles*, and the price compared is item plus delivery.
+2. **Check out** with the chosen merchant only. The Pod's shipping address (`schema:PostalAddress`) goes to that one merchant.
+3. **Authorize:** the gateway re-reads the checkout session itself from the merchant's pinned API address. It does not trust the agent's numbers. It checks total (including delivery) against the mandate, line items, category, payee and shipping address, then binds the authorization to a digest of that snapshot. Only one live authorization per checkout session is allowed.
+4. **Pay:** the signer has the PSP mint a one-time delegated card token limited to that amount, merchant, session, snapshot and expiry. The card token never leaves the signer.
+5. **Track:** the order moves through shipped → delivered. Then the user signs a verdict on the approval device ("Can the soles be replaced?"), which is recorded as the delivery outcome. Cancellation and refunds release budget only when the PSP confirms them.
+
+## LLM providers
+
+The interpreter can run on Anthropic Claude (also Bedrock and Vertex through the Anthropic SDK), OpenAI or Azure OpenAI, Google Gemini or Vertex AI, Ollama, or any OpenAI-compatible endpoint (Mistral, Groq, OpenRouter, Together, DeepSeek, LM Studio, vLLM). Each adapter uses the provider's native structured-output mode and then validates the answer locally, with one repair attempt.
+
+Whatever the model says still passes the vocabulary check, clarification and the user's signature. A weaker model can misread a request, but it cannot create spending authority. Setup per provider: [`docs/llm-providers.md`](docs/llm-providers.md).
+
+> The adapters are tested against local servers that mimic each provider's wire format. None of them has been run against the live services in this repository's tests.
+
+## Web demo
+
+```bash
+npm run demo:web
+```
+
+It prints a dashboard URL, a phone URL and a QR code:
+
+| Screen | What it shows |
+|---|---|
+| Live dashboard | The conversation, offers with reasons, every real HTTP exchange of the 402 flow ("on the wire"), the Pod's documents, Turtle and budget |
+| Phone approval | Opened from the QR code. Each item is approved on the phone; spending mandates are shown separately as FINANCIAL AUTHORITY |
+| Break it | Six live attacks and failures with the gateway's real verdicts |
+| Shoes | The checkout flow for physical goods, tracking and the user's signed verdict |
+
+A research/business toggle switches between mechanism detail and outcomes. Live calls are the default; `npm run demo:web -- --rehearse talk` records a verified fallback, and `--replay recordings/talk.json` plays it back. Presenter guide: [`docs/demo.md`](docs/demo.md).
+
 ## Completion checks
 
-All checks from the implementation brief are automated in `test/e2e.test.ts`:
+All checks from the implementation brief are automated in `test/e2e.test.ts`. The proxy, checkout, LLM-provider and web-demo suites (`test/proxy.test.ts`, `test/checkout.test.ts`, `test/llm.test.ts`, `test/web.test.ts`) cover the same properties for their parts, including a regression test for every confirmed review finding.
 
 | Check | Test |
 |---|---|
@@ -142,6 +211,9 @@ All checks from the implementation brief are automated in `test/e2e.test.ts`:
 | Ed25519 signatures on offers, receipts, authorizations and user confirmations | User approval device is in-process (stands in for a passkey or phone) |
 | SQLite ledger with `BEGIN IMMEDIATE` reservations | Signer idempotency state is in memory |
 | SHACL validation (`rdf-validate-shacl`) | Signing uses canonical JSON of parsed terms, not RDF Dataset Canonicalization (RDFC-1.0) |
+| 402 proxy over real HTTP | Proxy settlement state (route bindings) is in memory |
+| ACP-style checkout sessions, delegated tokens and orders over real HTTP | Merchants and PSP are simulations; ACP shapes are modelled on the public description, not verified against the specification |
+| Official provider SDKs (`@anthropic-ai/sdk`, `openai`, `@google/genai`) and Ollama's REST API | Adapters tested only against local mock servers, never against the live services |
 | | L402 macaroon and invoices are simplified; the card PSP is a mock |
 
 ## Making it real (next steps)
@@ -151,7 +223,8 @@ All checks from the implementation brief are automated in `test/e2e.test.ts`:
 3. **L402:** replace the simulated node with LND/CLN and use real macaroons (e.g. Aperture).
 4. **Card:** use a PSP's test mode. The vault stores only the PSP's payment-method token.
 5. **Signer hardening:** persistent idempotency store, HSM/KMS or a passkey-protected key, rate limits.
-6. **Interpretation research:** compare the rule-based and LLM interpreters on intent preservation across sessions and changing preferences (see Frohn, *From Prompting to Grounding*).
+6. **Interpretation research:** run `npm run compare:interpreters` against live providers and compare the rule-based and LLM interpreters on intent preservation across sessions and changing preferences (see Frohn, *From Prompting to Grounding*).
+7. **Checkout:** verify the ACP-style shapes against the current Agentic Commerce Protocol specification and a real PSP's delegated-payment API; persist the proxy's settlement bindings.
 
 Before using live funds, review the applicable privacy and payment obligations and the operational recovery procedures.
 

@@ -174,6 +174,9 @@ export async function startAcpMerchant(cfg: AcpMerchantConfig): Promise<AcpMerch
    * refund:<order> makes a retry after a lost PSP response refund once.
    */
   async function refund(o: AcpOrder, detail: string): Promise<Out> {
+    // Already refunded (a retry): the order's outcome is settled. Re-deciding its status
+    // here would turn a return into a cancellation and erase the buyer's verdict.
+    if (o.refund) return { status: 200, body: o };
     let r: { status: number; body: any };
     try {
       r = await postJson(`${cfg.psp.url}/agentic_commerce/refunds`, { charge_id: o.charge_id }, { authorization: `Bearer ${cfg.psp.apiKey}`, [IDEMPOTENCY_HEADER]: `refund:${o.id}` });
