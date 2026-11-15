@@ -14,8 +14,8 @@ import { LiveDemo } from "../src/web/live.js";
 import { ReplayDemo } from "../src/web/replay.js";
 import { loadRecording, type DemoEvent } from "../src/web/events.js";
 import { startDemoServer, demoToken, type DemoServer } from "../src/web/server.js";
-import { perform, rehearsalProblems } from "../src/web/rehearse.js";
-import { QUIET, actAs } from "../src/web/wire.js";
+import { actionProblems, perform, recordingProblems, rehearsalProblems, rehearse } from "../src/web/rehearse.js";
+import { QUIET, QUIET_HEADER, actAs } from "../src/web/wire.js";
 import { sleep } from "../src/web/scenarios/common.js";
 
 const RECORDING = fileURLToPath(new URL("../recordings/talk.json", import.meta.url));
@@ -70,11 +70,20 @@ async function run(srv: DemoServer, demo: LiveDemo, name: string, args: Record<s
 }
 
 /** Wait until the action that is running (if any) has finished. */
-const idle = (demo: LiveDemo) => until(() => [...demo.log.all()].reverse().find((e) => e.type === "busy")?.data.action === null);
+const idle = (demo: LiveDemo) => until(() => ([...demo.log.all()].reverse().find((e) => e.type === "busy")?.data.action ?? null) === null);
 
 /** Wait until a reset has produced a new log (fresh Pod and environment) that has finished starting up. */
-async function resetDone(demo: LiveDemo, previous: DemoEvent) {
-  await until(() => { const log = demo.log.all(); return log[0] !== previous && log.some((e) => e.type === "session") && log.at(-1)?.type === "busy" && log.at(-1)?.data.action === null; });
+async function resetDone(demo: LiveDemo, previous: DemoEvent, timeoutMs = 60_000) {
+  await until(() => { const log = demo.log.all(); return log[0] !== previous && log.some((e) => e.type === "session") && log.at(-1)?.type === "busy" && log.at(-1)?.data.action === null; }, timeoutMs);
+}
+
+/** Reset into a fresh session (fresh Pod, new environment) with auto-approve on or off. */
+async function freshSession(srv: DemoServer, demo: LiveDemo, auto: boolean) {
+  await idle(demo);
+  assert.equal((await post(srv, "/api/auto-approve", { on: auto })).status, 200);
+  const previous = demo.log.all()[0];
+  assert.equal((await post(srv, "/api/action/reset")).status, 202);
+  await resetDone(demo, previous);
 }
 
 describe("web demo, live", () => {
@@ -117,6 +126,11 @@ describe("web demo, live", () => {
   });
 
   test("the dashboard's own polling (budget meters, Pod panel) puts nothing on the wire, also downstream of the gateway", async () => {
+    // Self-contained: run alone (--test-name-pattern), there is no weather mandate yet.
+    if (!demo.log.all().some((e) => e.type === "budget" && e.data.key === "weather")) {
+      assert.equal((await post(srv, "/api/auto-approve", { on: true })).status, 200);
+      await run(srv, demo, "weather.autoplay");
+    }
     const before = demo.log.all().length;
     // What runs after every action: Pod listing, latest document and GET /budget for each tracked mandate
     await (demo as unknown as { refresh(): Promise<void> }).refresh();
@@ -140,7 +154,7 @@ describe("web demo, live", () => {
     assert.equal(done.price.tone, "warn");
     assert.match(done.price.lines[0], /^offer v\d+ → v\d+: re-validated$/);
     assert.equal(done.race.tone, "blocked");
-    assert.match(done.race.lines[0], /^2 settled · 4 BUDGET_EXCEEDED · charged/);
+    assert.equal(done.race.lines[0], "2 settled · 4 BUDGET_EXCEEDED · charged 0.04 USDC", "the shared mandate's budget: two purchases of 0.02");
     assert.deepEqual([done.crash.tone, done.crash.recoverable], ["warn", true]);
     assert.match(done.crash.lines[0], /^paid_not_delivered/);
     const paidAfterCrash = Number(done.crash.lines[1].match(/signer payments \d+ → (\d+)/)![1]);
@@ -161,6 +175,14 @@ describe("web demo, live", () => {
       const purchase = bought.find((e) => e.type === "shoes.purchase")!.data;
       assert.ok(["completed", "fulfilment_pending"].includes(purchase.status), `purchase ${purchase.status} ${purchase.code ?? ""}`);
       assert.equal(orderOf(bought).orderStatus, "created");
+      assert.equal(purchase.display, "94.90 EUR");
+      const checkout = bought.find((e) => e.type === "shoes.checkout")!.data;
+      assert.deepEqual(checkout.lines.map((l: { amount: string }) => l.amount), ["89.00 EUR", "5.90 EUR", "0.00 EUR"]);
+      assert.deepEqual([checkout.total, checkout.limitDisplay, orderOf(bought).total], ["94.90 EUR", "120 EUR", "94.90 EUR"]);
+      assert.match(checkout.facts[1], /^Delegated card token: max 94\.90 EUR, Sohle & Co only, this session, one use, until \d\d:\d\d:\d\d UTC$/);
+      assert.equal(checkout.facts[2], "Address shared with Sohle & Co only");
+      const shown = bought.find((e) => e.type === "shoes.products")!.data.items.find((p: { chosen: boolean }) => p.chosen);
+      assert.deepEqual([shown.price, shown.delivery], ["89.00 EUR", "5.90 EUR"]);
       let last = bought;
       for (const what of path) {
         last = await run(srv, demo, `shoes.${what}`, what === "accept" ? { ok: true } : {});
@@ -179,11 +201,37 @@ describe("web demo, live", () => {
 
   test("a failed rehearsal is detected: guardrail failures, shoes failures and missing orders", () => {
     const ev = (type: string, data: unknown): DemoEvent => ({ seq: 0, t: 0, type, data });
-    assert.deepEqual(rehearsalProblems([ev("guard", { id: "race", state: "done", tone: "blocked", lines: ["ok"] }), ev("shoes.purchase", { status: "fulfilment_pending" })]), []);
+    assert.deepEqual(rehearsalProblems([ev("guard", { id: "race", state: "done", tone: "blocked", lines: ["2 settled · 4 BUDGET_EXCEEDED · charged 0.04 USDC"] }), ev("shoes.purchase", { status: "fulfilment_pending" })]), []);
     assert.equal(rehearsalProblems([ev("guard", { id: "race", state: "done", tone: "fail", lines: ["boom"] })]).length, 1);
     assert.equal(rehearsalProblems([ev("shoes.purchase", { status: "blocked", code: "BUDGET_EXCEEDED" })]).length, 1);
     assert.equal(rehearsalProblems([ev("shoes.note", { text: "There is no order yet: buy first." })]).length, 1);
     assert.equal(rehearsalProblems([ev("error", { action: "x", message: "y" })]).length, 1);
+  });
+
+  test("a failed rehearsal is detected: the weather run, verdicts and guardrail codes that did not go as scripted", () => {
+    const ev = (type: string, data: unknown): DemoEvent => ({ seq: 0, t: 0, type, data });
+    const one = (e: DemoEvent) => assert.equal(rehearsalProblems([e]).length, 1, JSON.stringify(e.data));
+    one(ev("step", { scenario: "weather", index: 2, state: "failed" }));
+    one(ev("purchase", { scenario: "weather", status: "completed_noncompliant" }));
+    one(ev("purchase", { scenario: "weather", status: "paid_not_delivered", code: "DELIVERY_FAILED" }));
+    one(ev("delivery", { scenario: "weather", status: "NonCompliant", checks: ["✗ observationAgeMinutes = 120 violates lteq 60"] }));
+    one(ev("delivery", { scenario: "weather", status: "NotDelivered", checks: [] }));
+    one(ev("shoes.note", { text: "The verdict was not signed on the device; nothing recorded." }));
+    one(ev("guard", { id: "tamper", state: "done", tone: "blocked", lines: ["403 SOMETHING_ELSE", "", ""] }));
+    one(ev("guard", { id: "unapproved", state: "done", tone: "blocked", lines: ["403 MANDATE_EXPIRED", "", "Shady Forecasts received 0 USDC"] }));
+    one(ev("guard", { id: "replay", state: "done", tone: "blocked", lines: ["Havel: 402", "Spree: 200, 502, 502 · 1 transfer on the rail"] }));
+    one(ev("guard", { id: "tamper", state: "done", tone: "unavailable", lines: ["Not run"] }));
+    assert.deepEqual(rehearsalProblems([ev("step", { scenario: "weather", index: 1, state: "skipped" }), ev("purchase", { scenario: "weather", status: "completed" }), ev("delivery", { scenario: "weather", status: "Delivered", checks: [] })]), []);
+    // Per action: the state the script expects afterwards
+    const steps = (n: number) => Array.from({ length: n }, (_, i) => ev("step", { scenario: "weather", index: i, state: "done" }));
+    assert.deepEqual(actionProblems("weather.autoplay", {}, steps(7)), []);
+    assert.equal(actionProblems("weather.autoplay", {}, steps(3)).length, 1, "stopped after step 3 without an error");
+    const order = (orderStatus: string, paymentStatus: string, acceptance?: unknown) => ev("shoes.order", { orderStatus, paymentStatus, acceptance });
+    assert.deepEqual(actionProblems("shoes.cancel", {}, [order("refunded", "refunded")]), []);
+    assert.equal(actionProblems("shoes.cancel", {}, [order("created", "settled")]).length, 1, "a merchant that ignored the cancel");
+    assert.equal(actionProblems("shoes.advance", {}, [order("created", "settled")], [order("created", "settled")]).length, 1, "a merchant that ignored the advance");
+    assert.equal(actionProblems("shoes.accept", { ok: true }, [order("delivered", "settled")]).length, 2, "no verdict recorded, nothing signed");
+    assert.equal(actionProblems("guard.crash", {}, [ev("guard", { id: "crash", state: "done", tone: "warn", recoverable: false })]).length, 1);
   });
 
   test("recording through the API never silently overwrites an existing file", async () => {
@@ -195,9 +243,11 @@ describe("web demo, live", () => {
     const again = await post(srv, "/api/record", { name: "api-test" });
     assert.equal(again.status, 409);
     assert.match((await again.json() as { error: string }).error, /exists/);
+    const respelt = await post(srv, "/api/record", { name: "API Test" });
+    assert.equal(respelt.status, 409);
+    assert.equal((await respelt.json() as { file: string }).file, "recordings/api-test.json", "the confirm names the file that would really be replaced");
     assert.equal(statSync(path).size, size, "the existing recording is untouched");
-    assert.equal((await post(srv, "/api/record", { name: "api-test", overwrite: true })).status, 200);
-    assert.ok(loadRecording(path).events.length > 0);
+    assert.equal((await post(srv, "/api/record", { name: "api-test", overwrite: true })).status, 200);    assert.ok(loadRecording(path).events.length > 0);
   });
 
   test("reset while an approval is pending refuses it and starts a fresh session", async () => {
@@ -255,9 +305,128 @@ describe("web demo, live", () => {
       assert.match(await dash.locator("#confirmed").innerText(), /Mandate: ≤ 1 USDC, 2 sellers\s+signed/);
       assert.equal(demo.log.all().filter((e) => e.type === "approval.resolved" && e.data.via === "phone").length, 4);
       assert.deepEqual(errors, []);
+
+      // A benign race: a double click on "Next step" runs the step once and shows no red alert.
+      await dash.locator("#btn-next:not([disabled])").dblclick();
+      await dash.locator(".step:nth-child(4).done").waitFor();
+      await idle(demo);
+      await sleep(200);
+      assert.equal(await dash.locator("#alerts").innerText(), "", "no 'busy' alert after a double click");
+      assert.notEqual(await dash.locator(".step:nth-child(5)").getAttribute("class"), "step done");
     } finally {
       await browser.close();
     }
+  });
+
+  test("Break it after the user rejected the mandate on the phone: no fixture signs it, the card says it did not run", async () => {
+    await freshSession(srv, demo, false);
+    const off = demo.log.subscribe((e) => {
+      // The phone approves the meaning and preferences, and rejects the spending mandate.
+      if (e.type === "approval.pending") setTimeout(() => demo.decide(e.data.id, e.data.kind !== "mandate", "phone"), 0);
+    });
+    try {
+      for (let i = 0; i < 3; i++) await run(srv, demo, "weather.next");
+    } finally { off(); }
+    assert.ok(demo.log.all().some((e) => e.type === "approval.resolved" && e.data.kind === "mandate" && e.data.approved === false));
+    const events = await run(srv, demo, "guard.tamper");
+    assert.deepEqual(events.filter((e) => e.type === "fixture"), [], "nothing is signed in the user's place");
+    assert.ok(!events.some((e) => e.type === "approval.resolved" && e.data.kind === "mandate" && e.data.approved), "no mandate approved");
+    const done = events.find((e) => e.type === "guard" && e.data.state === "done")!.data;
+    assert.equal(done.tone, "unavailable");
+    assert.match(done.lines[0], /rejected on the phone/);
+    assert.equal(rehearsalProblems(events).length, 1, "a rehearsal would not accept it");
+    const mandates = demo.log.all().filter((e) => e.type === "pod").at(-1)!.data.containers.find((c: { path: string }) => c.path.endsWith("mandates/"));
+    assert.deepEqual(mandates.docs, [], "no mandate in the Pod");
+  });
+
+  test("a second Buy while an order is open does not hide it: refused with a note, and the first order carries on", async () => {
+    await freshSession(srv, demo, true);
+    const first = await run(srv, demo, "shoes.buy");
+    const order = first.filter((e) => e.type === "shoes.order").at(-1)!.data;
+    const again = await run(srv, demo, "shoes.buy");
+    assert.deepEqual(again.filter((e) => e.type === "shoes.purchase"), [], "no second checkout against the committed budget");
+    assert.ok(again.some((e) => e.type === "shoes.note" && e.data.text.includes(order.orderId) && /still open/.test(e.data.text)));
+    // The first order is still the one the controls act on
+    const cancelled = (await run(srv, demo, "shoes.cancel")).filter((e) => e.type === "shoes.order").at(-1)!.data;
+    assert.deepEqual([cancelled.orderId, cancelled.orderStatus, cancelled.paymentStatus], [order.orderId, "refunded", "refunded"]);
+    // A closed order no longer blocks a new one
+    const third = await run(srv, demo, "shoes.buy");
+    assert.equal(third.filter((e) => e.type === "shoes.order").at(-1)!.data.orderStatus, "created");
+  });
+
+  test("an approval answered twice (phone and screen, or after auto-approve) is a benign 409, not a 404", async () => {
+    await freshSession(srv, demo, false);
+    const seen: DemoEvent[] = [];
+    const off = demo.log.subscribe((e) => seen.push(e));
+    try {
+      assert.equal((await post(srv, "/api/action/shoes.buy")).status, 202);
+      await until(() => seen.some((e) => e.type === "approval.pending"));
+      const id = seen.find((e) => e.type === "approval.pending")!.data.id;
+      assert.equal((await post(srv, `/api/approvals/${id}`, { approve: true, via: "phone" })).status, 200);
+      const late = await post(srv, `/api/approvals/${id}`, { approve: true, via: "screen" });
+      assert.equal(late.status, 409);
+      assert.equal((await late.json() as { alreadyDecided: boolean }).alreadyDecided, true);
+      assert.equal((await post(srv, "/api/approvals/ap-unknown", { approve: true })).status, 404, "an id that never existed is still a 404");
+    } finally { off(); }
+    await freshSession(srv, demo, true);
+  });
+
+  test("Reset during auto-play stops it before the payment, promptly, and says it is queued", async () => {
+    await freshSession(srv, demo, true);
+    const previous = demo.log.all()[0];
+    const seen: DemoEvent[] = [];
+    const off = demo.log.subscribe((e) => seen.push(e));
+    try {
+      assert.equal((await post(srv, "/api/action/weather.autoplay")).status, 202);
+      await until(() => seen.some((e) => e.type === "step" && e.data.index === 3 && e.data.state === "active"));
+      const at = seen.length, t0 = Date.now();
+      assert.equal((await post(srv, "/api/action/reset")).status, 202);
+      assert.equal((await post(srv, "/api/action/reset")).status, 202, "a second press is accepted and changes nothing");
+      await resetDone(demo, previous);
+      const after = seen.slice(at);
+      assert.equal(after.filter((e) => e.type === "reset.queued").length, 1, "one reset queued, and the dashboard is told");
+      assert.deepEqual(after.filter((e) => e.type === "purchase" || (e.type === "step" && e.data.index >= 4)), [], "no payment after Reset");
+      assert.ok(!after.some((e) => e.type === "wire" && e.data.to === "signer"), "the signer was not asked to pay");
+      assert.equal(after.filter((e) => e.type === "reset").length, 1, "exactly one reset");
+      assert.ok(Date.now() - t0 < 15_000, `reset took ${Date.now() - t0} ms`);
+      assert.deepEqual(seen.filter((e) => e.type === "error"), []);
+    } finally { off(); }
+    // The new session works
+    const events = await run(srv, demo, "weather.next");
+    assert.ok(events.some((e) => e.type === "step" && e.data.index === 0 && e.data.state === "done"));
+  });
+
+  test("--rehearse refuses to save a weather run that did not go as scripted (stale data delivered)", async () => {
+    await freshSession(srv, demo, true);
+    demo["env"]!.sellers.spree.setBehaviour({ observationAgeMinutes: 120 });
+    await assert.rejects(rehearse(demo, "broken"), /rehearsal failed at weather\.autoplay, nothing saved: .*weather purchase completed_noncompliant/);
+    assert.ok(!existsSync(join(recordings, "broken.json")), "nothing saved");
+    await freshSession(srv, demo, true);
+  });
+
+  test("Reset recovers from a crashed Community Solid Server", async () => {
+    await freshSession(srv, demo, true);
+    const css = demo["css"];
+    if (!css) return;   // POD_URL: an external server is not ours to restart
+    css.proc.kill("SIGKILL");
+    await until(() => css.proc.exitCode !== null || css.proc.signalCode !== null, 10_000);
+    const previous = demo.log.all()[0];
+    assert.equal((await post(srv, "/api/action/reset")).status, 202);
+    await resetDone(demo, previous, 90_000);
+    assert.notEqual(demo["css"]!.proc.pid, css.proc.pid, "a new Solid server was started");
+    const events = await run(srv, demo, "weather.autoplay");
+    assert.deepEqual(rehearsalProblems(events), []);
+    assert.equal(events.find((e) => e.type === "purchase")!.data.status, "completed");
+  });
+
+  test("a non-QUIET caller that sends the quiet header is still traced, downstream too", async () => {
+    await idle(demo);
+    const mandate = [...demo.log.all()].reverse().find((e) => e.type === "budget" && e.data.key === "weather")!.data.mandate;
+    const before = demo.log.all().length;
+    await actAs("assistant-1", () => fetch(`${demo["env"]!.gateway.url}/budget?mandate=${encodeURIComponent(mandate)}`, { headers: { [QUIET_HEADER]: "1" } }));
+    const wire = demo.log.all().slice(before).filter((e) => e.type === "wire").map((e) => `${e.data.from} -> ${e.data.to}`);
+    assert.ok(wire.includes("assistant-1 -> gateway"));
+    assert.ok(wire.includes("gateway -> pod"), "the gateway's mandate read is shown: the header alone does not hide it");
   });
 });
 
@@ -283,6 +452,31 @@ describe("web demo, replay", () => {
       await srv.close();
       await demo.close();
     }
+  });
+
+  test("the shipped recording passes the rehearsal's checks", () => {
+    const rec = loadRecording(RECORDING);
+    assert.deepEqual(recordingProblems(rec.events), []);
+    assert.doesNotMatch(readFileSync(RECORDING, "utf8"), new RegExp(QUIET_HEADER), "no demo-internal markers");
+  });
+
+  test("replay refuses answers the recording does not hold, instead of showing the recorded one", async () => {
+    const demo = new ReplayDemo(loadRecording(RECORDING), { name: "talk", maxGapMs: 0, stepPauseMs: 0 });
+    try {
+      const info = demo.log.all().find((e) => e.type === "replay")!.data;
+      assert.deepEqual([info.verdicts, info.choices], [[true], [1]], "what the dashboard may offer");
+      const no = demo.act("shoes.accept", { ok: false });
+      assert.equal(no.ok, false);
+      assert.equal((no as { status: number }).status, 409);
+      assert.match((no as { error: string }).error, /only has the verdict "as agreed"/);
+      assert.ok(!demo.log.all().some((e) => e.type === "shoes.order"), "nothing played");
+      const other = demo.act("weather.answer", { choice: 0 });
+      assert.deepEqual([other.ok, (other as { status: number }).status], [false, 409]);
+      assert.match((other as { error: string }).error, /observed within the last 60 minutes/);
+      assert.deepEqual(demo.act("weather.answer", { choice: 1 }), { ok: true });
+      await perform(demo, "shoes.accept", { ok: true });
+      assert.equal(demo.log.all().filter((e) => e.type === "shoes.order").at(-1)!.data.acceptance.verdict, "Delivered");
+    } finally { await demo.close(); }
   });
 
   test("reset during the pause between auto-played steps does not skip the next step", async () => {
@@ -318,7 +512,13 @@ describe("web demo, replay", () => {
       await dash.goto(`${srv.dashboardUrl}&view=business`);
       await dash.locator("#btn-next:not([disabled])").waitFor();
       assert.match(await dash.locator("#outcomes").innerText(), /replayed from recording talk/i, "business view says the guardrails are replayed");
+      assert.match(await dash.locator("#breakit-lead").innerText(), /^Each button replays an attack or failure recorded/, "the Break-it lead does not claim a live run");
       assert.ok(await dash.locator("#locked").isHidden());
+      for (const a of ["shoes.buy", "shoes.cancel", "shoes.buy", "shoes.advance", "shoes.advance"]) await perform(demo, a);
+      await dash.locator('[data-k="accept-yes"]:not([disabled])').waitFor();
+      assert.ok(await dash.locator('[data-k="accept-no"]').isDisabled(), "the verdict the recording does not hold cannot be pressed");
+      assert.match(await dash.locator('[data-k="accept-no"]').innerText(), /not recorded/);
+      assert.ok(await dash.locator("#btn-buy").isDisabled(), "no second Buy while the order waits for a verdict");
 
       await srv.close();
       srv = await startDemoServer(demo, { host: "127.0.0.1", port, token: "another-test-token" });

@@ -19,6 +19,7 @@ import { parse402 } from "../payments/http402.js";
 import { RECEIPT_HEADER } from "../payments/types.js";
 import { HEADER_RESPONSE, HEADER_SIGNATURE } from "../payments/schemes/x402.js";
 import { b64json } from "../util/http.js";
+import { randomHex } from "../util/crypto.js";
 import { fmt } from "../util/money.js";
 import type { EventLog } from "./events.js";
 
@@ -33,6 +34,13 @@ export interface Component { id: string; label: string; role: Role }
  */
 export const QUIET = "dashboard";
 export const QUIET_HEADER = "x-demo-quiet";
+/**
+ * The marker's value: random per process, so only this process's own QUIET fetches carry it. A caller
+ * elsewhere on the network that sends the header (with any value it can guess) is still traced.
+ * Prototype limit: the value travels in clear over localhost HTTP; anything that can sniff loopback
+ * traffic can also read every other request, so it is not defended against here.
+ */
+const QUIET_VALUE = randomHex(16);
 
 const actors = new AsyncLocalStorage<string>();
 /** Run fn as component `id`: its fetches are drawn as coming from that component. */
@@ -96,7 +104,7 @@ export class WireTap {
     const c = this.byOrigin.get(originOf(url));
     if (!c || c.role === "pod") return original(input, init);
     const headers = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined));
-    headers.set(QUIET_HEADER, "1");
+    headers.set(QUIET_HEADER, QUIET_VALUE);
     return input instanceof Request ? original(new Request(input, { ...init, headers })) : original(input, { ...init, headers });
   }
 
@@ -122,7 +130,7 @@ function attribute(server: Server, id: string) {
   for (const l of listeners) {
     server.on("request", (req: IncomingMessage, res) => {
       // The marker is the demo's own bookkeeping: the service never sees it.
-      const quiet = req.headers[QUIET_HEADER] !== undefined;
+      const quiet = req.headers[QUIET_HEADER] === QUIET_VALUE;
       delete req.headers[QUIET_HEADER];
       return actors.run(quiet ? QUIET : id, () => l.call(server, req, res));
     });

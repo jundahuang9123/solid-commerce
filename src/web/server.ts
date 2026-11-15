@@ -24,7 +24,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
-import { extname, join } from "node:path";
+import { basename, extname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { timingSafeEqual } from "node:crypto";
 import { randomHex } from "../util/crypto.js";
@@ -90,13 +90,17 @@ export async function startDemoServer(demo: DemoControls, opts: ServeOptions = {
     if (approval) {
       if (demo.mode === "replay") return send(res, 409, { error: "approvals are part of the recording" });
       const ok = demo.decide(approval[1], args.approve === true, args.via === "phone" ? "phone" : "screen");
-      return ok ? send(res, 200, { decided: approval[1] }) : send(res, 404, { error: "no such pending approval" });
+      if (ok) return send(res, 200, { decided: approval[1] });
+      // Answered meanwhile on the other screen, by auto-approve or by a reset: nothing to do, and not a failure.
+      if (demo.wasDecided?.(approval[1])) return send(res, 409, { error: "already decided", alreadyDecided: true });
+      return send(res, 404, { error: "no such pending approval" });
     }
     if (u.pathname === "/api/auto-approve") { demo.setAuto(args.on === true); return send(res, 200, { on: args.on === true }); }
     if (u.pathname === "/api/record") {
       if (demo.mode === "replay") return send(res, 409, { error: "cannot record while replaying" });
       try { return send(res, 200, { path: demo.record(String(args.name ?? "session"), { overwrite: args.overwrite === true }) }); }
-      catch (e) { if (e instanceof RecordingExists) return send(res, 409, { error: e.message, exists: true }); throw e; }
+      // `file` is the name as the server normalised it, so the client's "replace?" names the real file.
+      catch (e) { if (e instanceof RecordingExists) return send(res, 409, { error: e.message, exists: true, file: `recordings/${basename(e.path)}` }); throw e; }
     }
     send(res, 404, { error: "not_found" });
   }

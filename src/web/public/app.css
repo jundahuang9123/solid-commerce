@@ -181,7 +181,7 @@ pre { margin: 0; background: #F6F6F3; border: 1px solid var(--soft); border-radi
 .verdict.blocked, .verdict.fail { background: var(--err-soft); color: var(--err-text); }
 .verdict.warn { background: var(--warn-soft); color: var(--warn-text); }
 .verdict.ok { background: var(--blue-soft); color: var(--blue-dark); }
-.verdict.running { background: var(--soft); color: var(--ink-2); }
+.verdict.running, .verdict.unavailable { background: var(--soft); color: var(--ink-2); }
 .tiles { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 6px; margin-top: auto; }
 .tile { height: 34px; border-radius: 8px; background: #E4E4DE; }
 .tile.on { background: var(--ok); }

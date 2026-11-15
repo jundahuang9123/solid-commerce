@@ -67,10 +67,11 @@ export class EventLog {
     this.emit("reset", data);
   }
 
-  save(path: string) {
+  /** Write the log as a recording; with `overwrite: false`, fail with EEXIST rather than replace a file. */
+  save(path: string, opts: { overwrite?: boolean } = {}) {
     const rec: Recording = { format: "solid-commerce-demo-recording", version: 1, recordedAt: new Date().toISOString(), events: this.events.map((e) => ({ ...e })) };
     mkdirSync(dirname(path), { recursive: true });
-    writeFileSync(path, JSON.stringify(rec, null, 1) + "\n");
+    writeFileSync(path, JSON.stringify(rec, null, 1) + "\n", { flag: opts.overwrite === false ? "wx" : "w" });
   }
 }
 

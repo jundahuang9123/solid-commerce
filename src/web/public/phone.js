@@ -29,6 +29,8 @@ document.addEventListener("click", async (ev) => {
     $("ph-error").hidden = true;
     navigator.vibrate?.(30);
   } catch (e) {
+    // Answered meanwhile (on screen, by auto-approve or by a reset): nothing went wrong.
+    if (e.status === 409 && e.body?.alreadyDecided) { $("ph-error").hidden = true; return; }
     $("ph-error").hidden = false;
     $("ph-error").innerHTML = esc(e.message);
     b.disabled = false;
@@ -39,6 +41,8 @@ connect((e) => {
   if (e.type === "replay") mode = "replay";
   if (e.type === "session") mode = e.data.mode;
   state = approvalsReducer(state, e);
+  // An error about an item that is no longer pending is stale.
+  if (e.type === "reset" || e.type === "approval.resolved") $("ph-error").hidden = true;
   render();
 }, (up) => {
   if (!up) { $("ph-title").textContent = "Reconnecting"; return; }

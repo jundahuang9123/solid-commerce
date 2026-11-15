@@ -51,8 +51,18 @@ export class ShoesScenario {
 
   private say(role: "user" | "assistant", text: string) { this.d.log.emit("chat", { scenario: "shoes", role, text }); }
 
+  /** An order that still needs the presenter: not yet delivered, or delivered and waiting for the user's verdict. */
+  private openOrder(): OrderTracking | undefined {
+    const t = this.tracking;
+    return t && (["created", "shipped"].includes(t.orderStatus) || (t.orderStatus === "delivered" && !t.acceptance)) ? t : undefined;
+  }
+
   private async buy(choice: number) {
     const env = this.d.env;
+    // A second checkout against the same mandate would be refused by the gateway (the first order's
+    // budget is committed) and would hide the order that exists. Finish or cancel that one first.
+    const open = this.openOrder();
+    if (open) { this.d.log.emit("shoes.note", { text: `Order ${open.orderId} is still open (${open.orderStatus}): advance, cancel or give your verdict first.` }); return; }
     this.say("user", SHOES_REQUEST);
     const { ctx, result } = await this.assistant.understand(SHOES_REQUEST, this.d.approved("merchants"));
     const answers = result.questions.flatMap((q, n) => {
@@ -72,6 +82,7 @@ export class ShoesScenario {
       this.mandate = confirmed.find((r): r is SpendingMandate => r.kind === "mandate") ?? this.mandate;
     }
     this.mandate ??= ctx.mandates.find((m) => m.targets.includes("Shoes"));
+    if (this.d.cancelled()) return;   // Reset was pressed while the phone was asked: check out nowhere
     if (!this.mandate) { this.say("assistant", "No spending mandate for shoes was approved, so I cannot check out anywhere."); return; }
     this.d.track("shoes", "Shoes mandate", this.mandate);
 
