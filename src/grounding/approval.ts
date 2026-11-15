@@ -9,7 +9,7 @@
  * ever see its public key (enrolled out of band).
  */
 import { Ed25519Key, digestOf, verifyJsonSignature, keyIdOf } from "../util/crypto.js";
-import { confirmableTerms, type Confirmation, type GroundRecord } from "../model.js";
+import { confirmableTerms, type Confirmation, type Criterion, type GroundRecord } from "../model.js";
 import { normalizeRecord } from "../rdf/records.js";
 
 /**
@@ -23,22 +23,45 @@ export type Decider = (summary: string, record: GroundRecord | DeliveryAttestati
 
 export const autoApprove: Decider = async () => true;
 
+/** The executable form of a criterion, exactly as ranking and delivery checks run it. */
+export function describeCriterion(c: Criterion): string {
+  return `${c.leftOperand} ${c.operator} ${JSON.stringify(c.rightOperand)}${c.unit ? " " + c.unit : ""}`;
+}
+
+/**
+ * What the approval device shows before signing. It shows every signed term
+ * that changes behaviour: for a meaning that is the executable criterion, not
+ * only the free-text definition (label, definition and criterion all come from
+ * the interpreter, possibly an LLM, and nothing proves they agree; the user has
+ * to be able to see the criterion that will actually run). The last line names
+ * the record, its revision, what it replaces and the user's words it was
+ * derived from, which the signature also covers.
+ */
 export function summarize(r: GroundRecord): string {
+  const footer = `  record ${r.id}, revision ${r.revision}${r.supersedes ? `, replaces ${r.supersedes}` : ""}` +
+    (r.derivedFrom !== undefined ? `; from: ${JSON.stringify(r.derivedFrom)}` : "");
   switch (r.kind) {
     case "meaning":
-      return `AGREED MEANING  "${r.term}" for ${r.scope}: ${r.definition}`;
+      return [
+        `AGREED MEANING  "${r.term}" for ${r.scope}: ${r.definition}`,
+        `  executable criterion: ${describeCriterion(r.criterion)}`,
+        footer,
+      ].join("\n");
     case "preference":
-    case "requirement": {
-      const c = r.criterion;
-      return `${r.kind.toUpperCase()} for ${r.appliesTo}: ${c.leftOperand} ${c.operator} ${JSON.stringify(c.rightOperand)}${c.unit ? " " + c.unit : ""}` +
-        (r.kind === "preference" ? ` (weight ${r.weight ?? 0.5}; ranking only, grants no spending authority)` : " (offers failing this are rejected)");
-    }
+    case "requirement":
+      return [
+        `${r.kind.toUpperCase()} for ${r.appliesTo}: ${describeCriterion(r.criterion)}` +
+          (r.kind === "preference" ? ` (weight ${r.weight ?? 0.5}; ranking only, grants no spending authority)` : " (offers failing this are rejected)"),
+        ...(r.groundedIn ? [`  grounded in agreed meaning ${r.groundedIn} (applies that meaning's current criterion)`] : []),
+        footer,
+      ].join("\n");
     case "mandate":
       return [
         `FINANCIAL AUTHORITY: allow agents [${r.assignees.join(", ")}] to purchase ${r.targets.join(", ")}`,
         `  up to ${r.maxPerTransaction} ${r.currency} per purchase, ${r.totalLimit} ${r.currency} in total,`,
         `  only from: ${r.allowedSellers.join(", ")}`,
         `  via: ${r.allowedSchemes.join(", ")}; valid until ${r.validUntil}`,
+        footer,
       ].join("\n");
   }
 }
