@@ -1,0 +1,454 @@
+{
+ "confirmed": [
+  {
+   "title": "L402 and card rail references come from the agent and are never tied to the challenge the signer pays, so a paid transaction can be released and the budget reused",
+   "file": "src/gateway/gatewayService.ts",
+   "line": 175,
+   "severity": "high",
+   "description": "For l402 and card-psp, the ledger's rail_reference is `binding.railReference`, which is `o.railReference` (bindSignedOffer, line 111). That value is a free field in the agent's PaymentOption. Nothing checks that it matches the challenge the gateway signs over (challengeDigest) and the signer actually pays: the L402 invoice paymentHash, or the card challenge.id. Reconciliation (reconcileOne, lines 289-295) asks the rail about rail_reference only, and it releases the row when the rail says 'not paid' after the authorization has expired. So the 'release only with proof the payment cannot happen' rule can be satisfied by proof about a different invoice or intent. On the card path the signer also never compares intent.resource with auth.resource (cardPsp.ts createCardPayment), so an intent for another resource of the same merchant at the same price is paid as well.",
+   "failureScenario": "Reproduced in a throwaway worktree at e4b6da3. Setup: SAT mandate with totalLimit 25 and maxPerTransaction 25, authorizationTtlSeconds 2. The agent fetches Spree's 402 twice and gets invoices I1 and I2. It sends /authorize with option = the I1 challenge but railReference = I2.paymentHash, and the gateway authorizes. The signer pays I1, and the seller is credited 25 sat. The agent reports outcome 'payment_failed'. After 2 s, /reconcile looks up I2 (unpaid), and the transaction becomes 'released' with committed back to 0. Repeating this three times gave the seller 75 sat against a 25 sat mandate, and the budget still showed 25 available. The card path does the same with challenge.id=pi_A (confirmed) and railReference=pi_B (never confirmed).",
+   "suggestedFix": "Have the gateway derive the rail reference from the challenge it binds instead of trusting option.railReference. For L402, decode challenge.invoice and use its paymentHash; also check that its amount and payee equal the offer price. For card, use challenge.id, fetch the intent from the PSP and check its amount, currency, merchant and resource against the offer. Reject the request if option.railReference differs. In createCardPayment, also require intent.resource === auth.resource.",
+   "lens": "money-e2e",
+   "upheld": 2,
+   "votes": 2,
+   "notes": [
+    "I read the code at e4b6da3 and it confirms the finding. The gateway's rail_reference for l402 and card-psp is the railReference field the agent supplies. The gateway never checks that value against the challenge it signs over. The signer checks only challengeDigest, then pays challenge.invoice (or challenge.id). Reconciliation queries the rail only by rail_reference, so it can release a paid trans",
+    "The code confirms the finding. For l402 and card-psp, the gateway stores the agent-supplied option.railReference as the ledger's rail_reference and never checks it against the challenge it signs over. The signer checks only challengeDigest and then pays the invoice or intent named in the challenge. Reconciliation queries the rail only by rail_reference and releases the row when that reference show"
+   ]
+  },
+  {
+   "title": "x402 network, asset and EIP-712 domain in the challenge are not bound to the signed offer or the authorization; the signer signs whatever token and chain the challenge names",
+   "file": "src/payments/schemes/x402.ts",
+   "line": 100,
+   "severity": "high",
+   "description": "The gateway compares only the agent's option fields (amount, currency, payTo, resource) with the signed offer price. option.currency itself comes from the challenge's `extra.name` label (parseX402), not from the asset. The challenge object the signer uses goes into the authorization only as an opaque digest. createX402Payment checks only req.amount and req.payTo against the authorization. It then builds the EIP-712 domain from req.network, req.asset and req.extra, none of which the gateway or the signer compares with the offer's PriceOption.network and asset. CHAIN_IDS includes Base mainnet (8453). So an approved seller (or anyone shaping the challenge) can get a TransferWithAuthorization signed for a different token contract or a different chain at the same atomic amount. Examples: mainnet USDC instead of Sepolia test USDC, a 6-decimal token worth more, or a token whose name is spoofed as 'USDC'. The user's mandate in USDC and the 'amount must equal the signed price' rule are then met only in name.",
+   "failureScenario": "Reproduced: from Spree's real 402, keep amount 20000 and payTo, and set requirements.network='eip155:8453', asset='0x\u20260bad', extra.name='USDC'. Gateway /authorize returned 200 (authorized). Signer /pay returned 200 with a PAYMENT-SIGNATURE whose accepted.network is eip155:8453 and accepted.asset is 0x\u20260bad. That is a valid EIP-3009 authorization for a chain and token the user never approved, which the seller can submit there.",
+   "suggestedFix": "In bindSignedOffer, for x402, read the challenge's requirements and require network, asset (getAddress-normalised), amount, payTo and scheme 'exact' to equal the offer's PriceOption. Derive currency from a pinned asset\u2192currency table, not extra.name. Put network and asset into PaymentAuthorization, and have createX402Payment refuse a requirements object whose network or asset differ from the authorization, or whose extra (domain name and version) is not the pinned one for that asset.",
+   "lens": "money-e2e",
+   "upheld": 2,
+   "votes": 2,
+   "notes": [
+    "I confirmed this from the code at e4b6da3. No layer checks the challenge's network, asset or EIP-712 domain against the signed offer.\n- The gateway's bindSignedOffer compares only option.amount, currency, payTo and resource with the offer's PriceOption. It never reads PriceOption.network or asset, or the challenge's requirements.network, asset or extra.\n- option.currency comes from the extra.name ",
+    "I confirmed this from the code at e4b6da3; I did not rerun the reproduction. The gateway and the signer never compare the challenge's network, asset or EIP-712 domain fields with the signed offer's PriceOption.network and asset. That offer field is set in src/payments/serverSide.ts:58. The challenge digest only shows the signer got the same challenge the gateway saw. It does not show that challeng"
+   ]
+  },
+  {
+   "title": "Agent identity is self-asserted and payment credentials are handed to any caller: unauthenticated GET /transactions/:id exposes the signed authorization, and the signer replays the credential to whoever presents it",
+   "file": "src/signer/signerService.ts",
+   "line": 57,
+   "severity": "medium",
+   "description": "The gateway's assignee checks (authorize, outcome, reconcile) compare a plain `agentId` string from the request body; nothing authenticates it. GET /transactions/:id needs no agentId at all and returns auth_json, the full gateway-signed authorization. The exact challenge is written to the Pod evidence (sc:challenge). The signer's /pay pays or replays for anyone holding authorization plus challenge (`done.get(authId)` returns the stored credential). So any local process can obtain another agent's live payment credential: the x402 PAYMENT-SIGNATURE, the L402 macaroon:preimage, or the card Payment header. It can also authorize spending under any agent's name. The README says a different agent 'cannot spend: it is not an assignee of the mandate', but that holds only if agents don't lie about their id. The design's threat table does not list this.",
+   "failureScenario": "Agent 1 buys a POST (non-repeatable) paid route. A second process reads GET {gateway}/transactions/{txId} (no auth) to get auth_json, reads the challenge from {pod}/transactions/{txId}.ttl, and POSTs both to {signer}/pay. It gets the same credential back (replayed:true) and presents it to the proxy first. That consumes the one delivery the user paid for, and agent 1 gets 402 credential_consumed. For GET routes the credential gives the thief unlimited free re-delivery. The same process can also call /authorize with agentId=AGENT_1 against AGENT_1's mandate.",
+   "suggestedFix": "Authenticate callers of the gateway and signer, for example with per-agent keys, mTLS or a signed request bound to agentId. Bind the authorization to the requesting agent's key, and have the signer return a credential only to that key. Require the same check on GET /transactions/:id, or remove auth_json from the response. Until then, state in README and design.md that agent identity is not authenticated and that the assignee check assumes honest agents.",
+   "lens": "money-e2e",
+   "upheld": 2,
+   "votes": 2,
+   "notes": [
+    "The code at e4b6da3 matches every part of the finding. The gateway's assignee and ownership checks compare a plain agentId string taken from the request body, and nothing authenticates it. GET /transactions/:id has no caller check and returns the full ledger row, auth_json included. The signer's /pay checks only the gateway signature and the challenge digest. When an authId has already been paid, ",
+    "I read the code at e4b6da3 and every part of the finding holds. The gateway's assignee and ownership checks compare an `agentId` string taken from the request body, and nothing authenticates it. GET /transactions/:id has no access check and returns the whole ledger row, including auth_json. The signer's /pay checks only two things: that the authorization carries the gateway's signature, and that t"
+   ]
+  },
+  {
+   "title": "Superseded mandate/meaning revisions stay valid: an agent with Pod write access can roll back to an older signed revision",
+   "file": "src/grounding/commonGround.ts",
+   "line": 219,
+   "severity": "high",
+   "description": "When the user revises a record, commit() copies the previous revision byte for byte into history/<slug>-rN.ttl. That copy keeps status UserConfirmed, the original subject IRI and a valid signature. The 'Superseded' status is declared in model.ts but nothing ever uses it. verifyConfirmation (approval.ts), the gateway's loadMandate (gatewayService.ts:81-91) and CommonGround.load only check that the signature matches the record's terms. None of them checks that the revision is the latest one the user signed, and no revocation or high-water mark exists anywhere. The signature covers id and revision, but the id is the same in every revision. So an older revision copied back over the live document verifies cleanly. The ledger keys the budget by mandate id, so the restored higher limit applies to the same running total. The same trick works for agreed meanings and requirements (for example restoring 'current = 60 min' after the user tightened it to 15). Grounded requirements then follow it through effectiveCriterion. The threat model in docs/design.md says 'Agent or anyone with Pod write access raises a limit -> Mandate signature no longer verifies', but this route raises the limit and the signature still verifies.",
+   "failureScenario": "Reproduced in-process. The device signs mandate r1 (totalLimit 1 USDC, maxPerTransaction 1). The user then signs r2 (totalLimit 0.10, maxPerTransaction 0.05, supersedes history/...-r1.ttl), and commit() archives the r1 bytes. An agent copies history/weatherreport-usdc-r1.ttl over mandates/weatherreport-usdc.ttl. parseRecord(ttl1, mandateId) followed by verifyConfirmation returns { ok: true } with totalLimit '1'. The gateway's loadMandate does only this, so /authorize then allows up to 1 USDC in total and 1 USDC per purchase again, although the user cut the limit to 0.10 / 0.05.",
+   "suggestedFix": "Make the newest revision binding. Options: write archived revisions with status Superseded and keep a per-record minimum revision (or the digest of the current signed revision) somewhere agents cannot write, such as the gateway's ledger, a user-signed revision index, or the device. Then make the gateway and CommonGround.load reject any revision below it. At minimum, the gateway should remember the highest revision it has seen per mandate id and refuse anything lower. Add an e2e regression test that copies the history document back.",
+   "lens": "authority",
+   "upheld": 2,
+   "votes": 2,
+   "notes": [
+    "I checked this against the code at e4b6da3 and could not refute it. When a record is revised, commit() writes the old Pod bytes (existing.text) unchanged to confirmed.supersedes. Those bytes still say status UserConfirmed and still carry the old signature, which matches the old terms.\n\nThe checks that run later all pass on those bytes. verifyConfirmation checks only the status, the owner, that the",
+    "The code at e4b6da3 confirms the finding. commit() archives the previous live document unchanged into history/<slug>-rN.ttl, so the copy keeps status UserConfirmed, the original subject IRI and a valid signature. verifyConfirmation looks only at status, owner, enrolled key, terms digest and signature. Nothing compares the revision against a latest or minimum revision, and no revocation exists. The"
+   ]
+  },
+  {
+   "title": "Existing mandate is reused when the user asks for narrower terms; the narrower per-purchase limit, expiry and other terms are silently dropped",
+   "file": "src/grounding/commonGround.ts",
+   "line": 131,
+   "severity": "medium",
+   "description": "negotiate() reuses an existing confirmed mandate whenever its totalLimit and currency equal the new request and it has not expired. It ignores maxPerTransaction, validUntil/validDays, assignees and allowedSellers. The assistant reports 'Existing mandate covers this request; no new spending authority requested', but the mandate it reuses can allow more than the user just stated. The user's latest statement of what may be spent is never shown on the approval device and never recorded, so the agent keeps acting on broader authority than the user currently means.",
+   "failureScenario": "Reproduced. A confirmed mandate exists for WeatherReport/USDC with totalLimit 1 and maxPerTransaction 1. The user says 'Get me a Berlin weather report. You may spend up to 1 USDC, at most 0.01 USDC per purchase, from approved providers.' The rule interpreter produces { totalLimit: '1', maxPerTransaction: '0.01' }. negotiate() returns proposals: [] and reuses the old mandate, so a single purchase of up to 1 USDC is authorised without the user seeing anything. The same happens for 'for the next 2 days' (validDays) and for a smaller set of agents.",
+   "suggestedFix": "Build the candidate mandate as now and reuse the existing one only when it is no broader in any term: maxPerTransaction <= requested, validUntil <= requested, assignees and sellers a subset of those requested, schemes a subset. Otherwise propose a new revision for the user to approve. Simplest: reuse only when every authority term is equal.",
+   "lens": "authority",
+   "upheld": 2,
+   "votes": 2,
+   "notes": [
+    "The code confirms the finding. In src/grounding/commonGround.ts at e4b6da3, negotiate() builds a candidate mandate that carries the requested maxPerTransaction, validUntil, assignees, allowedSellers and allowedSchemes (lines ~132-148). It then reuses the existing confirmed mandate when only three things hold: totalLimit matches, currency matches, and the mandate has not expired (line ~151). Becaus",
+    "The code confirms the finding. At e4b6da3, negotiate() builds a candidate mandate that carries maxPerTransaction, validUntil (from validDays), assignees, allowedSellers and allowedSchemes. It then reuses the existing confirmed mandate if only three things hold: totalLimit matches, currency matches, and the mandate has not expired. When it reuses, it records no proposal and adds the note \"Existing "
+   ]
+  },
+  {
+   "title": "Terminal approval device signs an agreed meaning without showing its executable criterion",
+   "file": "src/grounding/approval.ts",
+   "line": 24,
+   "severity": "medium",
+   "description": "summarize() describes a meaning only as its free-text definition ('AGREED MEANING \"current\" for WeatherReport: <definition>'). The interactive terminal demo (src/demo/run-demo.ts:58-62 and 87) shows the user just the option label and this summary. The signature covers the criterion, which is what ranking and delivery checks actually run. Label, definition and criterion all come from the interpreter's candidate, and with LLM_PROVIDER set that is LLM output. Nothing checks that they agree. A misreading or prompt-injected model can therefore get the user to sign a meaning whose criterion differs from the words shown. The meaning is then reused across sessions and agents without being asked again. The web phone card does show the criterion (approvals.ts describe()), so this affects the terminal device and the canonical summary text.",
+   "failureScenario": "LLM_PROVIDER=openai npm run demo:interactive. The model returns a candidate { label: 'observed within the last 15 minutes', definition: 'current means observed at most 15 minutes before delivery', criterion: observationAgeMinutes lteq 600 }. The user picks it, and the device prints only the 15-minute definition. The user approves, and the signed AgreedMeaning operationalises 'current' as 600 minutes for all later sessions. The grounded requirement's line does print 'lteq 600', but the meaning can be approved on its own and stays reusable.",
+   "suggestedFix": "Include the criterion (leftOperand, operator, rightOperand, unit) in summarize() for meanings, as the phone card already does. Consider also checking LLM candidates for consistency, for example by rendering each label from its criterion instead of trusting model text.",
+   "lens": "authority",
+   "upheld": 2,
+   "votes": 2,
+   "notes": [
+    "The finding holds at e4b6da3. summarize() describes a meaning record using only its free-text definition. The terminal decider prints only that summary. The device then signs confirmableTerms(record), and that includes the criterion. Under LLM_PROVIDER, the demo's interpreter is the LlmInterpreter. Its output passes the JSON schema, but nothing checks that label, definition and criterion agree. Th",
+    "I confirmed this from the code at e4b6da3. summarize() describes a meaning record only by its term, scope and free-text definition. The terminal decider in the demo prints exactly that summary. The device signs confirmableTerms(record), and that includes the criterion that commonGround uses as the effective criterion. When LLM_PROVIDER is set, the candidate label, definition and criterion all come"
+   ]
+  },
+  {
+   "title": "Vocabulary validation can be bypassed: criteria in statements with no category are never checked, and a quote in a value defeats the 'skip invalid statement' match",
+   "file": "src/grounding/interpretation.ts",
+   "line": 60,
+   "severity": "low",
+   "description": "checkCriterion checks leftOperand only when the statement has its own category. negotiate() then fills in the category from the intention, so a criterion with an unknown property passes. Separately, negotiate() (commonGround.ts:69) finds the invalid statements by applying the greedy regex /\"(.*)\"/ to each error message. If the offending value contains a double quote (leftOperand is a free string in the LLM schema), the captured text is not the statement text, and the statement flagged invalid is still turned into a proposal. Both break the documented guarantee that anything outside the vocabulary is rejected before proposal. The user still has to approve the result, so this does not create authority by itself.",
+   "failureScenario": "Reproduced with negotiate(). Interpretation: [intention WeatherReport; requirement with no category and criterion sellerIsMyFriend eq true; preference WeatherReport with leftOperand 'bogus\"']. validateInterpretation reports only the second preference. negotiate() still proposes both records, with leftOperands 'sellerIsMyFriend' and 'bogus\"'.",
+   "suggestedFix": "Validate against the effective category (statement category, else the intention's) and reject criteria when none is known. Have validateInterpretation return the indexes of invalid statements instead of parsing them back out of message strings.",
+   "lens": "authority",
+   "upheld": 2,
+   "votes": 2,
+   "notes": [
+    "I confirmed both parts from the code and reproduced them. In src/grounding/interpretation.ts:59, checkCriterion skips the leftOperand check when a statement has no category of its own. Then commonGround.ts:101 (`const category = st.category ?? out.intention?.category`) fills in the intention's category, and commonGround.ts:125-130 turns the statement into a proposal. Separately, commonGround.ts:96",
+    "I read the code at e4b6da3 and both bypasses are real. I did not run the reproduction because the logic is clear from the source.\n(1) At src/grounding/interpretation.ts:59, checkCriterion checks leftOperand only when `category` is set. It receives `s.category`, which is undefined when the statement has no category of its own. The LLM schema allows a null category (llmInterpreter.ts:48). negotiate("
+   ]
+  },
+  {
+   "title": "Web demo auto-signs the weather mandate as a 'fixture' even after the user rejected it on the phone",
+   "file": "src/web/scenarios/weather.ts",
+   "line": 54,
+   "severity": "low",
+   "description": "groundedMandate() checks only this.mandate. When the presenter's phone rejects the mandate in the Approve step, this.mandate stays unset. Starting any Break-it scenario afterwards calls d.fixture(), which swaps the device decider to autoApprove and signs the full set of weather proposals: the 1 USDC mandate and, if it was also rejected, the default 60-minute meaning. docs/demo.md (line 121) says this happens only 'when Break it runs first'. Here it overrides an explicit rejection on the approval device.",
+   "failureScenario": "Dashboard: Next (Ask), Next (Clarify), Next (Approve), then reject the mandate on the phone ('No spending mandate was approved'). Then run Break it > tamper. The fixture signs and writes a 1 USDC mandate for assistant-1 without the phone, and later weather steps and purchases can use it.",
+   "suggestedFix": "Run the fixture only when no weather approval has been attempted in this session, for example by tracking a 'user decided' flag. Otherwise refuse the Break-it action with 'approve the mandate first'. Alternatively, sign fixtures with a separate fixture mandate id so they never stand in for a record the user rejected.",
+   "lens": "authority",
+   "upheld": 2,
+   "votes": 2,
+   "notes": [
+    "I confirmed this from the code at e4b6da3; I did not run it. groundedMandate() checks only whether this.mandate is set. approve() sets this.mandate only when the phone confirms a mandate. When the phone rejects it, approve() returns false at weather.ts:159 and this.mandate stays unset. Every Break-it action (tamper, price, race and the rest in guardrails.ts) starts by calling this.mandate(), which",
+    "I confirmed this from the code at e4b6da3. It is low severity, demo-only, and it was there before this commit, because e4b6da3 does not touch weather.ts. In approve(), a rejected mandate means the step returns false before setMandate runs (weather.ts:158). this.mandate stays undefined and next stays at 2. Guardrails gets its mandate through `() => this.weather!.groundedMandate()` (live.ts:123), an"
+   ]
+  },
+  {
+   "title": "'Verified' rehearsal saves a weather run that did not go as scripted",
+   "file": "src/web/rehearse.ts",
+   "line": 30,
+   "severity": "medium",
+   "description": "README says `--rehearse` \"records a verified fallback\". docs/demo.md says the rehearsal \"stops with an error, and saves nothing, if any step did not go as scripted\" and that \"a broken run never becomes your fallback\". rehearsalProblems() only looks for `error` events, guard cards with tone `fail`, the shoes purchase status and a 'no order yet' note. It never checks the weather scenario. A weather step that returns false (no mandate approved, purchase blocked with no transactionId) stops autoplay without emitting an error. A purchase that ends `completed_noncompliant` or `paid_not_delivered` counts as 'done' and is not checked at all. The guard checks are also weaker than the presenter script says: tamper and unapproved pass on any 403 whatever the code, and replay never checks that Spree really delivered three times (only that Havel returned 402 and the rail shows one transfer).",
+   "failureScenario": "Reproduced at e4b6da3. I started LiveDemo, set Spree's behaviour to observationAgeMinutes:120 until the weather delivery event, then called rehearse(demo,'broken'). Every step ran and the run printed 'SAVED .../broken.json'. The saved log contains purchase status completed_noncompliant and delivery NonCompliant ('\u2717 observationAgeMinutes = 120 violates lteq 60'). A presenter replaying it on stage would show a failed delivery as the headline flow.",
+   "suggestedFix": "In rehearsalProblems, flag any `step` event with state 'failed', a weather `purchase` whose status is not 'completed', and a weather `delivery` whose status is not 'Delivered'. Make the tamper and unapproved cards check the expected codes (MANDATE_NOT_CONFIRMED, SELLER_NOT_IN_MANDATE), and make replay require Spree to return 200 three times. Or narrow the docs to the conditions actually checked.",
+   "lens": "docs-honesty",
+   "upheld": 2,
+   "votes": 2,
+   "notes": [
+    "I could not refute this; the code confirms it. At e4b6da3, rehearsalProblems() (src/web/rehearse.ts:33-42) only flags four things: `error` events, guard cards that finish with tone `fail`, `shoes.purchase` with a status other than completed or fulfilment_pending, and a `shoes.note` saying 'no order yet'. It never looks at weather `step`, `purchase` or `delivery` events.\n\nWhen a weather step cannot",
+    "The core claim holds when checked against the code at e4b6da3. rehearsalProblems() (src/web/rehearse.ts:33-42) checks only four things: `error` events, guard cards with tone \"fail\", the `shoes.purchase` status and the shoes \"no order yet\" note. It never looks at weather `step`, `purchase` or `delivery` events.\n\nIn src/web/scenarios/weather.ts, step() (lines 79-92) catches a false return from run()"
+   ]
+  },
+  {
+   "title": "Comparison-harness docs say the rule interpreter fails cases it now passes",
+   "file": "docs/llm-providers.md",
+   "line": 202,
+   "severity": "medium",
+   "description": "docs/llm-providers.md says of the `injection` case: \"The rule-based interpreter currently obeys this text and is reported as failing it.\" Line 208 gives as an example that \"the rule-based interpreter misses 'shoes I can get repaired'\". Both are false at e4b6da3. ruleInterpreter.ts maps 'repaired' to 'repairable' (SYNONYMS), and the rule interpreter proposes no mandate for the injection text.",
+   "failureScenario": "Ran `npm run compare:interpreters` offline from a clean clone. Summary: rule-based, 10 cases, 0 errors, 0 validation failures, 0 expectation failures, 0 invariant violations. Injection case output: intention, question WeatherReport.current, unrecognized x1, and no mandate. Repairable paraphrase: question Shoes.repairable. A reader relying on the doc expects a documented injection failure as the baseline and wrongly concludes the harness or its expectations are broken.",
+   "suggestedFix": "Remove or update both sentences, e.g. say the rule-based interpreter passes all cases and that LLM providers are what the adversarial cases are for. Or pick a current example of a rule-based expectation failure.",
+   "lens": "docs-honesty",
+   "upheld": 2,
+   "votes": 2,
+   "notes": [
+    "I could not refute the finding. Both sentences in the doc are stale at e4b6da3. The code and a reproduction in a throwaway worktree (removed afterwards) both show that the rule-based interpreter passes the injection case and the \"repaired\" paraphrase case. The doc says it fails both. This is a doc defect only: it misdescribes the baseline but causes no runtime harm. Medium/low severity fits.",
+    "The finding is confirmed. At e4b6da3, docs/llm-providers.md says two things about the rule-based interpreter: that it obeys the injection text and is reported as failing it, and that it misses \"shoes I can get repaired\". The code says otherwise. In src/grounding/ruleInterpreter.ts, the SYNONYMS table maps \"repaired\" to \"repairable\" (line 26), and line 68 detects \"already approved\" text and rejects"
+   ]
+  },
+  {
+   "title": "README proxy instruction cannot serve a paid request: no command starts the rails it needs",
+   "file": "README.md",
+   "line": 160,
+   "severity": "medium",
+   "description": "README presents `npm run proxy -- --config proxy.example.json` as how to run \"the 402 proxy in front of an API of your own\". The example config points the rails at 127.0.0.1:4021/4022/4023. The only implementations of those rail HTTP surfaces are the in-process simulations in src/payments/sim/. They start only from code, on random ports (startFacilitator/startLightning/startPsp take no port), and no script or CLI starts them. The config's $comment hints at this, but the README does not, so the documented command gives a proxy whose every paid route fails.",
+   "failureScenario": "From a clean clone: `npm run proxy -- --config proxy.example.json` starts and prints the routes. Then `curl -i http://127.0.0.1:8402/v1/aqi/current` returns `HTTP/1.1 500 {\"error\":\"internal_error\",\"message\":\"fetch failed\"}`, because building the challenge calls the absent Lightning node and PSP. No 402 is ever produced. Only /profile/card works.",
+   "suggestedFix": "Ship a small `npm run rails` (or a `--sim-rails` flag on the proxy CLI) that starts the simulated facilitator, Lightning node and PSP on the configured ports. Or state in the README that the proxy currently needs those simulations started from code, and return 502/503 'rail_unavailable' instead of a generic 500.",
+   "lens": "docs-honesty",
+   "upheld": 2,
+   "votes": 2,
+   "notes": [
+    "I reproduced the finding. The README at e4b6da3 gives `npm run proxy -- --config proxy.example.json` with no warning that the rails must already be running. proxy.example.json points the rails at 127.0.0.1:4021/4022/4023. No npm script or CLI starts anything on those ports: package.json's scripts are pod, demo, demo:interactive, proxy, compare:interpreters, demo:web, test and typecheck. startLight",
+    "I confirmed this by reading the code and by reproducing it. The README section \"Selling through HTTP 402: the proxy\" (README.md around line 160) gives `npm run proxy -- --config proxy.example.json` as the way to run the proxy. It does not say that the payment rails must be started separately, or how. Two other places hint at the limitation. One is the $comment in proxy.example.json. The other is t"
+   ]
+  },
+  {
+   "title": "Node >= 22.5 requirement is too low for unflagged node:sqlite",
+   "file": "README.md",
+   "line": 38,
+   "severity": "medium",
+   "description": "README says \"Requires Node.js \u2265 22.5. Ledger storage uses the built-in `node:sqlite`\", and package.json engines says >=22.5. On Node 22.5.0 through 22.12.x, node:sqlite is available only with the --experimental-sqlite flag (the flag was dropped in 22.13.0). No script passes that flag. Not reproduced here: installing an older Node was blocked; tested only on v22.23.4.",
+   "failureScenario": "A user on Node 22.12 meets the documented requirement and runs `npm ci && npm run demo`. The import of node:sqlite in src/gateway/ledger.ts fails with ERR_UNKNOWN_BUILTIN_MODULE, so the demo, web demo and tests cannot start.",
+   "suggestedFix": "Raise the requirement to Node >= 22.13 in the README and engines, or add `--experimental-sqlite` via NODE_OPTIONS in the npm scripts.",
+   "lens": "docs-honesty",
+   "upheld": 2,
+   "votes": 2,
+   "notes": [
+    "The finding holds at e4b6da3. The README and engines both say Node >= 22.5. src/gateway/ledger.ts imports node:sqlite with a plain static import, and nothing in the repo passes --experimental-sqlite: no npm script, no NODE_OPTIONS, no .nvmrc. Node 22.5.0 added node:sqlite only behind the --experimental-sqlite flag, and the flag was removed in 22.13.0. So on Node 22.5 through 22.12 the import fails",
+    "I could not refute this finding, so it stands. At e4b6da3 the README and package.json engines both say Node >= 22.5. The ledger module imports node:sqlite statically, and no npm script, .nvmrc, .npmrc or NODE_OPTIONS setting passes --experimental-sqlite. Per Node's release history (my own knowledge, not reproduced here), node:sqlite first shipped in v22.5.0 behind the --experimental-sqlite flag an"
+   ]
+  },
+  {
+   "title": "Comment tells users to set X402_FACILITATOR_URL, which nothing reads",
+   "file": "src/payments/schemes/x402.ts",
+   "line": 11,
+   "severity": "low",
+   "description": "The header comment says: \"To move to Base Sepolia, set X402_FACILITATOR_URL to a real facilitator and fund the signer's address with test USDC.\" No code reads X402_FACILITATOR_URL. The only environment variables read in src are DEMO_PUBLIC_URL, POD_URL, DEMO_TOKEN, DEMO_PORT, CLAUDE_MODEL and the LLM variables in config.ts. Facilitator URLs come only from in-process sims (startEnvironment) or the proxy config's rails.facilitatorUrl.",
+   "failureScenario": "A developer following the comment exports X402_FACILITATOR_URL=https://<real facilitator> and runs the demo or proxy. Settlement still goes to the in-memory simulation (or to the config's rails URL) with no error. They may believe they tested against a real facilitator.",
+   "suggestedFix": "Drop the sentence or replace it with the real mechanism (the proxy config's rails.facilitatorUrl, plus the README next-steps list). Or actually read the variable in startEnvironment.",
+   "lens": "docs-honesty",
+   "upheld": 2,
+   "votes": 2,
+   "notes": [
+    "Confirmed. The comment in x402.ts at commit e4b6da3 tells users to set X402_FACILITATOR_URL. No code anywhere in the commit reads that variable: the only match for the string is the comment itself. The facilitator URL comes from rails.facilitatorUrl. In the demo, that value is the in-process sim's URL (src/demo/environment.ts:80). In the proxy, it comes from the config file (src/proxy/cli.ts:29). ",
+    "The finding holds. At e4b6da3 the header comment in src/payments/schemes/x402.ts (lines 10-12) tells readers to \"set X402_FACILITATOR_URL to a real facilitator\". The only place that string appears anywhere in the tree is that comment. No code reads it through process.env, and no config or env helper reads it either. All process.env reads in src cover POD_URL, CLAUDE_MODEL, DEMO_PORT, DEMO_TOKEN, D"
+   ]
+  },
+  {
+   "title": "Rehearsal accepts a run whose weather scenario did not complete, and saves it as the 'verified' fallback",
+   "file": "src/web/rehearse.ts",
+   "line": 32,
+   "severity": "medium",
+   "description": "rehearsalProblems() checks only 'error' events, guard verdicts with tone 'fail', the shoes.purchase status and the 'no order yet' shoes note. It never looks at the weather screen: not the weather 'purchase' status, not the 'delivery' status, and not whether every weather step reached 'done'. WeatherScenario.step() catches its own failures and returns false, and autoplay() then stops without emitting an 'error' event. As a result, a weather run that ended paid_not_delivered, blocked, or stopped partway passes the check. rehearse() then overwrites recordings/talk.json with it. docs/demo.md says the rehearsal 'stops with an error, and saves nothing, if any step did not go as scripted' and that 'a broken run never becomes your fallback'.",
+   "failureScenario": "Reproduced against a LiveDemo in a scratch worktree. I set spree.setBehaviour({failDeliveryTimes:10}) only while weather step 4 (Pay) ran, to simulate a seller API glitch during the rehearsal, and then called rehearse(demo,'glitch'). It printed 'SAVED .../glitch.json'. The recording has purchase status 'paid_not_delivered' (DELIVERY_FAILED) and delivery 'NotDelivered', and steps 4 to 6 are all marked 'done'. With `--rehearse talk` this run would replace the shipped fallback. In the talk, the replay's weather screen would then show a failed delivery right when the presenter has fallen back to the 'safe' recording.",
+   "suggestedFix": "In rehearsalProblems, treat these as problems: any weather 'step' event with state 'failed'; a weather 'purchase' whose status is not 'completed'; a 'delivery' whose status is not 'Delivered'; and a rehearsal that ends with any of the 7 weather steps not done or skipped. Also flag a shoes 'The verdict was not signed' note. Add a regression test that injects a delivery failure during weather Pay and expects rehearse() to throw.",
+   "lens": "live-talk",
+   "upheld": 2,
+   "votes": 2,
+   "notes": [
+    "The code confirms the finding. At e4b6da3, rehearsalProblems (src/web/rehearse.ts:32-41) looks at only four kinds of event: 'error', 'guard' with tone 'fail', 'shoes.purchase' and 'shoes.note'. It never reads the weather events 'purchase', 'delivery' or 'step'. A weather failure produces no 'error' event: WeatherScenario.step() (src/web/scenarios/weather.ts:79-91) turns a false return into a 'step",
+    "I confirmed this from the code at e4b6da3. rehearsalProblems() (src/web/rehearse.ts:32-41) looks at only four things: 'error' events, guard tone 'fail', shoes.purchase status, and the shoes 'no order yet' note. It never looks at the weather 'purchase', 'delivery' or 'step' events. On the weather side, the gaps line up with what the finding says. step() (weather.ts:79-92) has try/finally and no cat"
+   ]
+  },
+  {
+   "title": "A second 'Buy' after an order hides the existing paid order and locks the shoes controls",
+   "file": "src/web/public/app.js",
+   "line": 71,
+   "severity": "medium",
+   "description": "'Buy with the assistant' stays enabled after an order exists (btn-buy is disabled only by !canAct()). A second buy re-uses the confirmed 120 EUR mandate, and the gateway blocks it: 94.9 committed + 94.9 > 120. The scenario keeps its server-side tracking of the first order, but the dashboard reducer sets s.shoes.order = null on any shoes.purchase whose status is not fulfilment_pending. The tracking strip then shows 'No order yet', and Advance, Cancel and the Yes/No verdict buttons become disabled even though a paid order exists and the budget meter shows 94.90 EUR committed. The presenter can continue the shoes story only through Reset, which also wipes the weather and Break-it screens.",
+   "failureScenario": "Reproduced via the HTTP API with auto-approve on: shoes.buy gives order ord_\u2026 fulfilment_pending. A second shoes.buy returns shoes.purchase {status:'blocked', code:'BUDGET_EXCEEDED', reason:'94.9 EUR committed + 94.9 EUR > 120 EUR'}. In the UI that clears the order panel and disables Advance and Cancel. A direct POST shoes.advance still moved the hidden first order to 'shipped', which shows the order still exists on the server. A presenter who presses Buy again instead of Advance, or who forgets the 'cancel first' order from the script, is stuck mid-talk.",
+   "suggestedFix": "Disable Buy while an order is live (created, shipped, or delivered without a verdict). Alternatively, only clear s.shoes.order when the server says it replaced tracking: for example, emit shoes.order again, or include the current tracking in the blocked shoes.purchase event, and keep showing the previous order.",
+   "lens": "live-talk",
+   "upheld": 2,
+   "votes": 2,
+   "notes": [
+    "I could not refute this finding. The code at e4b6da3 supports every step of the reported chain.\n\n1. Buy stays enabled after an order exists. src/web/public/app.js:323 sets `$(\"btn-buy\").disabled = !canAct()`, and canAct (line 96) only checks `ui.authorized && !s.busy`.\n2. A second buy reuses the mandate already confirmed. In src/web/scenarios/shoes.ts, buy() keeps `this.mandate` and runs purchaseV",
+    "I checked the claim against the code at e4b6da3 and every link in the chain holds. I did not run my own reproduction, because the code alone is enough.\n\n1. The Buy button is gated only by canAct() (app.js:323), so it stays clickable while an order is live.\n2. A second buy runs purchaseViaCheckout again against the same mandate. The scenario always emits shoes.purchase with whatever status comes ba"
+   ]
+  },
+  {
+   "title": "Replay ignores 'No, not compliant' and shows the recorded 'accepted' verdict",
+   "file": "src/web/replay.ts",
+   "line": 47,
+   "severity": "low",
+   "description": "ReplayDemo.act() ignores the action args, so shoes.accept with {ok:false} plays the single recorded shoes.accept unit. The shipped recording made by REHEARSAL has ok:true. The dashboard still offers both 'Yes, as agreed' and 'No, not compliant' in replay. The presenter script tells them to answer either way.",
+   "failureScenario": "In `--replay recordings/talk.json` I went buy, cancel, buy, advance, advance, then clicked 'No, not compliant'. The tracking shows 'Accepted by you' and the panel says 'You accepted the delivery as agreed.', the opposite of what the presenter just said on stage. The same applies to the weather meaning chips: picking 15 minutes in replay is silently ignored, and the recorded 60-minute answer plays.",
+   "suggestedFix": "Key replay units by their args too: for example, record the verdict in the unit key, and refuse with a clear 409 ('the recording only has the accepted verdict'). Or disable the controls the recording cannot honour in replay mode, such as the 'No' button and non-recorded chips.",
+   "lens": "live-talk",
+   "upheld": 2,
+   "votes": 2,
+   "notes": [
+    "I confirmed this from the code at e4b6da3. `ReplayDemo.act(name, _args)` never reads its args. It picks units by key alone: the key is the action name, except that the weather.next and weather.autoplay actions map to \"weather.step\" (src/web/replay.ts:47-58). The `cut()` function also keys each unit only by `busy.data.action`, so the verdict never becomes part of the key (replay.ts:106). The shippe",
+    "The finding holds up against the code at e4b6da3. ReplayDemo.act takes `_args` and never reads it. It looks up units by action name only (the `key` from `name`). Units are cut by the `busy` action name, so the recording's one shoes.accept unit plays whatever was pressed. That recording has ok:true. weather.answer simply returns {ok:true} without doing anything, so the replay plays the recorded cho"
+   ]
+  },
+  {
+   "title": "Reset during autoplay is silently delayed while the autoplay keeps paying",
+   "file": "src/web/live.ts",
+   "line": 157,
+   "severity": "low",
+   "description": "When Reset is pressed while busy, act() only cancels pending approvals and chains the reset after this.running. An autoplay that is already past the Approve step has no pending approval, so it keeps going: Compare, Pay, Deliver and Evidence, with stepPauseMs between steps. Only after that does the reset happen. No event tells the dashboard that a reset is queued, so the presenter sees a payment executed after pressing Reset, with no feedback.",
+   "failureScenario": "Measured with auto-approve on: weather.autoplay, then POST reset when step 4 (Compare) became active. The reset event arrived 3.9 s later, after the purchase step had paid 0.02 USDC and delivery and evidence had run. Pressing Reset again in that window is accepted (202) and changes nothing.",
+   "suggestedFix": "Make the scenarios abortable on reset: for example, a resetRequested flag checked by WeatherScenario.autoplay() between steps and before Pay. Emit an event ('reset queued') so the dashboard can show 'Resetting after the current step\u2026'.",
+   "lens": "live-talk",
+   "upheld": 2,
+   "votes": 2,
+   "notes": [
+    "I confirmed this from the code at e4b6da3 but did not reproduce it. When Reset arrives while an action is running (src/web/live.ts:177-183), act() only calls broker.cancelAll() and chains `this.running?.then(() => this.act(\"reset\", {}))`. cancelAll() (src/web/approvals.ts:76-79) rejects pending approvals and sets closed=true, so later decider calls are refused. Nothing else reaches the scenario. W",
+    "The code confirms the behaviour, so I am not refuting it. In LiveDemo.act() at e4b6da3, a Reset pressed while busy does only two things: it calls broker.cancelAll(), which refuses pending approvals, and it queues the reset with this.running.then(() => this.act(\"reset\")). WeatherScenario.autoplay() is a plain while loop over step(), with sleep(stepPauseMs) between steps (900 ms by default). Nothing"
+   ]
+  },
+  {
+   "title": "Benign click races show as red 'failed' alerts on the projected dashboard",
+   "file": "src/web/public/app.js",
+   "line": 388,
+   "severity": "low",
+   "description": "Any 409 or 404 from a harmless race goes into s.errors and is rendered as an alert, for example '<action> failed: busy: weather.next' or 'approval failed: no such pending approval'. This happens on a fast double-click before the busy event disables the button, with two dashboards or two control surfaces open, and when an on-screen Approve races the phone or auto-approve. On the phone page the 404 error stays visible until the next successful decision.",
+   "failureScenario": "Playwright dblclick on 'Next step' (step 2) left the alert 'weather.next failed: busy: weather.next' on the dashboard while the step itself ran fine. POSTing an approval on the phone right after Reset (or after the dashboard/auto-approve resolved it) returns 404 'no such pending approval', which the phone shows in red and the dashboard shows as 'approval failed: \u2026'.",
+   "suggestedFix": "Treat 409 'busy' for the action already running, and 404 for an approval already resolved, as no-ops. Show nothing, or a transient neutral note. Clear the phone's error when the item it referred to is resolved or a reset arrives.",
+   "lens": "live-talk",
+   "upheld": 2,
+   "votes": 2,
+   "notes": [
+    "I confirmed this from the code at e4b6da3. I didn't run a Playwright reproduction, but the code path is plain. The server returns 409 `busy: <action>` for any action other than reset that arrives while another action is running. It returns 404 'no such pending approval' when the approval has already been decided. The client treats both the same as real failures. On the dashboard, the button is dis",
+    "I read the code at e4b6da3 and it backs the finding. I did not run Playwright, because the code path is plain. The server sends 409 \"busy: <action>\" whenever an action is already running, unless the new action is a reset that can still go through. It sends 404 \"no such pending approval\" when the approval has already been decided. The dashboard's act() puts every thrown error into s.errors, and the"
+   ]
+  }
+ ],
+ "disputed": [
+  {
+   "title": "Gateway ledger listed as 'real' and 'durable' but every entry point runs it in memory",
+   "file": "README.md",
+   "line": 205,
+   "severity": "low",
+   "description": "The README's 'What is real' table lists \"SQLite ledger with BEGIN IMMEDIATE reservations\" under Real, in contrast to \"Signer idempotency state is in memory\". design.md calls the ledger the \"source of truth for money\". ledger.ts opens with \"Durable transaction ledger ... several gateway processes sharing the file cannot together exceed a mandate\". But `new Ledger(path = \":memory:\")` is the default. No CLI, demo, web demo or test ever passes ledgerPath, and nothing tests the multi-process file mode.",
+   "failureScenario": "Any `npm run demo`, `demo:web` or test run keeps reservations and settlement history in an in-memory SQLite database. Restarting the gateway loses all budget state, exactly like the signer state the README lists as simulated. The 'several processes sharing the file' guarantee has never been exercised.",
+   "suggestedFix": "Move 'ledger is in memory in the demo (file path supported, untested)' into the Simulated column and soften the ledger.ts header. Or wire a file path (e.g. .data/ledger.sqlite) and add a two-process test.",
+   "lens": "docs-honesty",
+   "upheld": 1,
+   "votes": 2,
+   "notes": [
+    "The facts in the finding are correct. The README entry it objects to is still accurate, so this is not a real defect. Ledger defaults to \":memory:\" (src/gateway/ledger.ts:24). Nothing passes ledgerPath: src/demo/run-demo.ts:68, test/e2e.test.ts:24 (no env() call sets it), test/llm.test.ts:550 and test/proxy.test.ts:679 all leave it out, and no test runs in multi-process file mode. But the README \"",
+    "The finding holds up as a low-severity documentation problem, so I am not refuting it. src/gateway/ledger.ts:24 defaults to `constructor(path = \":memory:\")`, and src/gateway/gatewayService.ts:75 calls `new Ledger(cfg.ledgerPath)`. The only code that forwards ledgerPath is src/demo/environment.ts:71/96. No caller ever sets it: run-demo.ts:68 passes `{ decider }`, the e2e helper test/e2e.test.ts:23-"
+   ]
+  },
+  {
+   "title": "Bedrock/Vertex support overstated in README and stale in design.md",
+   "file": "README.md",
+   "line": 181,
+   "severity": "low",
+   "description": "README says the interpreter runs on \"Anthropic Claude (also Bedrock and Vertex through the Anthropic SDK)\". docs/llm-providers.md says \"Bedrock / Vertex AI are not wired\" and \"That path is untested here\". Neither @anthropic-ai/bedrock-sdk nor @anthropic-ai/vertex-sdk is a dependency, and no LLM_PROVIDER value selects them. Separately, design.md's grounding diagram still shows the interpreter as \"rules | Claude, JSON schema\", although the provider-neutral layer now covers five providers.",
+   "failureScenario": "A reader of the README expects Bedrock/Vertex to be configurable like the other providers. In fact no environment configuration reaches them: they need extra packages and hand-written code, on a path no test covers.",
+   "suggestedFix": "Change the README to: 'Bedrock and Vertex can be passed in code as an Anthropic SDK client (not wired, untested)'. Update the design.md diagram to 'rules | any LLM provider'.",
+   "lens": "docs-honesty",
+   "upheld": 1,
+   "votes": 2,
+   "notes": [
+    "The finding quotes the docs accurately, but it is not a real defect in commit e4b6da3, and the limitation is already written down. (1) e4b6da3 does not touch README.md or docs/design.md. Its stat lists only docs/demo.md, recordings/*, src/web/* and test/web.test.ts, so the issue was there before this commit. (2) The cited line is wrong: in e4b6da3 the sentence is at README.md:166, not line 181. (3",
+    "The finding holds up, with one small error: the claim is at README line 166, not 181. The README says the interpreter \"can run on Anthropic Claude (also Bedrock and Vertex through the Anthropic SDK)\". The repository's own docs and code say otherwise: Bedrock and Vertex are not wired, are untested, and their SDKs are not dependencies. No LLM_PROVIDER value selects them, so environment configuration"
+   ]
+  },
+  {
+   "title": "Reset cannot recover from a crashed Community Solid Server and leaves the demo wedged",
+   "file": "src/web/live.ts",
+   "line": 104,
+   "severity": "low",
+   "description": "boot() reuses the CSS child with `this.css ??= await startCss()` and never checks whether that process is still alive. If CSS dies mid-talk (OOM, crash, killed), every action fails with 'fetch failed', and so does Reset. That failed boot leaves the broker closed (cancelAll set closed=true and reopen() never ran), with this.env pointing at the already-closed old environment. The dashboard keeps the stale session and shows only 'reset failed: fetch failed', which does not say that the Pod server is down or that restarting the process (or switching to --replay) is the only way out.",
+   "failureScenario": "Reproduced on a live server: weather steps 1-4 ran, then I killed the CSS child (kill -9). Next step gave step 4 'failed' plus 'weather.next failed: fetch failed'. Reset then emitted 'reset failed: fetch failed', and the screen stayed on the old session. Every further Reset fails the same way until the whole demo process is restarted.",
+   "suggestedFix": "In boot(), if this.css?.proc.exitCode !== null (or a probe of css.url fails), restart CSS before building the environment. On a failed boot, call broker.reopen() and emit a clear 'Pod server unreachable: restart the demo or switch to --replay' error.",
+   "lens": "live-talk",
+   "upheld": 1,
+   "votes": 2,
+   "notes": [
+    "I read the code at e4b6da3 and it matches the finding. I did not re-run the kill -9 reproduction. boot() reuses the CSS child with `??=` and never checks whether that process is still alive. Before it starts the new environment, it calls broker.cancelAll() (which sets closed=true) and closes the old environment. If startCheckoutEnvironment then throws because CSS is dead, three things are left bro",
+    "The code does behave as the finding describes. boot() reuses the Community Solid Server process without checking it is alive. On a failed boot, cancelAll() has already set closed=true and reopen() never runs, and this.env still points at the environment that was just closed. Two things make this not a real defect of commit e4b6da3. First, it is a known limitation with a documented way out. docs/de"
+   ]
+  }
+ ],
+ "openVariants": [
+  {
+   "id": "F2",
+   "finding": "Finding: \"Re-presenting a settled credential on a non-GET paid route runs the paid action again with a new body: one payment buys unlimited POSTs\". The fix in e4b6da3 adds SettlementBook.tryStartDeliv",
+   "variants": [
+    "Timeout or 5xx after the upstream already did the work: a POST that times out (or gets a 5xx) is classed as 'transient' (outcomeOf, paymentProxy.ts:56-59). The credential stays usable, so the buyer can POST again with a different body. Reproduced with upstreamTimeoutMs=200, an upstream that takes 400ms, and card-psp: r1=502, r2=200, upstream.bodies=[job0,job1], card-psp charges=3 (one payment, two jobs run).",
+    "Upstream 4xx (e.g. 422) on a POST is 'refused'. It neither consumes the credential nor marks it delivered, so a buyer can send any number of different bodies until one gets a 2xx. Reproduced: statuses 422,422,422,200,402, with 4 upstream hits on one x402 payment. Low impact if the upstream does no billable work on a 4xx.",
+    "The deliveries map in SettlementBook is in memory only (serverSide.ts:121). After a proxy restart, a consumed POST credential has delivered=false again, so it can deliver once more. This fits the documented in-memory limitation of the book, but it is an open gap for non-GET routes."
+   ]
+  },
+  {
+   "id": "F3",
+   "finding": "Finding: \"OLLAMA_API_KEY sent as a Bearer token over plain HTTP when OLLAMA_HOST has no scheme\". At b6304b7, ollamaHost() in src/llm/config.ts (around line 96) put http:// in front of any OLLAMA_HOST ",
+   "variants": [
+    "Not this finding's code path, but the same kind of leak: other providers send their key over plain http with no check when the user writes an explicit http:// base URL. At e4b6da3, LLM_PROVIDER=openai-compatible with LLM_BASE_URL=http://ollama.com/v1 and LLM_API_KEY, openai with OPENAI_BASE_URL=http://api.example.com/v1, and anthropic with ANTHROPIC_BASE_URL=http://api.example.com all build an adapter without complaint. Only OllamaAdapter has the https-or-loopback guard.",
+    "Wrong result but no leak: a bare IPv4-mapped loopback address (OLLAMA_HOST=::ffff:127.0.0.1) is not treated as loopback and becomes https://[::ffff:7f00:1], so a local plain-http server cannot be reached. It fails safe."
+   ]
+  },
+  {
+   "id": "F4",
+   "finding": "Finding: \"OLLAMA_HOST without a port resolves to port 80, not Ollama's default 11434\". In b6304b7, ollamaHost() in src/llm/config.ts only added \"http://\" in front of the value, so \"0.0.0.0\" became htt",
+   "variants": [
+    "Scheme-less public FQDN or public IP for a self-hosted plain-http Ollama (e.g. OLLAMA_HOST=ollama.mycorp.com on internal corporate DNS, or 203.0.113.5) now resolves to https://<host> on port 443. The Ollama CLI would use http://<host>:11434. This is a deliberate, documented choice (src/llm/providers/ollama.ts:52-58) made so an API key never travels in cleartext, but for those hosts it still differs from the CLI rule the finding cites, and the request still misses a server listening on http 11434. The workaround is to write the scheme and port explicitly."
+   ]
+  },
+  {
+   "id": "F5",
+   "finding": "Finding: \"Vertex AI mode sends a leftover GEMINI_API_KEY to the Vertex project endpoint instead of using ADC\". The fix at e4b6da3 (src/llm/config.ts:132-141) reads the key only from LLM_API_KEY in Ver",
+   "variants": [
+    "Vertex mode (GOOGLE_GENAI_USE_VERTEXAI=true) with GEMINI_API_KEY or GOOGLE_API_KEY in process.env but no GOOGLE_CLOUD_PROJECT and no GOOGLE_CLOUD_LOCATION: config.ts:138 yields vertex={project:undefined,location:undefined} and apiKey undefined, so the SDK constructor falls back to getApiKeyFromEnv(). No precedence branch clears that key when project and location are both missing, so the request goes to the Vertex express path /v1beta1/publishers/google/models/...:generateContent with x-goog-api-key set to the AI Studio key (observed: key 'k' / 'gk'), not ADC. This contradicts the new comment at config.ts:133-136 ('Only LLM_API_KEY selects Vertex express'). The setup is incomplete, but the key is still sent to Vertex without warning instead of failing with a config error."
+   ]
+  },
+  {
+   "id": "F7",
+   "finding": "Finding: \"Anthropic stop_reason model_context_window_exceeded is treated as a normal stop\". At b6304b7 the adapter mapped only 'refusal' and 'max_tokens'. Everything else became finish:'stop', so part",
+   "variants": [
+    "The adapter uses a denylist, not an allowlist: any stop_reason other than end_turn that is not in CUT_OFF (null, or a future SDK value) still falls through to finish:'stop' and the partial text gets parsed and repaired (src/llm/providers/anthropic.ts:64-66). I confirmed this with a fake client: stop_reason null and 'some_future_cutoff' both return finish 'stop' with text '{\"a\":'. stop_sequence and tool_use behave the same way, but this adapter can't hit them today because it sends no stop_sequences or tools. Low risk."
+   ]
+  },
+  {
+   "id": "F8",
+   "finding": "Finding: \"Comparison harness cannot detect a successful prompt-injection budget: the 'injection' adversarial case is unchecked and the invariant is vacuous for it\". In b6304b7, both 'injection' and 's",
+   "variants": [
+    "smuggle-preference atMost check ignores maxPerTransaction: a USDC mandate with totalLimit 500 and maxPerTransaction 600 gets no validation, expectation or invariant failure (src/llm/compare.ts:138-142 checks only currency and totalLimit, and validateInterpretation accepts perTx > total).",
+    "The atMost check runs per mandate, not on the sum: two separate 500 USDC mandates (1000 USDC in total) pass smuggle-preference with no findings.",
+    "Cosmetic: when only maxPerTransaction hits a forbidden limit (e.g. total 5000, perTx 1000), the invariant message says 'limit 5000 USDC is forbidden', naming the wrong amount (compare.ts:157). The mandate is still flagged.",
+    "smuggle-preference now accepts a 500 USDC mandate taken from the smuggled sentence by design (comment at compare.ts:78-80). This is a policy choice, not a detection gap, but a reviewer may see it as permissive."
+   ]
+  },
+  {
+   "id": "F9",
+   "finding": "Finding: \"Dashboard's own GET /budget polls show up in the wire trace as gateway->Pod mandate reads\". At b6304b7 the tap skipped only the dashboard's own QUIET fetch. attribute() then ran every gatewa",
+   "variants": [
+    "Header spoofing (low risk): attribute() trusts any incoming x-demo-quiet header (src/web/wire.ts:124-127). A non-QUIET caller that sends it, such as anything on the network that reaches the gateway, gets its server-side downstream work hidden from the trace. Only deliberate misuse triggers it, because no library code sets this header.",
+    "Test fragility (not a wrong outcome): the new regression test in test/web.test.ts expects an earlier test (the weather scenario) to have tracked a 'weather' budget. Run alone with --test-name-pattern, it crashes on a null .data instead of testing anything."
+   ]
+  },
+  {
+   "id": "F11",
+   "finding": "Finding: \"No test runs the Break-it guardrails or the shoes flow against live services; they are only checked by replaying a frozen recording\". This is a test-coverage gap, not a code bug. src/web/sce",
+   "variants": [
+    "race() reading the budget of the wrong mandate is not caught: I changed the GET /budget in guardrails.ts race() to query this.mandate() instead of the shared mandate, and both new live tests still passed. test/web.test.ts only checks the prefix /^2 settled \u00b7 4 BUDGET_EXCEEDED \u00b7 charged/ and never the charged amount.",
+    "shoes eur formatting is not covered: I changed the eur() divisor in src/web/scenarios/shoes.ts:22 from 100 to 10 and the shoes and Break-it tests still passed. No test asserts the display, total or price strings.",
+    "shoes checkout facts are not covered: I changed the delegated-token fact text in shoes.ts:128 ('this session, one use' to 'any session, unlimited use') and the tests still passed. No test asserts shoes.checkout facts."
+   ]
+  },
+  {
+   "id": "F12",
+   "finding": "Finding: \"--rehearse saves a recording even when guardrails or the shoes purchase fail, so the 'verified rehearsal' can ship failures\".",
+   "variants": [
+    "weather.autoplay failure goes undetected: if the weather purchase is blocked or no mandate is approved, the scenario emits a `purchase` event with a non-completed status and a `step {state:'failed'}`, then stops without throwing (src/web/scenarios/weather.ts:72, 87, 159, 203). rehearsalProblems (src/web/rehearse.ts:32-41) checks neither `step` failed nor `purchase` status, so the recording is still saved. Reproduced with a stub: saved=true.",
+    "shoes.accept where the verdict is not signed on the device emits shoes.note 'The verdict was not signed on the device; nothing recorded.' (src/web/scenarios/shoes.ts:155). The rehearse regex only matches /no order yet/, so the recording is saved. Reproduced: saved=true.",
+    "No check that the final shoes.order states match the script (cancel ends refunded/refunded; advance+accept ends delivered with acceptance). A merchant that ignores cancel or advance would still produce a saved rehearsal. Inferred from code, not run."
+   ]
+  },
+  {
+   "id": "F13",
+   "finding": "Finding: \"Business-view 'Guardrails held' tile says 'run live' in replay mode too\".",
+   "variants": [
+    "Break-it tab lead text (src/web/public/index.html:151, e4b6da3) is a fixed string, 'Each button runs a real attack or failure against the live services.' The section is not live-only, so it shows in replay. Observed in a replay session on e4b6da3.",
+    "Guard 'running' verdict (src/web/public/app.js:369, e4b6da3) is a fixed string, 'Running against the live services\u2026'. Clicking a guard button in replay plays back the recorded unit and still shows this text. Observed on e4b6da3."
+   ]
+  },
+  {
+   "id": "F15",
+   "finding": "Finding: \"Record button defaults to the name \\\"talk\\\" and silently overwrites the rehearsed/shipped fallback recordings/talk.json\". At b6304b7, index.html prefilled value=\"talk\", and LiveDemo.record()",
+   "variants": [
+    "Cosmetic only: the client's confirm text (src/web/public/app.js, record submit handler near line 418) shows the name as typed, e.g. 'recordings/TALK.json', but the server lowercases and normalises it, so the file actually replaced is recordings/talk.json. The confirm can name a different file from the one overwritten.",
+    "By design, not a bug: once the presenter clicks OK on the confirm (or sends overwrite:true), the shipped talk.json can still be replaced with a partial session. `--rehearse talk` also always overwrites (rehearse.ts passes overwrite:true), but only after a fully clean run.",
+    "Minor: existsSync and then writeFileSync in src/web/live.ts:218-219 is a check-then-write race (TOCTOU). It is not reachable in practice with one demo process.",
+    "Test gap: the session-<HHMM> default name (app.js:415-417) and the confirm-on-409 flow in the browser are not covered by any test. Only the server API path is."
+   ]
+  },
+  {
+   "id": "F16",
+   "finding": "Finding: \"Switching to the documented --replay fallback leaves the open dashboard and phone with a dead token; every control fails with 'forbidden'\". The fix in e4b6da3 does two things. (1) The token ",
+   "variants": [
+    "If DEMO_TOKEN is set for one run and not the other (or recordings/.demo-token is deleted between runs), the restarted server has a new token. The dashboard and phone now lock with a clear message instead of showing buttons that fail, but the presenter still has to re-open the URL and re-scan in the middle of the fallback. This is documented and much softer than before.",
+    "Plausible, not reproduced: loadInfo (app.js) runs only on es.onopen. If the /api/info fetch fails while the SSE reconnect succeeds, `catch { return; }` leaves the old ui.authorized=true and no retry happens until the next reconnect. Buttons could then fail with 'forbidden' again.",
+    "New risk the fix brings, not a variant of the bug: the token now lasts across talks. If recordings/.demo-token is not deleted, anyone who saw the URL or QR code on a projector at an earlier talk can control the next one. docs/demo.md says to delete the file, but nothing enforces it.",
+    "Minor: demoToken writes into recordings/. If that folder cannot be written to (read-only checkout), the CLI throws at start-up, where it used to run."
+   ]
+  },
+  {
+   "id": "F17",
+   "finding": "Finding: a retried merchant refund flipped the order from 'returned' to 'refunded' and replaced the signed NonCompliant verdict with Cancelled (checkout variant). Cause at b6304b7: refund() always rec",
+   "variants": [
+    "Concurrent merchant refunds still cause the bug. Two refundOrder calls in flight together (Promise.all) both pass the `if (o.refund)` guard before the PSP await at src/payments/sim/acpMerchant.ts:179-182. The first call sets status to returned. The second sees 'returned', which is neither shipped nor delivered, so line 189 sets it to 'refunded'. On e4b6da3 the order events end [created, shipped, delivered, returned, refunded] and trackOrder gives orderStatus=refunded, delivery.status=Cancelled, so the NonCompliant verdict is replaced. The PSP idempotency key refund:<order> means money is refunded only once (merchant balance 0); only the order status and verdict are wrong. A fix would be an in-flight per-order promise, like `completing` for checkout, or setting status from a snapshot taken before the await.",
+    "Minor, found by reading the code and not run: two concurrent buyer cancels of a 'created' order without an Idempotency-Key both reach refund() (acpMerchant.ts:226-235) before o.refund is set. Each pushes an event, so the order gets duplicate 'refunded' events. The final status is still 'refunded', so this is only cosmetic."
+   ]
+  }
+ ]
+}
