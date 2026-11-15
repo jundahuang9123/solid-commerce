@@ -16,11 +16,17 @@ import { authorizationTypes, eip712Domain, type PaymentPayload, type PaymentRequ
 
 export class SimUsdc {
   balances = new Map<string, bigint>();
-  usedNonces = new Map<string, string>(); // `${from}:${nonce}` -> tx hash
+  usedNonces = new Map<string, string>(); // nonceKey(from, nonce) -> tx hash
   transfers: Array<{ tx: string; from: string; to: string; value: bigint; at: string }> = [];
   mint(addr: string, v: bigint) { const a = getAddress(addr); this.balances.set(a, (this.balances.get(a) ?? 0n) + v); }
   balanceOf(addr: string) { return this.balances.get(getAddress(addr)) ?? 0n; }
 }
+
+/**
+ * The ledger key of an EIP-3009 authorization. The nonce is a bytes32, so its hex letter case is
+ * not part of its identity (as on chain): "0xAB.." and "0xab.." are the same nonce.
+ */
+export const nonceKey = (from: string, nonce: string) => `${getAddress(from)}:${String(nonce).toLowerCase()}`;
 
 type VerifyResult = { isValid: boolean; invalidReason?: string; payer?: string };
 
@@ -39,14 +45,14 @@ export async function verifyPayment(chain: SimUsdc, p: PaymentPayload, req: Paym
     signature: p.payload.signature,
   }).catch(() => false);
   if (!ok) return { isValid: false, invalidReason: "invalid_exact_evm_payload_signature", payer: a.from };
-  if (chain.usedNonces.has(`${getAddress(a.from)}:${a.nonce}`)) return { isValid: false, invalidReason: "nonce_already_used", payer: a.from };
+  if (chain.usedNonces.has(nonceKey(a.from, a.nonce))) return { isValid: false, invalidReason: "nonce_already_used", payer: a.from };
   if (chain.balanceOf(a.from) < BigInt(a.value)) return { isValid: false, invalidReason: "insufficient_funds", payer: a.from };
   return { isValid: true, payer: getAddress(a.from) };
 }
 
 export async function settlePayment(chain: SimUsdc, p: PaymentPayload, req: PaymentRequirements): Promise<SettleResponse> {
   const a = p.payload.authorization;
-  const key = `${getAddress(a.from)}:${a.nonce}`;
+  const key = nonceKey(a.from, a.nonce);
   const prior = chain.usedNonces.get(key);
   if (prior) return { success: false, errorReason: "nonce_already_used", transaction: prior, network: req.network, payer: getAddress(a.from) };
   const v = await verifyPayment(chain, p, req);
@@ -78,7 +84,7 @@ export async function startFacilitator(chain = new SimUsdc()): Promise<Facilitat
       return json(res, 200, out);
     }
     if (req.method === "GET" && u.pathname === "/authorization-state") {
-      const key = `${getAddress(u.searchParams.get("authorizer") as Hex)}:${u.searchParams.get("nonce")}`;
+      const key = nonceKey(u.searchParams.get("authorizer") as Hex, u.searchParams.get("nonce") ?? "");
       const tx = chain.usedNonces.get(key);
       return json(res, 200, { used: Boolean(tx), transaction: tx ?? null });
     }

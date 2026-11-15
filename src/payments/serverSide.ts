@@ -20,7 +20,9 @@
  *     in the SettlementBook. Presenting it for anything else is refused, with
  *     one exception: a payment never delivered because the upstream refused its
  *     target outright (e.g. 404) may move to another target of the same resource.
- *   - Re-presenting a settled credential re-delivers; it never settles again.
+ *   - Re-presenting a settled credential never settles again. For a safe request
+ *     (GET) it re-delivers; for any other method one payment buys one delivery,
+ *     after which the credential is consumed (SettlementBook.tryStartDelivery).
  *     Concurrent presentations of one x402 credential are serialised, so there
  *     is at most one verify/settle in flight per credential.
  *   - A settlement whose outcome is unknown keeps its claim, so a retry with
@@ -167,6 +169,20 @@ export class SettlementBook {
     d.inFlight++;
     this.deliveries.set(key, d);
   }
+  /**
+   * Start a delivery for a payment. A repeatable (safe, e.g. GET) request may re-deliver any number
+   * of times. A request that is not (e.g. POST, whose body the buyer chooses each time) gets one
+   * delivery per payment: once one delivered, the payment is "consumed", and while one is in flight
+   * another is "busy", since it may yet deliver. A transient failure that delivered nothing leaves
+   * the payment usable, so the buyer can retry with the same credential.
+   */
+  tryStartDelivery(key: string, repeatable: boolean): "started" | "consumed" | "busy" {
+    const d = this.deliveries.get(key);
+    if (!repeatable && d?.delivered) return "consumed";
+    if (!repeatable && d && d.inFlight > 0) return "busy";
+    this.deliveryStarted(key);
+    return "started";
+  }
   deliveryEnded(key: string, outcome: DeliveryOutcome) {
     const d = this.deliveries.get(key);
     if (!d) return;
@@ -200,6 +216,8 @@ export const PAYMENT_HEADERS: readonly string[] = [HEADER_SIGNATURE, "x-payment"
 /** An Authorization value that is a payment credential rather than the API's own auth. */
 export const isPaymentAuthorization = (v: string) => /^(L402|Payment)\s/i.test(v);
 
+/** An EIP-3009 nonce: a bytes32 as 0x-prefixed hex, either letter case. */
+const NONCE = /^0x[0-9a-fA-F]{64}$/;
 const BOUND_ELSEWHERE: Acceptance = { kind: "rejected", status: 402, reason: "credential is bound to another resource" };
 /** Money may have moved. Never "pay again": the same credential confirms it later. */
 const outcomeUnknown = (error: string): Acceptance =>
@@ -259,26 +277,32 @@ export class PaymentAcceptor {
    * facilitator sees at most one verify/settle per credential at a time.
    */
   private async acceptX402(value: string, o: Offer, binding: Binding): Promise<Acceptance> {
-    let payload: PaymentPayload, key: string;
+    let payload: PaymentPayload, key: string, nonce: string;
     try {
       payload = b64json.decode<PaymentPayload>(value);
-      key = `x402:${getAddress(payload.payload.authorization.from)}:${payload.payload.authorization.nonce}`;
+      const raw: unknown = payload.payload.authorization.nonce;
+      // An EIP-3009 nonce is a bytes32: its hex spelling is not part of its identity on chain, and the
+      // EIP-712 signature verifies whatever the letter case. One canonical (lower-case) form keys the
+      // book, the rail reference and the rail query, so a re-cased nonce is the same payment.
+      if (typeof raw !== "string" || !NONCE.test(raw)) throw new Error("nonce is not a bytes32");
+      nonce = raw.toLowerCase();
+      key = `x402:${getAddress(payload.payload.authorization.from)}:${nonce}`;
     } catch { return { kind: "rejected", status: 400, reason: "malformed_payment" }; }
     for (let f = this.x402Flights.get(key); f; f = this.x402Flights.get(key)) await f.catch(() => undefined);
-    const run = this.settleX402(key, payload, o, binding);
+    const run = this.settleX402(key, nonce, payload, o, binding);
     this.x402Flights.set(key, run);
     try { return await run; } finally { if (this.x402Flights.get(key) === run) this.x402Flights.delete(key); }
   }
 
-  private async settleX402(key: string, payload: PaymentPayload, o: Offer, binding: Binding): Promise<Acceptance> {
-    const ref = payload.payload.authorization.nonce;
+  private async settleX402(key: string, nonce: string, payload: PaymentPayload, o: Offer, binding: Binding): Promise<Acceptance> {
+    const ref = nonce;
     const prior = this.book.lookup(key, binding);
     if (prior === ELSEWHERE) return BOUND_ELSEWHERE;
     if (prior?.settledAt) return this.paid(key, prior); // already paid: re-deliver, never re-charge
     if (prior) {
       // An earlier attempt for this binding claimed it but never learned the outcome: ask the rail
       // first, so a price change since then cannot turn a settled payment into "pay again".
-      const state = await this.authorizationState(payload);
+      const state = await this.authorizationState(payload, nonce);
       if (state === "used") return this.paid(key, prior);
       if (state === "unknown") return outcomeUnknown("payment_state_unknown");
       // Provably unpaid: start over against the current offer (re-claimed synchronously below).
@@ -305,7 +329,7 @@ export class PaymentAcceptor {
       // Every other check passed but the nonce is spent: a concurrent request or an earlier
       // settlement with a lost response moved the money. Confirm on the token, never re-charge.
       // If the token does not confirm it, the two rail answers disagree: hold, do not release.
-      if (v.body?.invalidReason === "nonce_already_used") return (await this.authorizationState(payload)) === "used" ? this.paid(key, entry) : outcomeUnknown("payment_state_unknown");
+      if (v.body?.invalidReason === "nonce_already_used") return (await this.authorizationState(payload, nonce)) === "used" ? this.paid(key, entry) : outcomeUnknown("payment_state_unknown");
       this.book.release(key);
       return { kind: "rejected", status: 402, reason: `Payment invalid: ${v.body?.invalidReason}` };
     }
@@ -315,7 +339,7 @@ export class PaymentAcceptor {
     if (s.body?.success) return this.paid(key, entry, s.body);
     // A failed /settle (an error status, or nonce_already_used) does not prove the transfer did not
     // happen: the facilitator may have broadcast it. Only the token's own state decides.
-    const state = await this.authorizationState(payload);
+    const state = await this.authorizationState(payload, nonce);
     if (state === "used") return this.paid(key, entry);
     if (state === "unknown") return outcomeUnknown("settlement_unavailable");
     this.book.release(key);
@@ -326,10 +350,10 @@ export class PaymentAcceptor {
    * The token contract's authorizationState(), via the facilitator. Anything but a well-formed
    * answer is "unknown": a timeout or a 5xx says nothing about whether the transfer happened.
    */
-  private async authorizationState(p: PaymentPayload): Promise<"used" | "unused" | "unknown"> {
-    const a = p.payload.authorization;
+  private async authorizationState(p: PaymentPayload, nonce: string): Promise<"used" | "unused" | "unknown"> {
     try {
-      const r = await fetch(`${this.cfg.rails.facilitatorUrl}/authorization-state?authorizer=${a.from}&nonce=${a.nonce}`);
+      const q = new URLSearchParams({ authorizer: getAddress(p.payload.authorization.from), nonce });
+      const r = await fetch(`${this.cfg.rails.facilitatorUrl}/authorization-state?${q}`);
       if (!r.ok) return "unknown";
       const used = ((await r.json()) as { used?: unknown }).used;
       return used === true ? "used" : used === false ? "unused" : "unknown";

@@ -94,7 +94,7 @@ before(async () => {
 after(async () => { await Promise.all(cleanup.map((s) => s.close())); });
 
 /** A plain API that counts hits and records what it was sent. */
-interface Upstream { url: string; hits: number; seen: IncomingHttpHeaders[]; paths: string[]; bodies: string[]; mode: "ok" | "down" | "error" | "busy"; close(): Promise<void> }
+interface Upstream { url: string; hits: number; seen: IncomingHttpHeaders[]; paths: string[]; bodies: string[]; mode: "ok" | "down" | "error" | "busy" | "unavailable"; close(): Promise<void> }
 /** The upstream's ETag: a request carrying it in If-None-Match gets 304. */
 const ETAG = '"v1"';
 async function startUpstream(): Promise<Upstream> {
@@ -108,6 +108,7 @@ async function startUpstream(): Promise<Upstream> {
     u.paths.push(req.url ?? "");
     u.bodies.push(Buffer.concat(chunks).toString());
     if (u.mode === "error") { res.writeHead(500); return res.end("boom"); }
+    if (u.mode === "unavailable") { res.writeHead(503); return res.end("maintenance"); }
     if (u.mode === "busy") { res.writeHead(429, { "retry-after": "1" }); return res.end("slow down"); }
     if (req.url?.includes("missing")) { res.writeHead(404, { "content-type": "application/json" }); return res.end(JSON.stringify({ error: "no such station" })); }
     if (req.headers["if-none-match"] === ETAG) { res.writeHead(304, { etag: ETAG }); return res.end(); }
@@ -165,6 +166,20 @@ const present = (url: string, c: PaymentCredential, extra: Record<string, string
 function rewriteResource(c: PaymentCredential, url: string): PaymentCredential {
   const p = b64json.decode(c.header.value);
   return { ...c, header: { ...c.header, value: b64json.encode({ ...p, resource: { ...p.resource, url } }) } };
+}
+
+/** The x402 credential with its EIP-3009 nonce re-cased: the same bytes32 on chain, the signature still verifies. */
+function recaseNonce(c: PaymentCredential): PaymentCredential {
+  const p = b64json.decode(c.header.value);
+  const nonce: string = p.payload.authorization.nonce;
+  const recased = "0x" + nonce.slice(2).toUpperCase();
+  assert.notEqual(recased, nonce, "the test nonce has letters to re-case");
+  return { ...c, header: { ...c.header, value: b64json.encode({ ...p, payload: { ...p.payload, authorization: { ...p.payload.authorization, nonce: recased } } }) } };
+}
+/** The x402 credential with its nonce replaced by `nonce`. */
+function withNonce(c: PaymentCredential, nonce: string): PaymentCredential {
+  const p = b64json.decode(c.header.value);
+  return { ...c, header: { ...c.header, value: b64json.encode({ ...p, payload: { ...p.payload, authorization: { ...p.payload.authorization, nonce } } }) } };
 }
 
 /**
@@ -274,6 +289,36 @@ describe("402 proxy", () => {
     assert.equal(upstream.hits, 1);
     assert.equal(charges(proxy).x402, 1);
     assert.equal((await fetch(proxy.resourceUrl("a"), { headers: { "payment-signature": "%%%" } })).status, 400);
+  });
+
+  test("a re-cased x402 nonce is the same payment: refused on another route and another prefix target, never charged twice", async () => {
+    const { upstream, proxy } = await setup();
+    const a = proxy.resourceUrl("a"), b = proxy.resourceUrl("b");
+    const cred = await buy(proxy, a, "x402");
+    assert.equal((await present(a, cred)).status, 200);
+    const onB = await present(b, rewriteResource(recaseNonce(cred), b));
+    assert.equal(onB.status, 402, "a re-cased nonce does not escape the binding");
+    assert.equal(((await onB.json()) as { error: string }).error, "credential is bound to another resource");
+    // The re-cased form is the same payment on its own binding: it re-delivers without a charge.
+    assert.equal((await present(a, recaseNonce(cred))).status, 200);
+    assert.deepEqual(upstream.paths, ["/v1/a", "/v1/a"]);
+    assert.equal(charges(proxy).x402, 1, "one charge");
+    assert.equal(proxy.settlements, 1);
+
+    const berlin = `${proxy.url}/v1/stations/berlin`, hamburg = `${proxy.url}/v1/stations/hamburg`;
+    const st = await buy(proxy, berlin, "x402");
+    assert.equal((await present(berlin, st)).status, 200);
+    const r = await present(hamburg, recaseNonce(st));
+    assert.equal(r.status, 402, "one payment, one station, whatever the nonce's case");
+    assert.equal(((await r.json()) as { error: string }).error, "credential is bound to another resource");
+    assert.ok(!upstream.paths.includes("/v1/stations/hamburg"));
+    assert.equal(charges(proxy).x402, 2, "one charge per bought credential");
+
+    // A nonce that is not a bytes32 hex string is malformed, not a new payment.
+    for (const nonce of ["0x1234", "0X" + "ab".repeat(32), "0x" + "zz".repeat(32), "ab".repeat(32) + "00", 42 as unknown as string]) {
+      assert.equal((await present(a, withNonce(cred, nonce))).status, 400, String(nonce));
+    }
+    assert.equal(upstream.hits, 3);
   });
 
   test("a prefix route charges per request target", async () => {
@@ -516,6 +561,46 @@ describe("402 proxy", () => {
     assert.ok(r.headers[RECEIPT_HEADER], "delivered with a receipt");
     const passthrough = await rawRequest(proxy.url, "POST", "/free", { expect: "100-continue", "content-type": "text/plain" }, big);
     assert.equal(passthrough.status, 200);
+  });
+
+  test("a settled credential buys one delivery on a POST route: re-presenting it is refused, a transient failure keeps the retry", async () => {
+    const submit: PaidRoute = { id: "submit", method: "POST", path: "/v1/submit", category: "Data", prices: SAME_PRICES, description: "Submit" };
+    const post = (url: string, c: PaymentCredential, body: string) => fetch(url, { method: "POST", headers: { [c.header.name]: c.header.value, "content-type": "text/plain" }, body });
+    for (const scheme of SCHEMES) {
+      const { upstream, proxy } = await setup({ routes: [...ROUTES, submit] });
+      const url = proxy.resourceUrl("submit");
+      const cred = await buy(proxy, url, scheme, "POST");
+      const r1 = await post(url, cred, "first");
+      assert.equal(r1.status, 200, scheme);
+      assert.ok(r1.headers.get(RECEIPT_HEADER));
+      const r2 = await post(url, cred, "second");
+      assert.equal(r2.status, 402, `${scheme}: one payment, one POST`);
+      assert.equal(((await r2.json()) as { error: string }).error, "credential_consumed", scheme);
+      assert.deepEqual(upstream.bodies, ["first"], `${scheme}: the second POST never reached the upstream`);
+      assert.equal(proxy.deliveries, 1);
+
+      // Nothing was delivered on a 503, so the same credential may retry until it delivers once.
+      const cred2 = await buy(proxy, url, scheme, "POST");
+      upstream.mode = "unavailable";
+      const f = await post(url, cred2, "retry-me");
+      assert.deepEqual([f.status, ((await f.json()) as { paid: boolean }).paid], [502, true], scheme);
+      upstream.mode = "ok";
+      assert.equal((await post(url, cred2, "retry-me")).status, 200, `${scheme}: retry after 503 delivers`);
+      assert.equal((await post(url, cred2, "again")).status, 402, `${scheme}: then it is consumed`);
+      assert.deepEqual(upstream.bodies, ["first", "retry-me", "retry-me"], scheme);
+      assert.deepEqual(charges(proxy), { x402: 0, l402: 0, "card-psp": 0, [scheme]: 2 * ({ x402: 1, l402: 10, "card-psp": 3 } as Record<string, number>)[scheme] }, `${scheme}: one charge per credential`);
+      assert.deepEqual([proxy.settlements, proxy.deliveries], [2, 2]);
+    }
+  });
+
+  test("concurrent POSTs with one credential deliver at most once", async () => {
+    const submit: PaidRoute = { id: "submit", method: "POST", path: "/v1/submit", category: "Data", prices: SAME_PRICES, description: "Submit" };
+    const { upstream, proxy } = await setup({ routes: [...ROUTES, submit] });
+    const url = proxy.resourceUrl("submit");
+    const cred = await buy(proxy, url, "card-psp", "POST");
+    const rs = await Promise.all([1, 2, 3].map((i) => fetch(url, { method: "POST", headers: { [cred.header.name]: cred.header.value }, body: `b${i}` })));
+    assert.equal(rs.filter((r) => r.status === 200).length, 1, rs.map((r) => r.status).join(","));
+    assert.equal(upstream.hits, 1);
   });
 
   test("a paid target the upstream refuses (404) delivers nothing, says so, and lets the payment move once", async () => {

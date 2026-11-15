@@ -15,7 +15,9 @@
  * The upstream is only reached after payment is settled. The receipt's
  * contentDigest is computed over the exact bytes returned to the client.
  * What the upstream answers after settlement decides what the buyer gets:
- *   2xx                         the content, with a receipt
+ *   2xx                         the content, with a receipt. A GET may be re-delivered by
+ *                               re-presenting the credential; any other method is delivered
+ *                               once, then the credential is consumed (402 credential_consumed)
  *   no answer, 5xx, 408/425/429 502 paid:true; re-presenting the same credential
  *                               delivers later without a second charge
  *   any other 3xx/4xx           the upstream's own answer, relayed unchanged with no
@@ -44,6 +46,12 @@ import { matchRequest, RESERVED, validateRoutes, type PaidRoute } from "./routes
 export const OUTCOME_HEADER = "sc-payment-outcome";
 /** 4xx answers that say "try again later", not "this request is wrong". */
 const RETRYABLE_4XX = new Set([408, 425, 429]);
+/**
+ * Methods a settled credential may re-deliver any number of times. Anything else (a POST with a new
+ * body each time) gets one delivery per payment, or one payment would buy unlimited requests.
+ * HEAD never reaches a paid route (routes.ts refuses it).
+ */
+const SAFE_METHODS = new Set(["GET", "HEAD"]);
 
 function outcomeOf(up: UpstreamResponse | undefined): DeliveryOutcome {
   if (!up || up.status >= 500 || RETRYABLE_4XX.has(up.status)) return "transient";
@@ -164,7 +172,7 @@ export async function startPaymentProxy(cfg: PaymentProxyConfig, port = 0, host 
     // Matched and forwarded as the same parsed path, so the upstream sees what was classified.
     const pathAndQuery = u.pathname + u.search;
     const m = matchRequest([...states.values()].map((st) => st.route), method, u.pathname);
-    if (m.kind === "paid") return paid(req, res, body, stateOf(m.route.id), pathAndQuery, `${method} ${pathAndQuery}`);
+    if (m.kind === "paid") return paid(req, res, body, stateOf(m.route.id), method, pathAndQuery, `${method} ${pathAndQuery}`);
     if (m.kind === "refused") return send(res, m.status, { error: m.error }, m.headers);
     if (cfg.unconfigured === "passthrough") {
       let up: UpstreamResponse;
@@ -176,14 +184,20 @@ export async function startPaymentProxy(cfg: PaymentProxyConfig, port = 0, host 
     send(res, 404, { error: "not_found" });
   }
 
-  async function paid(req: IncomingMessage, res: ServerResponse, body: Buffer, st: RouteState, pathAndQuery: string, target: string) {
+  async function paid(req: IncomingMessage, res: ServerResponse, body: Buffer, st: RouteState, method: string, pathAndQuery: string, target: string) {
     const o = current(st).payload;
     const a: Acceptance = await acceptor.accept(req.headers, o, { resource: o.resource, target });
     switch (a.kind) {
       case "none": return challenge(res, st, o);
       case "rejected": return a.status === 402 ? challenge(res, st, o, a.reason) : send(res, 400, { error: a.reason });
       case "failed": return send(res, a.status, a.body);
-      case "paid": return deliver(req, res, body, pathAndQuery, a.settlement, a.responseHeaders);
+      case "paid": {
+        // Checked and started with no await in between, so concurrent requests cannot both pass.
+        const start = acceptor.book.tryStartDelivery(a.settlement.key, SAFE_METHODS.has(method));
+        if (start === "consumed") return challenge(res, st, o, "credential_consumed");
+        if (start === "busy") return send(res, 409, { error: "delivery_in_progress", paid: true, retry: "re-present the same payment credential once the request in flight has answered" }, a.responseHeaders);
+        return deliver(req, res, body, pathAndQuery, a.settlement, a.responseHeaders);
+      }
     }
   }
 
@@ -193,8 +207,8 @@ export async function startPaymentProxy(cfg: PaymentProxyConfig, port = 0, host 
   }
 
   async function deliver(req: IncomingMessage, res: ServerResponse, body: Buffer, pathAndQuery: string, s: Settlement, paymentHeaders: Record<string, string>) {
-    // Started before the first await: while it runs, the payment cannot move to another target.
-    acceptor.book.deliveryStarted(s.key);
+    // Started (by the caller, via tryStartDelivery) before the first await: while it runs, the
+    // payment cannot move to another target, nor deliver a second non-repeatable request.
     let up: UpstreamResponse | undefined;
     try { up = await forward(req, body, { upstreamBase: cfg.upstream, pathAndQuery, publicUrl, paidRoute: true, paymentReference: `${s.scheme}:${s.railReference}`, timeoutMs }); }
     catch { up = undefined; }
