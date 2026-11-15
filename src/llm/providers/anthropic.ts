@@ -17,6 +17,14 @@ import type { AdapterOptions, ChatAdapter, Completion, CompletionRequest } from 
 
 export const ANTHROPIC_DEFAULT_MODEL = "claude-opus-5-5";
 
+/**
+ * Stop reasons (besides max_tokens) after which the message is not a complete
+ * answer: the context window filled up mid-answer, the server paused a long
+ * turn, or it stopped to compact context. Partial JSON must not be parsed or
+ * "repaired"; it is a truncation.
+ */
+const CUT_OFF = new Set(["model_context_window_exceeded", "pause_turn", "compaction"]);
+
 /** The subset of the SDK client this adapter calls, so Bedrock/Vertex clients or test doubles fit. */
 export type AnthropicLike = Pick<Anthropic, "beta">;
 
@@ -53,6 +61,7 @@ export class AnthropicAdapter implements ChatAdapter {
       return { ...base, text: "", finish: "refusal", detail: [d?.category, d?.explanation].filter(Boolean).join(": ") || undefined };
     }
     if (response.stop_reason === "max_tokens") return { ...base, text: "", finish: "truncated", detail: `max_tokens ${this.maxOutputTokens}` };
+    if (CUT_OFF.has(response.stop_reason)) return { ...base, text: "", finish: "truncated", detail: `stop_reason ${response.stop_reason}` };
     const text = (response.content ?? []).filter((b: any) => b.type === "text").map((b: any) => b.text).join("");
     return { ...base, text, finish: "stop" };
   }

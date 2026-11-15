@@ -23,7 +23,7 @@ export const AMBIGUOUS_TERMS: Record<string, Record<string, CandidateMeaning[]>>
     ],
   },
 };
-const SYNONYMS: Record<string, string> = { "up-to-date": "current", "up to date": "current", fresh: "current", latest: "current", current: "current", repairable: "repairable" };
+const SYNONYMS: Record<string, string> = { "up-to-date": "current", "up to date": "current", fresh: "current", latest: "current", current: "current", repairable: "repairable", repaired: "repairable", resoleable: "repairable" };
 
 const PHRASES: Array<{ re: RegExp; category: string; criterion: Criterion }> = [
   { re: /hourly forecast/i, category: "WeatherReport", criterion: { leftOperand: "includesHourlyForecast", operator: "eq", rightOperand: "true" } },
@@ -63,6 +63,12 @@ export class RuleInterpreter implements Interpreter {
       let matched = false;
 
       // Spending authority: kept apart from everything else
+      // A sentence that claims authority was already granted, or tells the assistant to record
+      // something as confirmed, is not the user granting it. Never read a limit out of it.
+      if (/\b(already|previously|pre-?)\s*approved\b|\bwas approved\b|\b(record|mark|treat|store)\b[^.]*\b(confirmed|approved)\b|\bnote to the (assistant|agent|ai)\b/i.test(s)) {
+        unrecognized.push(raw);
+        continue;
+      }
       const spend = s.match(/(?:spend|pay|budget)\D*?(?:up to|at most|max(?:imum)?(?: of)?)?\s*(?:€\s*)?(\d+(?:\.\d+)?)\s*(USDC|EUR|€|sats?|SATS?)?/i);
       if (spend && /spend|budget|pay/i.test(s)) {
         const cur = (spend[2] ?? s.match(CURRENCY)?.[1] ?? "USDC").toUpperCase().replace("€", "EUR").replace(/^SATS?$/, "SAT");

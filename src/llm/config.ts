@@ -19,8 +19,8 @@
  * Legacy: INTERPRETER=claude selects anthropic and CLAUDE_MODEL its model.
  */
 import { ANTHROPIC_DEFAULT_MODEL, AnthropicAdapter } from "./providers/anthropic.js";
-import { GEMINI_DEFAULT_MODEL, GeminiAdapter } from "./providers/gemini.js";
-import { OLLAMA_DEFAULT_MODEL, OllamaAdapter } from "./providers/ollama.js";
+import { GEMINI_DEFAULT_MODEL, GeminiAdapter, type GeminiVertexOptions } from "./providers/gemini.js";
+import { OLLAMA_DEFAULT_MODEL, OllamaAdapter, ollamaBaseUrl } from "./providers/ollama.js";
 import { OPENAI_DEFAULT_MODEL, OpenAIAdapter, STRUCTURED_MODES, type StructuredMode } from "./providers/openai.js";
 import { LlmError, PROVIDERS, type AdapterOptions, type ChatAdapter, type ProviderName } from "./types.js";
 
@@ -37,8 +37,12 @@ export interface LlmConfig {
   structuredOutput?: StructuredMode;
   /** openai only: route through Azure OpenAI. */
   azure?: { endpoint: string; apiVersion?: string };
-  /** gemini only: route through Vertex AI with Application Default Credentials. */
-  vertex?: { project?: string; location?: string };
+  /**
+   * gemini only: route through Vertex AI. Without apiKey, credentials come from
+   * Application Default Credentials (or googleAuthOptions); with apiKey, Vertex
+   * AI express mode.
+   */
+  vertex?: GeminiVertexOptions;
 }
 
 export const DEFAULTS = { timeoutMs: 120_000, maxRetries: 2, maxOutputTokens: 16_000, azureApiVersion: "2024-10-21" } as const;
@@ -89,10 +93,10 @@ function int(env: Env, name: string): number | undefined {
   return Number(v);
 }
 
-/** OLLAMA_HOST is often written without a scheme ("127.0.0.1:11434"), as the Ollama CLI accepts it. */
+/** OLLAMA_HOST is often written without a scheme or port ("gpu-box", "127.0.0.1:11434"); see ollamaBaseUrl. */
 function ollamaHost(v: string | undefined): string | undefined {
   const h = nonEmpty(v);
-  return h && !/^https?:\/\//i.test(h) ? `http://${h}` : h;
+  return h && ollamaBaseUrl(h);
 }
 
 /**
@@ -124,9 +128,17 @@ export function providerConfigFromEnv(provider: ProviderName, env: Env = process
     }
     case "gemini":
       cfg.model = g("LLM_MODEL") ?? nonEmpty(env.GEMINI_MODEL);
-      cfg.apiKey = g("LLM_API_KEY") ?? nonEmpty(env.GEMINI_API_KEY) ?? nonEmpty(env.GOOGLE_API_KEY);
       cfg.baseURL = g("LLM_BASE_URL");
-      if (truthy(env.GOOGLE_GENAI_USE_VERTEXAI)) cfg.vertex = { project: nonEmpty(env.GOOGLE_CLOUD_PROJECT), location: nonEmpty(env.GOOGLE_CLOUD_LOCATION) };
+      if (truthy(env.GOOGLE_GENAI_USE_VERTEXAI)) {
+        // Vertex AI authenticates with ADC. GEMINI_API_KEY / GOOGLE_API_KEY are Gemini
+        // Developer API keys: passing one would send it as x-goog-api-key to the
+        // project path instead of using ADC. Only LLM_API_KEY selects Vertex express,
+        // which takes a key and no project/location.
+        cfg.apiKey = g("LLM_API_KEY");
+        cfg.vertex = cfg.apiKey ? {} : { project: nonEmpty(env.GOOGLE_CLOUD_PROJECT), location: nonEmpty(env.GOOGLE_CLOUD_LOCATION) };
+      } else {
+        cfg.apiKey = g("LLM_API_KEY") ?? nonEmpty(env.GEMINI_API_KEY) ?? nonEmpty(env.GOOGLE_API_KEY);
+      }
       break;
     case "ollama":
       cfg.model = g("LLM_MODEL") ?? nonEmpty(env.OLLAMA_MODEL);

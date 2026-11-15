@@ -32,6 +32,13 @@ function hasType(v: unknown, t: string): boolean {
 
 const show = (v: unknown) => JSON.stringify(v);
 
+/**
+ * Own properties only. `k in obj` and `props[k]` also see Object.prototype
+ * ("constructor", "toString", "__proto__", ...), which would let such a key
+ * satisfy "required" or slip past additionalProperties:false.
+ */
+const own = <T>(o: Record<string, T> | undefined, k: string): T | undefined => (o && Object.hasOwn(o, k) ? o[k] : undefined);
+
 /** Returns human-readable errors with JSONPath-like locations; empty means valid. */
 export function validateJson(value: unknown, schema: JsonSchema, path = "$"): string[] {
   for (const k of Object.keys(schema)) if (!KEYWORDS.has(k)) throw new Error(`jsonSchema: unsupported keyword "${k}" at ${path}`);
@@ -70,9 +77,9 @@ export function validateJson(value: unknown, schema: JsonSchema, path = "$"): st
   }
   if (typeOf(value) === "object") {
     const obj = value as Record<string, unknown>;
-    for (const r of s.required ?? []) if (!(r in obj)) errors.push(`${path}: missing required property "${r}"`);
+    for (const r of s.required ?? []) if (!Object.hasOwn(obj, r)) errors.push(`${path}: missing required property "${r}"`);
     for (const [k, v] of Object.entries(obj)) {
-      const sub = s.properties?.[k];
+      const sub = own(s.properties, k);
       if (sub) errors.push(...validateJson(v, sub, `${path}.${k}`));
       else if (s.additionalProperties === false) errors.push(`${path}: unexpected property "${k}"`);
       else if (typeof s.additionalProperties === "object") errors.push(...validateJson(v, s.additionalProperties, `${path}.${k}`));
@@ -121,9 +128,10 @@ export function fromStrict(value: unknown, schema: JsonSchema): unknown {
   const required = new Set((schema.required as string[] | undefined) ?? []);
   const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-    const sub = props[k];
+    const sub = own(props, k);
     if (v === null && sub && !required.has(k) && !allowsNull(sub)) continue;
-    out[k] = sub ? fromStrict(v, sub) : v;
+    // defineProperty: plain assignment of "__proto__" would set the prototype instead of a key.
+    Object.defineProperty(out, k, { value: sub ? fromStrict(v, sub) : v, enumerable: true, writable: true, configurable: true });
   }
   return out;
 }

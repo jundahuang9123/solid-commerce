@@ -8,13 +8,21 @@
  * from Application Default Credentials). Gemini enforces the schema on a
  * best-effort basis, which is one reason every answer is validated locally.
  */
-import { GoogleGenAI, type GenerateContentResponse } from "@google/genai";
+import { GoogleGenAI, type GenerateContentResponse, type GoogleGenAIOptions } from "@google/genai";
 import { toLlmError } from "../structured.js";
 import type { AdapterOptions, ChatAdapter, Completion, CompletionRequest } from "../types.js";
 
 export const GEMINI_DEFAULT_MODEL = "gemini-2.5-flash";
 
 export type GeminiLike = Pick<GoogleGenAI, "models">;
+
+/**
+ * Vertex AI routing. With project/location and no API key the SDK uses
+ * Application Default Credentials (googleAuthOptions customises that, e.g.
+ * explicit credentials). An API key without project/location is Vertex AI
+ * express mode.
+ */
+export interface GeminiVertexOptions { project?: string; location?: string; googleAuthOptions?: GoogleGenAIOptions["googleAuthOptions"] }
 
 /** Finish reasons meaning a policy stopped the answer. Any other non-STOP reason also ends it abnormally. */
 const BLOCKED = new Set(["SAFETY", "RECITATION", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII", "IMAGE_SAFETY", "LANGUAGE"]);
@@ -24,9 +32,9 @@ export class GeminiAdapter implements ChatAdapter {
 
   constructor(readonly model: string, private readonly client: GeminiLike, private readonly maxOutputTokens = 16000) {}
 
-  static create(o: AdapterOptions & { vertex?: { project?: string; location?: string } }): GeminiAdapter {
+  static create(o: AdapterOptions & { vertex?: GeminiVertexOptions }): GeminiAdapter {
     const client = new GoogleGenAI({
-      ...(o.vertex ? { vertexai: true, project: o.vertex.project, location: o.vertex.location } : { vertexai: false }),
+      ...(o.vertex ? { vertexai: true, project: o.vertex.project, location: o.vertex.location, googleAuthOptions: o.vertex.googleAuthOptions } : { vertexai: false }),
       apiKey: o.apiKey,
       httpOptions: {
         baseUrl: o.baseURL,
