@@ -22,6 +22,7 @@ import { startSigner, type SignerHandle } from "../signer/signerService.js";
 import { startGateway, type GatewayHandle } from "../gateway/gatewayService.js";
 import { ShoppingAssistant } from "../agent/assistant.js";
 import { randomHex } from "../util/crypto.js";
+import { bearerHeaders, newAgentSecret, secretHash } from "../trust/agentAuth.js";
 import { readWallet } from "../pod/wallet.js";
 import { addressToTurtle, type PostalAddress } from "../pod/address.js";
 import { startAcpMerchant, type AcpMerchantHandle, type ShippingRate } from "../payments/sim/acpMerchant.js";
@@ -39,7 +40,19 @@ export interface Environment {
   sellers: { spree: SellerHandle; havel: SellerHandle; shady: SellerHandle };
   signer: SignerHandle;
   gateway: GatewayHandle;
+  /** An assistant acting as agentId, holding that agent's secret for the gateway and the signer. */
   assistant(agentId?: string, opts?: { interpreter?: Interpreter; log?: (l: string) => void }): ShoppingAssistant;
+  /**
+   * Headers that authenticate a direct call to the gateway or signer as this agent (enrolled on
+   * first use). For code that plays an agent without a ShoppingAssistant: tests and the web demo's
+   * guardrails. The secret exists only in this process; it is never written to the Pod.
+   */
+  agentHeaders(agentId?: string): Record<string, string>;
+  /**
+   * The operator's credential (the demo dashboard): GET /transactions/:id of any agent and POST
+   * /reconcile at the gateway. It cannot authorize or pay.
+   */
+  adminHeaders: Record<string, string>;
   close(): Promise<void>;
 }
 
@@ -91,13 +104,27 @@ export async function startEnvironment(opts: { podUrl?: string; decider?: Decide
   // The signer is configured with the gateway's public key, so the gateway starts first.
   const lightningAccount = "acct-" + randomHex(4);
   const cardToken = "tok_" + randomHex(6);
+  // Per-agent secrets for the gateway and signer, issued here at setup and held only in memory.
+  const adminSecret = newAgentSecret();
   const gateway = await startGateway({
     pod, layout, enrolledApprovalKeys: [device.publicJwk], registry, rails,
-    payers: {}, authorizationTtlSeconds: opts.authorizationTtlSeconds, ledgerPath: opts.ledgerPath,
+    payers: {}, authorizationTtlSeconds: opts.authorizationTtlSeconds, ledgerPath: opts.ledgerPath, adminSecretHash: secretHash(adminSecret),
   });
   const signer = await startSigner({ gatewayPublicJwk: gateway.key.publicJwk, lightning: { url: lightning.url, accountToken: lightningAccount }, card: { token: cardToken, allowedProviders: [psp.url] } });
   // Public payer address, used by the gateway for reconciliation
   gateway.setPayer(signer.evmAddress);
+  const agentSecrets = new Map<string, string>();
+  const agentSecret = (agentId: string) => {
+    let s = agentSecrets.get(agentId);
+    if (!s) {
+      s = newAgentSecret();
+      gateway.enrollAgent(agentId, secretHash(s));
+      signer.enrollAgent(agentId, secretHash(s));
+      agentSecrets.set(agentId, s);
+    }
+    return s;
+  };
+  for (const a of [AGENT_1, AGENT_2]) agentSecret(a);
 
   // Test funds
   facilitator.chain.mint(signer.evmAddress, 5_000_000n);          // 5 USDC
@@ -112,15 +139,23 @@ export async function startEnvironment(opts: { podUrl?: string; decider?: Decide
   await pod.putTurtle(layout.wallet, walletToTurtle(layout.wallet, { schemes: ["x402", "l402", "card-psp"], x402Address: signer.evmAddress, signerEndpoint: signer.url }));
 
   const catalog = [spree.offerUrl, havel.offerUrl, shady.offerUrl];
-  return {
+  const env: Environment = {
     podRoot, layout, pod, device, registry, rails: { facilitator, lightning, psp }, sellers: { spree, havel, shady }, signer, gateway,
-    assistant: (agentId = AGENT_1, o = {}) => new ShoppingAssistant({ agentId, pod, layout, interpreter: o.interpreter ?? defaultInterpreter(), enrolledApprovalKeys: [device.publicJwk], gatewayUrl: gateway.url, catalog, log: o.log }),
+    assistant: (agentId = AGENT_1, o = {}) => new ShoppingAssistant({ agentId, agentSecret: agentSecret(agentId), pod, layout, interpreter: o.interpreter ?? defaultInterpreter(), enrolledApprovalKeys: [device.publicJwk], gatewayUrl: gateway.url, catalog, log: o.log }),
+    agentHeaders: (agentId = AGENT_1) => bearerHeaders(agentSecret(agentId)),
+    adminHeaders: bearerHeaders(adminSecret),
     async close() {
       await Promise.all([gateway, signer, spree, havel, shady, facilitator, lightning, psp].map((s) => s.close()));
       css?.proc.kill();
     },
   };
+  secrets.set(env, agentSecret);
+  return env;
 }
+
+/** Each environment's agent-secret issuer, kept out of the Environment object so callers only get headers. */
+const secrets = new WeakMap<Environment, (agentId: string) => string>();
+const secretOf = (env: Environment, agentId: string) => secrets.get(env)!(agentId);
 
 // ----------------------------------------------------------------- checkout merchants (physical goods)
 //
@@ -161,7 +196,7 @@ export async function startCheckoutEnvironment(opts: Parameters<typeof startEnvi
   const merchantApis = [billig, atelier, sohle, outlet].map((m) => m.url);
   return {
     ...env, merchants: { billig, atelier, sohle, outlet }, address: BUYER_ADDRESS,
-    checkoutAssistant: (agentId = AGENT_1, o = {}) => new ShoppingAssistant({ agentId, pod: env.pod, layout: env.layout, interpreter: o.interpreter ?? defaultInterpreter(), enrolledApprovalKeys: [env.device.publicJwk], gatewayUrl: env.gateway.url, catalog: [], checkoutMerchants: merchantApis, log: o.log }),
+    checkoutAssistant: (agentId = AGENT_1, o = {}) => new ShoppingAssistant({ agentId, agentSecret: secretOf(env, agentId), pod: env.pod, layout: env.layout, interpreter: o.interpreter ?? defaultInterpreter(), enrolledApprovalKeys: [env.device.publicJwk], gatewayUrl: env.gateway.url, catalog: [], checkoutMerchants: merchantApis, log: o.log }),
     async close() {
       await Promise.all([billig, atelier, sohle, outlet].map((m) => m.close()));
       await env.close();

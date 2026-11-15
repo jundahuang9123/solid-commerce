@@ -161,7 +161,7 @@ test("x402: real EIP-712 signature verifies; nonce prevents double settlement", 
   const pk = generatePrivateKey();
   const payTo = "0x00000000000000000000000000000000000000A1";
   const req = { scheme: "exact" as const, network: DEFAULT_NETWORK, asset: DEFAULT_USDC, amount: "20000", payTo, maxTimeoutSeconds: 60, extra: { name: "USDC", version: "2" } };
-  const auth = { authId: "auth-1", amount: "20000", payTo, expiresAt: new Date(Date.now() + 60_000).toISOString() } as any;
+  const auth = { authId: "auth-1", amount: "20000", currency: "USDC", payTo, railReference: nonceFor("auth-1"), x402: { network: DEFAULT_NETWORK, asset: DEFAULT_USDC, domainName: "USDC", domainVersion: "2" }, expiresAt: new Date(Date.now() + 60_000).toISOString() } as any;
   const cred = await createX402Payment(pk, auth, { requirements: req, resource: { url: "http://s/r" } });
   chain.mint(cred.payer!, 1_000_000n);
   const payload = b64json.decode<PaymentPayload>(cred.header.value);

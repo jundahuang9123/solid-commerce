@@ -29,8 +29,13 @@ export function parseCardPsp(wwwAuthenticate: string | null, resourceUrl: string
 
 export async function createCardPayment(cardToken: string, allowedProviders: string[], auth: PaymentAuthorization, challenge: { id: string; provider: string }): Promise<PaymentCredential> {
   if (!allowedProviders.includes(challenge.provider)) throw new Error(`PSP ${challenge.provider} is not a provider this vault trusts`);
-  const intent = await (await fetch(`${challenge.provider}/payment_intents/${challenge.id}`)).json() as { amount: number; currency: string; merchant: string };
+  // The gateway reconciles by the intent id it bound: confirming any other intent would let a
+  // "not paid" answer about the bound one release a payment that happened.
+  if (typeof challenge.id !== "string" || !/^pi_\w+$/.test(challenge.id) || challenge.id !== auth.railReference) throw new Error("payment intent is not the one the gateway authorized");
+  const intent = await (await fetch(`${challenge.provider}/payment_intents/${challenge.id}`)).json() as { amount: number; currency: string; merchant: string; resource?: string };
   if (String(intent.amount) !== auth.amount || intent.currency !== auth.currency || intent.merchant !== auth.payTo) throw new Error("Payment intent does not match authorization");
+  // Same merchant and price is not enough: an intent for another of its resources would be paid too.
+  if (intent.resource !== auth.resource) throw new Error("Payment intent is for a different resource than the authorization");
   const r = await fetch(`${challenge.provider}/payment_intents/${challenge.id}/confirm`, {
     method: "POST", headers: { "content-type": "application/json", "idempotency-key": auth.authId }, body: JSON.stringify({ paymentMethod: cardToken }),
   });

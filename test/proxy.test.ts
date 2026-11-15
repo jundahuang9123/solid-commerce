@@ -18,13 +18,15 @@ import { startFacilitator, type FacilitatorSim } from "../src/payments/sim/facil
 import { startLightning, type LightningSim } from "../src/payments/sim/lightning.js";
 import { startPsp, type PspSim } from "../src/payments/sim/psp.js";
 import { startSigner, type SignerHandle } from "../src/signer/signerService.js";
-import { OUTCOME_HEADER, startPaymentProxy, type PaymentProxyConfig, type PaymentProxyHandle } from "../src/proxy/paymentProxy.js";
+import { OUTCOME_HEADER, REPLAY_HEADER, startPaymentProxy, type PaymentProxyConfig, type PaymentProxyHandle } from "../src/proxy/paymentProxy.js";
 import type { PaidRoute } from "../src/proxy/routes.js";
 import { loadKeyMaterial } from "../src/proxy/keys.js";
 import { PaymentAcceptor, priceOptionsFor } from "../src/payments/serverSide.js";
 import { parseL402 } from "../src/payments/schemes/l402.js";
 import { parse402 } from "../src/payments/http402.js";
-import { RECEIPT_HEADER, type PaymentAuthorization, type PaymentCredential, type Receipt } from "../src/payments/types.js";
+import { RECEIPT_HEADER, type PaymentAuthorization, type PaymentCredential, type PaymentOption, type Receipt } from "../src/payments/types.js";
+import { nonceFor, type PaymentRequirements } from "../src/payments/schemes/x402.js";
+import { bearerHeaders, newAgentSecret, secretHash } from "../src/trust/agentAuth.js";
 import type { Offer, SchemeId, SpendingMandate } from "../src/model.js";
 import { digestOf, Ed25519Key, newId, randomHex, sha256Hex, signEnvelope, verifyEnvelope, type Signed } from "../src/util/crypto.js";
 import { b64json, postJson } from "../src/util/http.js";
@@ -75,6 +77,10 @@ async function startTap(target: string): Promise<Tap> {
 }
 
 const gatewayKey = Ed25519Key.generate();
+/** The one agent enrolled with the test signer, and its secret. */
+const TEST_AGENT = "urn:test:agent";
+const agentSecret = newAgentSecret();
+const asAgent = bearerHeaders(agentSecret);
 const lnAccount = "acct-" + randomHex(4);
 const cardToken = "tok_" + randomHex(6);
 let facilitator: FacilitatorSim, lightning: LightningSim, psp: PspSim, signer: SignerHandle;
@@ -85,7 +91,7 @@ before(async () => {
   [facilitator, lightning, psp] = await Promise.all([startFacilitator(), startLightning(), startPsp()]);
   [facTap, lnTap, pspTap] = await Promise.all([startTap(facilitator.url), startTap(lightning.url), startTap(psp.url)]);
   // The 402's card challenge names the proxy's PSP URL, which is the tap.
-  signer = await startSigner({ gatewayPublicJwk: gatewayKey.publicJwk, lightning: { url: lightning.url, accountToken: lnAccount }, card: { token: cardToken, allowedProviders: [psp.url, pspTap.url] } });
+  signer = await startSigner({ gatewayPublicJwk: gatewayKey.publicJwk, lightning: { url: lightning.url, accountToken: lnAccount }, card: { token: cardToken, allowedProviders: [psp.url, pspTap.url] }, agents: [{ agentId: TEST_AGENT, secretHash: secretHash(agentSecret) }] });
   facilitator.chain.mint(signer.evmAddress, 100_000_000n);
   lightning.balances.set(lnAccount, 100_000);
   psp.cards.set(cardToken, { limit: 100_000, spent: 0 });
@@ -94,7 +100,7 @@ before(async () => {
 after(async () => { await Promise.all(cleanup.map((s) => s.close())); });
 
 /** A plain API that counts hits and records what it was sent. */
-interface Upstream { url: string; hits: number; seen: IncomingHttpHeaders[]; paths: string[]; bodies: string[]; mode: "ok" | "down" | "error" | "busy" | "unavailable"; close(): Promise<void> }
+interface Upstream { url: string; hits: number; seen: IncomingHttpHeaders[]; paths: string[]; bodies: string[]; mode: "ok" | "down" | "error" | "busy" | "unavailable" | "invalid" | "slow"; close(): Promise<void> }
 /** The upstream's ETag: a request carrying it in If-None-Match gets 304. */
 const ETAG = '"v1"';
 async function startUpstream(): Promise<Upstream> {
@@ -107,6 +113,8 @@ async function startUpstream(): Promise<Upstream> {
     u.seen.push(req.headers);
     u.paths.push(req.url ?? "");
     u.bodies.push(Buffer.concat(chunks).toString());
+    if (u.mode === "slow") await delay(400);   // does the work, but answers after the proxy gave up
+    if (u.mode === "invalid") { res.writeHead(422, { "content-type": "application/json" }); return res.end(JSON.stringify({ error: "invalid job" })); }
     if (u.mode === "error") { res.writeHead(500); return res.end("boom"); }
     if (u.mode === "unavailable") { res.writeHead(503); return res.end("maintenance"); }
     if (u.mode === "busy") { res.writeHead(429, { "retry-after": "1" }); return res.end("slow down"); }
@@ -143,6 +151,24 @@ async function setup(over: Partial<PaymentProxyConfig> = {}) {
   return { upstream, proxy };
 }
 
+/**
+ * A gateway-style authorization for a 402 option, with what the real gateway derives from the
+ * challenge: the rail reference, and for x402 the chain, token and EIP-712 domain.
+ */
+function authorizationFor(proxy: PaymentProxyHandle, ch: ReturnType<typeof parse402>, option: PaymentOption, over: Partial<PaymentAuthorization> = {}): PaymentAuthorization {
+  const now = Date.now();
+  const authId = newId("auth-");
+  const req = option.scheme === "x402" ? (option.challenge as { requirements: PaymentRequirements }).requirements : undefined;
+  return {
+    authId, transactionId: newId("tx-"), mandateId: "urn:test:mandate", agentId: TEST_AGENT, seller: proxy.webId,
+    offerId: ch.offer!.offerId, offerVersion: ch.offer!.version, offerDigest: ch.offer!.digest, resource: option.resource,
+    scheme: option.scheme, amount: option.amount, currency: option.currency, payTo: option.payTo, challengeDigest: digestOf(option.challenge),
+    railReference: req ? nonceFor(authId) : option.railReference,
+    ...(req ? { x402: { network: req.network, asset: getAddress(req.asset), domainName: req.extra.name, domainVersion: req.extra.version } } : {}),
+    issuedAt: new Date(now).toISOString(), expiresAt: new Date(now + 120_000).toISOString(), ...over,
+  };
+}
+
 /** What a buyer does after a 402: get a gateway-style authorization and let the real signer pay. */
 async function buy(proxy: PaymentProxyHandle, url: string, scheme: SchemeId, method = "GET"): Promise<PaymentCredential> {
   const r = await fetch(url, { method });
@@ -150,14 +176,7 @@ async function buy(proxy: PaymentProxyHandle, url: string, scheme: SchemeId, met
   const ch = parse402(r, url);
   const option = ch.options.find((o) => o.scheme === scheme)!;
   assert.ok(option, `402 offers ${scheme}`);
-  const now = Date.now();
-  const auth: PaymentAuthorization = {
-    authId: newId("auth-"), transactionId: newId("tx-"), mandateId: "urn:test:mandate", agentId: "urn:test:agent", seller: proxy.webId,
-    offerId: ch.offer!.offerId, offerVersion: ch.offer!.version, offerDigest: ch.offer!.digest, resource: option.resource,
-    scheme, amount: option.amount, currency: option.currency, payTo: option.payTo, challengeDigest: digestOf(option.challenge),
-    issuedAt: new Date(now).toISOString(), expiresAt: new Date(now + 120_000).toISOString(),
-  };
-  const pay = await postJson(`${signer.url}/pay`, { authorization: signEnvelope(gatewayKey, auth), challenge: option.challenge });
+  const pay = await postJson(`${signer.url}/pay`, { authorization: signEnvelope(gatewayKey, authorizationFor(proxy, ch, option)), challenge: option.challenge }, asAgent);
   assert.equal(pay.status, 200, JSON.stringify(pay.body));
   return pay.body.credential;
 }
@@ -554,7 +573,7 @@ describe("402 proxy", () => {
     const url = proxy.resourceUrl("submit");
     const cred = await buy(proxy, url, "x402", "POST");
     const big = "x".repeat(4096); // curl sends Expect: 100-continue for any body over 1 KiB
-    const r = await rawRequest(proxy.url, "POST", "/v1/submit", { [cred.header.name]: cred.header.value, expect: "100-continue", "content-type": "text/plain" }, big);
+    const r = await rawRequest(proxy.url, "POST", "/v1/submit", { [cred.header.name]: cred.header.value, expect: "100-continue", "content-type": "text/plain", "idempotency-key": "k-expect" }, big);
     assert.equal(r.status, 200, r.body);
     assert.equal(upstream.bodies.at(-1), big);
     assert.equal(upstream.seen.at(-1)!.expect, undefined, "Expect is hop-by-hop");
@@ -565,15 +584,15 @@ describe("402 proxy", () => {
 
   test("a settled credential buys one delivery on a POST route: re-presenting it is refused, a transient failure keeps the retry", async () => {
     const submit: PaidRoute = { id: "submit", method: "POST", path: "/v1/submit", category: "Data", prices: SAME_PRICES, description: "Submit" };
-    const post = (url: string, c: PaymentCredential, body: string) => fetch(url, { method: "POST", headers: { [c.header.name]: c.header.value, "content-type": "text/plain" }, body });
+    const post = (url: string, c: PaymentCredential, body: string, key: string) => fetch(url, { method: "POST", headers: { [c.header.name]: c.header.value, "content-type": "text/plain", "idempotency-key": key }, body });
     for (const scheme of SCHEMES) {
       const { upstream, proxy } = await setup({ routes: [...ROUTES, submit] });
       const url = proxy.resourceUrl("submit");
       const cred = await buy(proxy, url, scheme, "POST");
-      const r1 = await post(url, cred, "first");
+      const r1 = await post(url, cred, "first", `${scheme}-1`);
       assert.equal(r1.status, 200, scheme);
       assert.ok(r1.headers.get(RECEIPT_HEADER));
-      const r2 = await post(url, cred, "second");
+      const r2 = await post(url, cred, "second", `${scheme}-2`);
       assert.equal(r2.status, 402, `${scheme}: one payment, one POST`);
       assert.equal(((await r2.json()) as { error: string }).error, "credential_consumed", scheme);
       assert.deepEqual(upstream.bodies, ["first"], `${scheme}: the second POST never reached the upstream`);
@@ -582,11 +601,11 @@ describe("402 proxy", () => {
       // Nothing was delivered on a 503, so the same credential may retry until it delivers once.
       const cred2 = await buy(proxy, url, scheme, "POST");
       upstream.mode = "unavailable";
-      const f = await post(url, cred2, "retry-me");
+      const f = await post(url, cred2, "retry-me", `${scheme}-3`);
       assert.deepEqual([f.status, ((await f.json()) as { paid: boolean }).paid], [502, true], scheme);
       upstream.mode = "ok";
-      assert.equal((await post(url, cred2, "retry-me")).status, 200, `${scheme}: retry after 503 delivers`);
-      assert.equal((await post(url, cred2, "again")).status, 402, `${scheme}: then it is consumed`);
+      assert.equal((await post(url, cred2, "retry-me", `${scheme}-3`)).status, 200, `${scheme}: retry after 503 delivers`);
+      assert.equal((await post(url, cred2, "again", `${scheme}-4`)).status, 402, `${scheme}: then it is consumed`);
       assert.deepEqual(upstream.bodies, ["first", "retry-me", "retry-me"], scheme);
       assert.deepEqual(charges(proxy), { x402: 0, l402: 0, "card-psp": 0, [scheme]: 2 * ({ x402: 1, l402: 10, "card-psp": 3 } as Record<string, number>)[scheme] }, `${scheme}: one charge per credential`);
       assert.deepEqual([proxy.settlements, proxy.deliveries], [2, 2]);
@@ -598,9 +617,119 @@ describe("402 proxy", () => {
     const { upstream, proxy } = await setup({ routes: [...ROUTES, submit] });
     const url = proxy.resourceUrl("submit");
     const cred = await buy(proxy, url, "card-psp", "POST");
-    const rs = await Promise.all([1, 2, 3].map((i) => fetch(url, { method: "POST", headers: { [cred.header.name]: cred.header.value }, body: `b${i}` })));
+    const rs = await Promise.all([1, 2, 3].map((i) => fetch(url, { method: "POST", headers: { [cred.header.name]: cred.header.value, "idempotency-key": "k-concurrent" }, body: `b${i}` })));
     assert.equal(rs.filter((r) => r.status === 200).length, 1, rs.map((r) => r.status).join(","));
     assert.equal(upstream.hits, 1);
+  });
+
+  test("a POST payment serves one request: Idempotency-Key required, a retry after a timeout or a 4xx must repeat it exactly", async () => {
+    const submit: PaidRoute = { id: "submit", method: "POST", path: "/v1/submit", category: "Data", prices: SAME_PRICES, description: "Submit" };
+    const { upstream, proxy } = await setup({ routes: [...ROUTES, submit], upstreamTimeoutMs: 200 });
+    const url = proxy.resourceUrl("submit");
+    const post = (c: PaymentCredential, body: string, key?: string) =>
+      fetch(url, { method: "POST", headers: { [c.header.name]: c.header.value, "content-type": "text/plain", ...(key ? { "idempotency-key": key } : {}) }, body });
+    const settles = () => facTap.calls.filter((c) => c === "POST /settle").length;
+
+    // No key: refused before the credential settles, and the 402 says the key is needed.
+    const unpaid = await fetch(url, { method: "POST", body: "x" });
+    assert.match(((await unpaid.json()) as { idempotencyKey?: string }).idempotencyKey ?? "", /required/);
+    const cred = await buy(proxy, url, "x402", "POST");
+    const settledBefore = settles();
+    const nokey = await post(cred, "job-0");
+    assert.deepEqual([nokey.status, ((await nokey.json()) as { error: string }).error], [400, "idempotency_key_required"]);
+    assert.deepEqual([settles(), upstream.hits], [settledBefore, 0], "nothing settled, nothing forwarded");
+
+    // The upstream does the job but answers after the proxy gave up (502 paid): only the SAME request may retry.
+    upstream.mode = "slow";
+    const t1 = await post(cred, "job-0", "k-1");
+    assert.deepEqual([t1.status, ((await t1.json()) as { paid: boolean }).paid], [502, true]);
+    for (const [body, key] of [["job-1", "k-1"], ["job-1", "k-2"], ["job-0", "k-2"]]) {
+      const r = await post(cred, body, key);
+      assert.deepEqual([r.status, ((await r.json()) as { error: string }).error], [409, "idempotency_conflict"], `${body} / ${key}`);
+    }
+    upstream.mode = "ok";
+    const t2 = await post(cred, "job-0", "k-1");
+    assert.equal(t2.status, 200);
+    const delivered = Buffer.from(await t2.arrayBuffer());
+    assert.deepEqual(upstream.bodies, ["job-0", "job-0"], "one job, retried; never a second job");
+    assert.deepEqual(upstream.seen.map((h) => h["idempotency-key"]), ["k-1", "k-1"], "the upstream can recognise the retry");
+
+    // The answer to an identical retry after delivery is the stored one; the upstream is not asked again.
+    const t3 = await post(cred, "job-0", "k-1");
+    assert.equal(t3.status, 200);
+    assert.equal(t3.headers.get(REPLAY_HEADER), "true");
+    assert.equal(t3.headers.get(RECEIPT_HEADER), t2.headers.get(RECEIPT_HEADER));
+    assert.deepEqual(Buffer.from(await t3.arrayBuffer()), delivered);
+    const other = await post(cred, "job-2", "k-3");
+    assert.deepEqual([other.status, ((await other.json()) as { error: string }).error], [402, "credential_consumed"]);
+    assert.deepEqual([upstream.hits, proxy.deliveries, charges(proxy).x402], [2, 1, 1]);
+
+    // A refused job (422) cannot be swapped for another body under the same payment.
+    const cred2 = await buy(proxy, url, "card-psp", "POST");
+    upstream.mode = "invalid";
+    const bad = await post(cred2, "bad-job", "k-9");
+    assert.deepEqual([bad.status, JSON.parse(bad.headers.get(OUTCOME_HEADER)!).delivered], [422, false]);
+    for (const key of ["k-9", "k-10"]) assert.equal((await post(cred2, "fixed-job", key)).status, 409, key);
+    assert.equal((await post(cred2, "bad-job", "k-9")).status, 422, "the same request may be repeated");
+    assert.deepEqual(upstream.bodies.slice(2), ["bad-job", "bad-job"]);
+    upstream.mode = "ok";
+  });
+
+  test("the signer pays only the authorized rail reference, chain, token and EIP-712 domain, and only for the authorization's agent", async () => {
+    const { proxy } = await setup();
+    const url = proxy.resourceUrl("a");
+    const pay = (auth: PaymentAuthorization, challenge: unknown, headers = asAgent) => postJson(`${signer.url}/pay`, { authorization: signEnvelope(gatewayKey, auth), challenge }, headers);
+    const offers = async (u = url) => { const r = await fetch(u); return parse402(r, u); };
+    const opt = (ch: Awaited<ReturnType<typeof offers>>, s: SchemeId) => ch.options.find((o) => o.scheme === s)!;
+    const paymentsBefore = signer.payments;
+
+    // Callers: only an enrolled agent, and only the agent the authorization names.
+    const ch0 = await offers();
+    const okAuth = authorizationFor(proxy, ch0, opt(ch0, "x402"));
+    assert.equal((await pay(okAuth, opt(ch0, "x402").challenge, {})).status, 401, "no agent secret");
+    assert.equal((await pay(okAuth, opt(ch0, "x402").challenge, bearerHeaders("sca_" + "0".repeat(64)))).status, 401, "unknown secret");
+    const otherSecret = newAgentSecret();
+    signer.enrollAgent("urn:test:other-agent", secretHash(otherSecret));
+    const theft = await pay(okAuth, opt(ch0, "x402").challenge, bearerHeaders(otherSecret));
+    assert.deepEqual([theft.status, theft.body.error], [403, "NOT_YOUR_AUTHORIZATION"]);
+    const mine = await pay(okAuth, opt(ch0, "x402").challenge);
+    assert.equal(mine.status, 200);
+    assert.equal((await pay(okAuth, opt(ch0, "x402").challenge, bearerHeaders(otherSecret))).status, 403, "nor is a paid credential replayed to another agent");
+
+    // L402: an authorization for invoice I2 does not pay invoice I1.
+    const [l1, l2] = [opt(await offers(), "l402"), opt(await offers(), "l402")];
+    assert.notEqual(l1.railReference, l2.railReference);
+    const sats = lightning.balances.get(proxy.lightningPayee) ?? 0;
+    const l = await pay(authorizationFor(proxy, ch0, l1, { railReference: l2.railReference }), l1.challenge);
+    assert.equal(l.status, 422, JSON.stringify(l.body));
+    assert.equal(lightning.balances.get(proxy.lightningPayee) ?? 0, sats);
+
+    // Card: neither another intent than the bound one, nor an intent for another resource of the same merchant.
+    const [c1, c2] = [opt(await offers(), "card-psp"), opt(await offers(), "card-psp")];
+    assert.equal((await pay(authorizationFor(proxy, ch0, c1, { railReference: c2.railReference }), c1.challenge)).status, 422);
+    const chB = await offers(proxy.resourceUrl("b"));
+    const forB = opt(chB, "card-psp");   // same merchant, same price, other route
+    assert.equal((await pay(authorizationFor(proxy, ch0, { ...forB, resource: url }), forB.challenge)).status, 422);
+    assert.equal(psp.merchantBalances.get(proxy.merchantId) ?? 0, 0);
+
+    // x402: same amount and payee, but another chain, another token or a spoofed EIP-712 domain.
+    const x = opt(await offers(), "x402");
+    const req = (x.challenge as { requirements: PaymentRequirements }).requirements;
+    const variants: Array<Partial<PaymentRequirements>> = [
+      { network: "eip155:8453" },
+      { asset: "0x000000000000000000000000000000000000bad0" },
+      { extra: { name: "USD Coin", version: "2" } },
+      { extra: { name: "USDC", version: "1" } },
+    ];
+    for (const v of variants) {
+      const challenge = { ...(x.challenge as object), requirements: { ...req, ...v } };
+      const asBound = authorizationFor(proxy, ch0, { ...x, challenge });   // the gateway's own terms say the same
+      const r1 = await pay(asBound, challenge);
+      assert.equal(r1.status, 422, `token/chain not pinned: ${JSON.stringify(v)}`);
+      const r2 = await pay({ ...authorizationFor(proxy, ch0, x), challengeDigest: digestOf(challenge) }, challenge);
+      assert.equal(r2.status, 422, `differs from the authorization: ${JSON.stringify(v)}`);
+    }
+    assert.equal(signer.payments, paymentsBefore + 1, "only the one honest payment was made");
   });
 
   test("a paid target the upstream refuses (404) delivers nothing, says so, and lets the payment move once", async () => {

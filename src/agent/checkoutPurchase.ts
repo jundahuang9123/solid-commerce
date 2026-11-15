@@ -22,6 +22,7 @@ import { totalOf, type AcpCheckoutSession, type DelegatedCredential } from "../c
 import { evaluateOffers, compare, type Evaluated } from "./ranking.js";
 import type { AssistantConfig, PurchaseResult, ShoppingAssistant } from "./assistant.js";
 import { postJson } from "../util/http.js";
+import { bearerHeaders } from "../trust/agentAuth.js";
 import { newId } from "../util/crypto.js";
 import { fmt, toAtomic } from "../util/money.js";
 
@@ -129,7 +130,7 @@ export class CheckoutPurchaser {
       const txId = newId("tx-");
       Object.assign(evidence, { transactionId: txId, docUrl: `${this.cfg.layout.transactions}${txId}.ttl`, selectedOffer: c.payload.offerId, checkoutSession: option.resource });
       const lineItems = session.line_items.map((li) => li.item);
-      const auth = await postJson(`${this.cfg.gatewayUrl}/authorize`, { transactionId: txId, agentId: this.cfg.agentId, mandateId: mandate.id, checkout: { merchant: c.merchant.webId, sessionId: session.id, lineItems }, option });
+      const auth = await postJson(`${this.cfg.gatewayUrl}/authorize`, { transactionId: txId, agentId: this.cfg.agentId, mandateId: mandate.id, checkout: { merchant: c.merchant.webId, sessionId: session.id, lineItems }, option }, bearerHeaders(this.cfg.agentSecret));
       if (auth.status === 409 && auth.body?.code === "CHECKOUT_CHANGED") {
         notes.push(`Gateway: ${auth.body.code}: ${auth.body.reason}; re-validated before paying`);
         this.log("Checkout changed since the quote, re-validating");
@@ -149,7 +150,7 @@ export class CheckoutPurchaser {
       Object.assign(evidence, { scheme: option.scheme, amount: option.amount, currency: option.currency, ledgerDoc: `${this.cfg.layout.transactions}${txId}-ledger.ttl`, challenge: option.challenge });
       const common = { ...base, transactionId: txId, selected: c.payload, amount: option.amount, currency: option.currency, scheme: option.scheme };
 
-      const pay = await postJson(`${wallet.signerEndpoint}/pay`, { authorization, challenge: option.challenge });
+      const pay = await postJson(`${wallet.signerEndpoint}/pay`, { authorization, challenge: option.challenge }, bearerHeaders(this.cfg.agentSecret));
       if (pay.status !== 200) {
         await this.outcome(txId, "payment_failed", pay.body?.reason);
         return this.finish(evidence, { ...common, status: "payment_failed", code: pay.body?.error, reason: pay.body?.reason });
@@ -193,7 +194,7 @@ export class CheckoutPurchaser {
     const order = await this.adapter.order(t.orderUrl);
     if (!order) throw new Error(`cannot read order ${t.orderUrl}`);
     // Refunds are confirmed by the gateway at the PSP; the merchant's order status alone moves no budget.
-    const gw = await postJson(`${this.cfg.gatewayUrl}/transactions/${encodeURIComponent(t.transactionId)}/reconcile`, { agentId: this.cfg.agentId });
+    const gw = await postJson(`${this.cfg.gatewayUrl}/transactions/${encodeURIComponent(t.transactionId)}/reconcile`, { agentId: this.cfg.agentId }, bearerHeaders(this.cfg.agentSecret));
     const next: OrderTracking = { ...t, orderStatus: order.status, events: order.events, paymentStatus: gw.body?.status ?? t.paymentStatus };
     next.delivery = deliveryState(next);
     this.log(`Order ${t.orderId}: ${order.status}; payment ${next.paymentStatus}`);
@@ -232,7 +233,7 @@ export class CheckoutPurchaser {
 
   /** Report to the gateway and return its ledger status. For checkouts it consults the PSP, not this report. */
   private async outcome(txId: string, result: "paid" | "payment_failed" | "unknown", detail?: string): Promise<string> {
-    const out = await postJson(`${this.cfg.gatewayUrl}/transactions/${encodeURIComponent(txId)}/outcome`, { agentId: this.cfg.agentId, result, detail });
+    const out = await postJson(`${this.cfg.gatewayUrl}/transactions/${encodeURIComponent(txId)}/outcome`, { agentId: this.cfg.agentId, result, detail }, bearerHeaders(this.cfg.agentSecret));
     return out.body?.status ?? "unknown";
   }
 

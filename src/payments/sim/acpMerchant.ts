@@ -76,6 +76,8 @@ export async function startAcpMerchant(cfg: AcpMerchantConfig): Promise<AcpMerch
   const idem = new Map<string, { request: string; out: Promise<Out> }>();
   /** Session id -> the completion currently running for it. */
   const completing = new Map<string, Promise<Out>>();
+  /** The refund in flight per order id (see refund). */
+  const refunding = new Map<string, Promise<Out>>();
   let loseResponses = 0;
   let completions = 0;
   let base = "";
@@ -173,10 +175,23 @@ export async function startAcpMerchant(cfg: AcpMerchantConfig): Promise<AcpMerch
    * confirmed the refund, so a failure leaves it retryable. Idempotency-Key
    * refund:<order> makes a retry after a lost PSP response refund once.
    */
-  async function refund(o: AcpOrder, detail: string): Promise<Out> {
+  function refund(o: AcpOrder, detail: string): Promise<Out> {
+    // One refund in flight per order: a concurrent call (a merchant retry, a buyer cancellation
+    // racing it) shares its outcome. Otherwise the second call would pass the `o.refund` guard
+    // before the first set it, and re-decide the status from "returned" to "refunded".
+    const running = refunding.get(o.id);
+    if (running) return running;
+    const p = refundOnce(o, detail).finally(() => refunding.delete(o.id));
+    refunding.set(o.id, p);
+    return p;
+  }
+
+  async function refundOnce(o: AcpOrder, detail: string): Promise<Out> {
     // Already refunded (a retry): the order's outcome is settled. Re-deciding its status
     // here would turn a return into a cancellation and erase the buyer's verdict.
     if (o.refund) return { status: 200, body: o };
+    // Decided from the status before the PSP call, not after it.
+    const goodsWentOut = o.status === "shipped" || o.status === "delivered";
     let r: { status: number; body: any };
     try {
       r = await postJson(`${cfg.psp.url}/agentic_commerce/refunds`, { charge_id: o.charge_id }, { authorization: `Bearer ${cfg.psp.apiKey}`, [IDEMPOTENCY_HEADER]: `refund:${o.id}` });
@@ -186,7 +201,7 @@ export async function startAcpMerchant(cfg: AcpMerchantConfig): Promise<AcpMerch
     if (r.status !== 200) return error(502, "refund_failed", r.body?.message ?? "refund failed", "processing_error");
     o.refund = { id: r.body.id, amount: r.body.amount };
     // Goods that went out and came back are a return, not a cancellation.
-    o.status = o.status === "shipped" || o.status === "delivered" ? "returned" : "refunded";
+    o.status = goodsWentOut ? "returned" : "refunded";
     o.events.push({ status: o.status, at: new Date().toISOString(), detail });
     return { status: 200, body: o };
   }

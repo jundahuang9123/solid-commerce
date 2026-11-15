@@ -71,9 +71,32 @@ export function splitChallenges(v: string): string[] {
   }, []);
 }
 
+/**
+ * The Lightning node's own record of an invoice, or undefined if it cannot be read. The simulated
+ * invoice string is unsigned JSON, so what it claims (amount, payee) is checked against the node,
+ * standing in for verifying a BOLT11 invoice's signature.
+ */
+export async function lightningInvoice(lightningUrl: string, paymentHash: string): Promise<{ paymentHash: string; amountSat: number; payee: string; paid: boolean; expiresAt?: number } | undefined> {
+  if (!/^[0-9a-f]{64}$/.test(paymentHash)) return undefined;
+  try {
+    const r = await fetch(`${lightningUrl}/invoices/${paymentHash}`, { signal: AbortSignal.timeout(5000) });
+    return r.ok ? (await r.json()) as any : undefined;
+  } catch { return undefined; }
+}
+
+/** Unverified decoding of the macaroon's caveats (only the seller can check its HMAC). */
+export function macaroonCaveats(macaroon: string): Partial<L402Caveats> | undefined {
+  try { return JSON.parse(Buffer.from(macaroon.split(".")[0], "base64url").toString()) as Partial<L402Caveats>; } catch { return undefined; }
+}
+
 export async function createL402Payment(lightningUrl: string, accountToken: string, auth: PaymentAuthorization, challenge: { macaroon: string; invoice: string }): Promise<PaymentCredential> {
   const inv = decodeInvoice(challenge.invoice);
   if (String(inv.amountSat) !== auth.amount || inv.payee !== auth.payTo) throw new Error("L402 invoice does not match authorization");
+  // The gateway reconciles this transaction by the payment hash it bound; paying any other invoice
+  // would let reconciliation "prove" non-payment with an invoice nobody paid.
+  if (!auth.railReference || inv.paymentHash !== auth.railReference) throw new Error("L402 invoice is not the one the gateway authorized");
+  const node = await lightningInvoice(lightningUrl, inv.paymentHash);
+  if (!node || String(node.amountSat) !== auth.amount || node.payee !== auth.payTo) throw new Error("the node's record of the L402 invoice does not match the authorization");
   const r = await fetch(lightningUrl + "/pay", { method: "POST", headers: { "content-type": "application/json", "x-account": accountToken }, body: JSON.stringify({ paymentRequest: challenge.invoice }) });
   const body = await r.json() as { status: string; preimage?: string; reason?: string };
   if (body.status !== "succeeded" || !body.preimage) throw new Error(`Lightning payment failed: ${body.reason}`);

@@ -12,6 +12,10 @@ import { Ed25519Key, signEnvelope } from "../src/util/crypto.js";
 import { parseTurtle } from "../src/rdf/records.js";
 import { parse402 } from "../src/payments/http402.js";
 import { NS } from "../src/rdf/namespaces.js";
+import { getAddress } from "viem";
+import { newId } from "../src/util/crypto.js";
+import { DEFAULT_NETWORK, DEFAULT_USDC, nonceFor } from "../src/payments/schemes/x402.js";
+import { encodeInvoice } from "../src/payments/sim/lightning.js";
 
 let css: { url: string; proc: ChildProcess };
 const envs: Environment[] = [];
@@ -93,15 +97,15 @@ describe("completion checks", () => {
     // A compromised agent goes straight to the gateway with offers it should not pay
     const shadyOffer = e.sellers.shady.currentOffer();
     const opt = (o: typeof shadyOffer) => ({ scheme: "x402", amount: o.payload.prices[0].amount, currency: "USDC", payTo: o.payload.prices[0].payTo, resource: o.payload.resource, challenge: {} });
-    const g1 = await postJson(`${e.gateway.url}/authorize`, { transactionId: "tx-shady", agentId: AGENT_1, mandateId: m.id, offer: shadyOffer, option: opt(shadyOffer) });
+    const g1 = await postJson(`${e.gateway.url}/authorize`, { transactionId: "tx-shady", agentId: AGENT_1, mandateId: m.id, offer: shadyOffer, option: opt(shadyOffer) }, e.agentHeaders(AGENT_1));
     assert.deepEqual([g1.status, g1.body.code], [403, "SELLER_NOT_IN_MANDATE"]);
     // Even if a mandate names it, the gateway's registry must approve the seller
     const wide = await mandate(e, { slug: "wide", allowedSellers: [e.sellers.shady.webId] });
-    const g2 = await postJson(`${e.gateway.url}/authorize`, { transactionId: "tx-shady-2", agentId: AGENT_1, mandateId: wide.id, offer: shadyOffer, option: opt(shadyOffer) });
+    const g2 = await postJson(`${e.gateway.url}/authorize`, { transactionId: "tx-shady-2", agentId: AGENT_1, mandateId: wide.id, offer: shadyOffer, option: opt(shadyOffer) }, e.agentHeaders(AGENT_1));
     assert.deepEqual([g2.status, g2.body.code], [403, "SELLER_NOT_APPROVED"]);
     // An offer re-signed with another key, claiming to be an approved seller
     const forged = signEnvelope(Ed25519Key.generate(), { ...e.sellers.spree.currentOffer().payload, prices: [{ ...e.sellers.spree.currentOffer().payload.prices[0], payTo: e.sellers.shady.payTo }] });
-    const g3 = await postJson(`${e.gateway.url}/authorize`, { transactionId: "tx-forged", agentId: AGENT_1, mandateId: m.id, offer: forged, option: opt(forged) });
+    const g3 = await postJson(`${e.gateway.url}/authorize`, { transactionId: "tx-forged", agentId: AGENT_1, mandateId: m.id, offer: forged, option: opt(forged) }, e.agentHeaders(AGENT_1));
     assert.deepEqual([g3.status, g3.body.code], [403, "KEY_MISMATCH"]);
     assert.equal(e.rails.facilitator.chain.balanceOf(e.sellers.shady.payTo), 0n);
   });
@@ -114,7 +118,7 @@ describe("completion checks", () => {
     // Gateway: a 402 that references v2 cannot be paid against an evaluation of v1
     const res = await fetch(e.sellers.spree.resourceUrl);
     const ch = parse402(res, e.sellers.spree.resourceUrl);
-    const g = await postJson(`${e.gateway.url}/authorize`, { transactionId: "tx-stale", agentId: AGENT_1, mandateId: m!.id, offer: stale, offerRef: ch.offer, option: ch.options[0] });
+    const g = await postJson(`${e.gateway.url}/authorize`, { transactionId: "tx-stale", agentId: AGENT_1, mandateId: m!.id, offer: stale, offerRef: ch.offer, option: ch.options[0] }, e.agentHeaders(AGENT_1));
     assert.deepEqual([g.status, g.body.code], [409, "OFFER_CHANGED"]);
     // Assistant: price changes after evaluation -> re-fetch, re-evaluate, then pay the new terms
     const r = await assistant.purchase({ ...BERLIN, mandateId: m!.id, hooks: { afterEvaluation: async () => e.sellers.spree.setPrice({ x402: "0.06" }) } });
@@ -143,27 +147,27 @@ describe("completion checks", () => {
     const ch = parse402(await fetch(e.sellers.spree.resourceUrl), e.sellers.spree.resourceUrl);
     const option = ch.options.find((o) => o.scheme === "x402")!;
     const req = { transactionId: "tx-retry", agentId: AGENT_1, mandateId: m!.id, offer, offerRef: ch.offer, option };
-    const a1 = await postJson(`${e.gateway.url}/authorize`, req);
-    const a2 = await postJson(`${e.gateway.url}/authorize`, req);
+    const a1 = await postJson(`${e.gateway.url}/authorize`, req, e.agentHeaders(AGENT_1));
+    const a2 = await postJson(`${e.gateway.url}/authorize`, req, e.agentHeaders(AGENT_1));
     assert.equal(a1.status, 200);
     assert.equal(a2.body.replayed, true);
     assert.deepEqual(a2.body.authorization, a1.body.authorization, "same transaction id -> same authorization");
     assert.equal((await budget(e, m!)).committed, "20000", "reserved once");
-    const conflict = await postJson(`${e.gateway.url}/authorize`, { ...req, option: { ...option, amount: "1" } });
+    const conflict = await postJson(`${e.gateway.url}/authorize`, { ...req, option: { ...option, amount: "1" } }, e.agentHeaders(AGENT_1));
     assert.equal(conflict.body.code, "IDEMPOTENCY_CONFLICT");
 
     // Signer: retried and concurrent duplicate pay calls yield one payment
-    const pay = () => postJson(`${e.signer.url}/pay`, { authorization: a1.body.authorization, challenge: option.challenge });
+    const pay = () => postJson(`${e.signer.url}/pay`, { authorization: a1.body.authorization, challenge: option.challenge }, e.agentHeaders(AGENT_1));
     const [p1, p2, p3] = await Promise.all([pay(), pay(), pay()]);
     assert.equal(e.signer.payments, 1);
     assert.deepEqual(p2.body.credential, p1.body.credential);
     assert.deepEqual(p3.body.credential, p1.body.credential);
     // Same authorization, different challenge (e.g. a substituted payee): refused
-    const swapped = await postJson(`${e.signer.url}/pay`, { authorization: a1.body.authorization, challenge: { ...(option.challenge as object), requirements: { ...(option.challenge as any).requirements, payTo: e.sellers.shady.payTo } } });
+    const swapped = await postJson(`${e.signer.url}/pay`, { authorization: a1.body.authorization, challenge: { ...(option.challenge as object), requirements: { ...(option.challenge as any).requirements, payTo: e.sellers.shady.payTo } } }, e.agentHeaders(AGENT_1));
     assert.equal(swapped.body.error, "CHALLENGE_MISMATCH");
     // Forged authorization
     const forged = signEnvelope(Ed25519Key.generate(), { ...a1.body.authorization.payload, authId: "auth-forged" });
-    assert.equal((await postJson(`${e.signer.url}/pay`, { authorization: forged, challenge: option.challenge })).status, 401);
+    assert.equal((await postJson(`${e.signer.url}/pay`, { authorization: forged, challenge: option.challenge }, e.agentHeaders(AGENT_1))).status, 401);
 
     // Seller: presenting the credential repeatedly charges once
     const cred = p1.body.credential;
@@ -225,7 +229,7 @@ describe("completion checks", () => {
     await e.pod.putTurtle(doc, orig.replace(/odrl:rightOperand (?:"1"\^\^xsd:decimal|1\.0+)/g, 'odrl:rightOperand "500.00"^^xsd:decimal'));
     const offer = e.sellers.spree.currentOffer();
     const ch = parse402(await fetch(e.sellers.spree.resourceUrl), e.sellers.spree.resourceUrl);
-    const g = await postJson(`${e.gateway.url}/authorize`, { transactionId: "tx-tamper", agentId: AGENT_1, mandateId: m!.id, offer, offerRef: ch.offer, option: ch.options[0] });
+    const g = await postJson(`${e.gateway.url}/authorize`, { transactionId: "tx-tamper", agentId: AGENT_1, mandateId: m!.id, offer, offerRef: ch.offer, option: ch.options[0] }, e.agentHeaders(AGENT_1));
     assert.deepEqual([g.status, g.body.code], [403, "MANDATE_NOT_CONFIRMED"]);
     assert.equal((await assistant.purchase({ ...BERLIN, mandateId: m!.id })).code, "NO_CONFIRMED_MANDATE");
     await e.pod.putTurtle(doc, orig);
@@ -248,7 +252,7 @@ describe("completion checks", () => {
     e.sellers.spree.setBehaviour({ failDeliveryTimes: 10 });
     const r1 = await assistant.purchase({ ...BERLIN, mandateId: m!.id });
     assert.deepEqual([r1.status, r1.delivery?.status], ["paid_not_delivered", "NotDelivered"]);
-    const tx = await (await fetch(`${e.gateway.url}/transactions/${r1.transactionId}`)).json() as any;
+    const tx = await (await fetch(`${e.gateway.url}/transactions/${r1.transactionId}`, { headers: e.agentHeaders(AGENT_1) })).json() as any;
     assert.equal(tx.status, "settled", "the gateway knows the money moved");
     e.sellers.spree.setBehaviour({ failDeliveryTimes: 0 });
     const paymentsBefore = e.signer.payments;
@@ -276,9 +280,9 @@ describe("completion checks", () => {
     assert.equal(r4.status, "payment_failed");
     assert.equal((await budget(e, sats)).committed, "25", "held while uncertain");
     await new Promise((r) => setTimeout(r, 3200));
-    await postJson(`${e.gateway.url}/reconcile`, {});
+    await postJson(`${e.gateway.url}/reconcile`, {}, e.adminHeaders);
     assert.equal((await budget(e, sats)).committed, "0", "released once provably unpaid");
-    const t4 = await (await fetch(`${e.gateway.url}/transactions/${r4.transactionId}`)).json() as any;
+    const t4 = await (await fetch(`${e.gateway.url}/transactions/${r4.transactionId}`, { headers: e.agentHeaders(AGENT_1) })).json() as any;
     assert.equal(t4.status, "released");
     assert.ok(t4.events.map((x: any) => x.type).join(",").includes("pending"));
   });
@@ -310,5 +314,127 @@ describe("completion checks", () => {
     assert.equal(pr.accepts[0].network, "eip155:84532");
     assert.equal(pr.accepts[0].amount, "20000");
     assert.match(res.headers.get("www-authenticate")!, /^L402 macaroon=".*", invoice="lnsim1.*", Payment method="card-psp"/);
+  });
+});
+
+/** Regression tests for the final audit's payment findings (gateway and signer side). */
+describe("payment authority binding", () => {
+  const challengeOf = async (e: Environment) => parse402(await fetch(e.sellers.spree.resourceUrl), e.sellers.spree.resourceUrl);
+  const authorize = (e: Environment, body: Record<string, unknown>, headers: Record<string, string> = e.agentHeaders(AGENT_1)) =>
+    postJson(`${e.gateway.url}/authorize`, { transactionId: newId("tx-"), agentId: AGENT_1, ...body }, headers);
+
+  test("L402 and card: the gateway derives the rail reference from the challenge and binds it; the agent cannot swap it", async () => {
+    const e = await env();
+    await ground(e, "Get me a current Berlin weather report.");
+    const offer = e.sellers.spree.currentOffer();
+    const sats = await mandate(e, { slug: "sats", currency: "SAT", totalLimit: "25", maxPerTransaction: "25", allowedSchemes: ["l402"] });
+    const eur = await mandate(e, { slug: "eur", currency: "EUR", totalLimit: "5", maxPerTransaction: "5", allowedSchemes: ["card-psp"] });
+    for (const [scheme, m] of [["l402", sats], ["card-psp", eur]] as const) {
+      const [c1, c2] = [await challengeOf(e), await challengeOf(e)];
+      const [o1, o2] = [c1.options.find((o) => o.scheme === scheme)!, c2.options.find((o) => o.scheme === scheme)!];
+      assert.notEqual(o1.railReference, o2.railReference);
+      // Challenge for payment 1, reference of payment 2: reconciliation would ask about the wrong payment.
+      const swapped = await authorize(e, { mandateId: m.id, offer, offerRef: c1.offer, option: { ...o1, railReference: o2.railReference } });
+      assert.deepEqual([swapped.status, swapped.body.code], [409, "RAIL_REFERENCE_MISMATCH"], scheme);
+      // Without the agent's reference the gateway still binds the challenge's own one.
+      const { railReference: _r, ...bare } = o1;
+      const ok = await authorize(e, { mandateId: m.id, offer, offerRef: c1.offer, option: bare });
+      assert.equal(ok.status, 200, JSON.stringify(ok.body));
+      assert.equal(ok.body.authorization.payload.railReference, o1.railReference, scheme);
+      const row = await (await fetch(`${e.gateway.url}/transactions/${ok.body.authorization.payload.transactionId}`, { headers: e.agentHeaders(AGENT_1) })).json() as { rail_reference: string };
+      assert.equal(row.rail_reference, o1.railReference, `${scheme}: the ledger reconciles against the challenge's payment`);
+      await postJson(`${e.gateway.url}/reconcile`, {}, e.adminHeaders);
+    }
+    // A card intent the agent created itself for the same merchant and price, but another resource.
+    const pi = (await postJson(`${e.rails.psp.url}/payment_intents`, { amount: 5, currency: "EUR", merchant: e.sellers.spree.merchantId, resource: "http://elsewhere.example/r" })).body.id as string;
+    const card = (await challengeOf(e)).options.find((o) => o.scheme === "card-psp")!;
+    const foreign = await authorize(e, { mandateId: eur.id, offer, option: { ...card, challenge: { id: pi, provider: e.rails.psp.url }, railReference: pi } });
+    assert.deepEqual([foreign.status, foreign.body.code], [409, "OFFER_MISMATCH"]);
+    // An L402 invoice whose string claims the signed price but whose node record is another invoice's.
+    const real = (await challengeOf(e)).options.find((o) => o.scheme === "l402")!;
+    const big = (await postJson(`${e.rails.lightning.url}/invoices`, { amountSat: 1000, payee: e.sellers.spree.lightningPayee, memo: "x" })).body as { paymentHash: string; paymentRequest: string };
+    const lie = encodeInvoice({ paymentHash: big.paymentHash, amountSat: 25, payee: e.sellers.spree.lightningPayee, expiresAt: Date.now() + 60_000 });
+    const forged = await authorize(e, { mandateId: sats.id, offer, option: { ...real, challenge: { ...(real.challenge as object), invoice: lie }, railReference: big.paymentHash } });
+    assert.deepEqual([forged.status, forged.body.code], [409, "OFFER_MISMATCH"]);
+  });
+
+  test("x402: network, token and EIP-712 domain must be those of the signed offer, and the authorization carries them", async () => {
+    const e = await env();
+    const { mandate: m } = await ground(e);
+    const offer = e.sellers.spree.currentOffer();
+    const ch = await challengeOf(e);
+    const x = ch.options.find((o) => o.scheme === "x402")!;
+    const req = (x.challenge as any).requirements;
+    for (const v of [{ network: "eip155:8453" }, { asset: "0x000000000000000000000000000000000000bad0", extra: { name: "USDC", version: "2" } }, { extra: { name: "USD Coin", version: "2" } }, { extra: { name: "USDC", version: "9" } }]) {
+      const challenge = { ...(x.challenge as object), requirements: { ...req, ...v } };
+      const g = await authorize(e, { mandateId: m!.id, offer, offerRef: ch.offer, option: { ...x, challenge } });
+      assert.deepEqual([g.status, g.body.code], [409, "OFFER_MISMATCH"], JSON.stringify(v));
+    }
+    const ok = await authorize(e, { mandateId: m!.id, offer, offerRef: ch.offer, option: x });
+    assert.equal(ok.status, 200);
+    assert.deepEqual(ok.body.authorization.payload.x402, { network: DEFAULT_NETWORK, asset: getAddress(DEFAULT_USDC), domainName: "USDC", domainVersion: "2" });
+    assert.equal(ok.body.authorization.payload.railReference, nonceFor(ok.body.authorization.payload.authId));
+  });
+
+  test("agents authenticate: identity comes from the agent's secret, and credentials and transactions go only to their agent", async () => {
+    const e = await env();
+    const m = await mandate(e, { slug: "only-1", assignees: [AGENT_1] });
+    await ground(e, "Get me a current Berlin weather report.");
+    const offer = e.sellers.spree.currentOffer();
+    const ch = await challengeOf(e);
+    const option = ch.options.find((o) => o.scheme === "x402")!;
+    const req = { mandateId: m.id, offer, offerRef: ch.offer, option };
+
+    assert.equal((await authorize(e, req, {})).status, 401, "a self-asserted agentId is not an identity");
+    assert.equal((await authorize(e, req, e.adminHeaders)).status, 401, "the operator cannot authorize spending");
+    const lying = await authorize(e, req, e.agentHeaders(AGENT_2));
+    assert.deepEqual([lying.status, lying.body.code], [403, "AGENT_MISMATCH"]);
+    const asItself = await authorize(e, { ...req, agentId: AGENT_2 }, e.agentHeaders(AGENT_2));
+    assert.deepEqual([asItself.status, asItself.body.code], [403, "AGENT_NOT_AUTHORIZED"]);
+    const ok = await authorize(e, req);
+    assert.equal(ok.status, 200);
+    const txId = ok.body.authorization.payload.transactionId as string;
+
+    const read = (h: Record<string, string>) => fetch(`${e.gateway.url}/transactions/${txId}`, { headers: h });
+    assert.equal((await read({})).status, 401, "the signed authorization is not public");
+    assert.equal((await read(e.agentHeaders(AGENT_2))).status, 403);
+    assert.ok(((await (await read(e.agentHeaders(AGENT_1))).json()) as { auth_json: string }).auth_json);
+    assert.equal((await read(e.adminHeaders)).status, 200, "the dashboard reads with the admin credential");
+
+    const pay = (h: Record<string, string>) => postJson(`${e.signer.url}/pay`, { authorization: ok.body.authorization, challenge: option.challenge }, h);
+    assert.equal((await pay({})).status, 401);
+    assert.deepEqual([(await pay(e.agentHeaders(AGENT_2))).status, e.signer.payments], [403, 0], "another agent gets no credential");
+    assert.equal((await pay(e.agentHeaders(AGENT_1))).status, 200);
+    assert.equal((await pay(e.agentHeaders(AGENT_2))).status, 403, "nor a replay of the paid one");
+
+    assert.equal((await postJson(`${e.gateway.url}/transactions/${txId}/outcome`, { result: "payment_failed" }, e.agentHeaders(AGENT_2))).status, 403);
+    assert.equal((await postJson(`${e.gateway.url}/transactions/${txId}/outcome`, { agentId: AGENT_1, result: "payment_failed" })).status, 401);
+    assert.equal((await postJson(`${e.gateway.url}/reconcile`, {})).status, 401);
+    assert.equal((await postJson(`${e.gateway.url}/reconcile`, {}, e.adminHeaders)).status, 200);
+  });
+
+  test("a superseded mandate revision put back into the Pod is refused by the gateway", async () => {
+    const e = await env();
+    await ground(e, "Get me a current Berlin weather report.");
+    const r1 = await mandate(e, { slug: "rollback", totalLimit: "1.00", maxPerTransaction: "1.00" });
+    const doc = r1.id.split("#")[0];
+    const r1Bytes = (await e.pod.get(doc))!.text;            // an agent keeps a copy of the signed r1
+    assert.equal((await budget(e, r1)).available, "1000000");
+    // The user lowers the limit: r2, signed on the device; the gateway sees it.
+    const { confirmation: _c, ...terms } = r1;
+    const r2 = await e.assistant().cg.commit({ ...terms, status: "Proposed", revision: 2, supersedes: e.layout.historyDoc("rollback", 1), totalLimit: "0.10", maxPerTransaction: "0.05" } as SpendingMandate, e.device);
+    assert.ok(r2);
+    assert.equal((await budget(e, r1)).available, "100000");
+    // The agent restores r1: still a valid user signature, but no longer the newest revision.
+    await e.pod.putTurtle(doc, r1Bytes);
+    e.sellers.spree.setPrice({ x402: "0.06" });           // above r2's per-purchase limit, within r1's
+    const ch = await challengeOf(e);
+    const g = await authorize(e, { mandateId: r1.id, offer: e.sellers.spree.currentOffer(), offerRef: ch.offer, option: ch.options.find((o) => o.scheme === "x402")! });
+    assert.deepEqual([g.status, g.body.code], [403, "MANDATE_SUPERSEDED"]);
+    assert.equal((await fetch(`${e.gateway.url}/budget?mandate=${encodeURIComponent(r1.id)}`)).status, 403);
+    // A different signed text under the same revision number as one already seen is refused too.
+    const twin = await e.assistant().cg.commit({ ...terms, status: "Proposed", revision: 2, supersedes: e.layout.historyDoc("rollback", 1), totalLimit: "0.50", maxPerTransaction: "0.50" } as SpendingMandate, e.device);
+    assert.ok(twin);
+    assert.equal(((await (await fetch(`${e.gateway.url}/budget?mandate=${encodeURIComponent(r1.id)}`)).json()) as { code: string }).code, "MANDATE_REVISION_CONFLICT");
   });
 });

@@ -6,12 +6,23 @@
  * POST /reconcile                  resolve authorized/pending transactions against the payment rails
  * POST /transactions/:id/reconcile the transaction's agent asks for one transaction to be reconciled,
  *                                  including refunds of settled checkout purchases
- * GET  /transactions/:id           ledger row and event history
- * GET  /budget?mandate=<iri>       limit, committed, settled, available
+ * GET  /transactions/:id           ledger row and event history (its own agent, or the admin)
+ * GET  /budget?mandate=<iri>       limit, committed, settled, available (unauthenticated: amounts only)
+ *
+ * Every route but /budget needs a caller credential (src/trust/agentAuth.ts):
+ * an enrolled agent's secret, or for GET /transactions/:id and /reconcile the
+ * admin secret. The acting agent is the one whose secret is presented; an
+ * `agentId` in the body must name that same agent.
  *
  * Authorization is bound to seller, offer version and digest, resource,
- * scheme, amount, currency, payee, the exact challenge, an expiry and a unique
- * transaction id.
+ * scheme, amount, currency, payee, the exact challenge, the payment's rail
+ * reference (derived here from the challenge, ./offerBinding.ts), for x402
+ * the chain, token and EIP-712 domain, an expiry and a unique transaction id.
+ *
+ * Mandate revisions: the ledger keeps the highest user-signed revision seen
+ * per mandate id and refuses older ones (Ledger.observeRevision). Agent-side
+ * rollback detection for agreed meanings and requirements is CommonGround's
+ * job (src/grounding), not the gateway's.
  *
  * Two kinds of terms are accepted:
  *  - a seller-signed offer plus the HTTP 402 challenge that implements it (x402, L402-style, card/PSP);
@@ -34,6 +45,8 @@ import { nonceFor } from "../payments/schemes/x402.js";
 import { Ledger, type TxRow, type TxStatus } from "./ledger.js";
 import { ledgerEvidenceToTurtle } from "../rdf/evidence.js";
 import { bindCheckout, delegatedPaymentState, type Binding, type CheckoutClaim } from "./checkoutBinding.js";
+import { bindSignedOffer } from "./offerBinding.js";
+import { AgentDirectory, type AgentEnrollment, type Principal } from "../trust/agentAuth.js";
 
 export interface GatewayConfig {
   pod: PodClient;
@@ -45,6 +58,10 @@ export interface GatewayConfig {
   ledgerPath?: string;
   authorizationTtlSeconds?: number;
   gatewayId?: string;
+  /** Agents that may call the gateway, with the hash of each one's secret (more can be enrolled later). */
+  agents?: AgentEnrollment[];
+  /** Hash of the operator's secret: may read any transaction and run /reconcile, never authorize. */
+  adminSecretHash?: string;
 }
 
 export interface AuthorizeRequest {
@@ -68,6 +85,8 @@ export interface GatewayHandle extends RunningServer {
   reconcile(): Promise<Array<{ txId: string; status: string }>>;
   /** Register the wallet's public x402 payer address (used to query the rail during reconciliation). */
   setPayer(x402Address: string): void;
+  /** Enroll an agent's secret (its hash, see secretHash). Only enrolled agents can act here. */
+  enrollAgent(agentId: string, secretHash: string): void;
 }
 
 export async function startGateway(cfg: GatewayConfig): Promise<GatewayHandle> {
@@ -86,32 +105,18 @@ export async function startGateway(cfg: GatewayConfig): Promise<GatewayHandle> {
     if (rec.kind !== "mandate") return reject("MANDATE_INVALID", "not a spending mandate");
     const check = verifyConfirmation(rec, cfg.enrolledApprovalKeys);
     if (!check.ok) return reject("MANDATE_NOT_CONFIRMED", check.reason);
+    // The newest revision the user signed is binding: an older signed revision put back into the
+    // Pod (still a valid signature) is refused once a newer one has been seen.
+    const hw = ledger.observeRevision(rec.id, rec.revision, rec.confirmation!.termsDigest);
+    if (!hw.ok) return reject(hw.code, hw.reason);
     return rec;
   }
 
-  /** 402 schemes: the challenge must implement exactly the signed offer that was evaluated. */
-  function bindSignedOffer(r: AuthorizeRequest, m: SpendingMandate): { ok: true; binding: Binding } | { ok: false; status: number; rj: Rejection } {
-    const offer = r.offer!.payload;
-    if (!m.targets.includes(offer.category)) return { ok: false, status: 403, rj: reject("CATEGORY_NOT_AUTHORIZED", offer.category) };
-
-    // Seller: approved by the gateway AND allowed by the mandate; offer signed by the pinned key
-    if (!m.allowedSellers.includes(offer.seller)) return { ok: false, status: 403, rj: reject("SELLER_NOT_IN_MANDATE", offer.seller) };
-    const oc = cfg.registry.checkOffer(r.offer!);
-    if (!oc.ok) return { ok: false, status: 403, rj: reject(oc.code, oc.reason) };
-
-    // The 402 challenge must implement exactly the signed offer that was evaluated
-    if (r.offerRef && (r.offerRef.offerId !== offer.offerId || r.offerRef.version !== offer.version || r.offerRef.digest !== oc.digest)) {
-      return { ok: false, status: 409, rj: reject("OFFER_CHANGED", `402 references ${r.offerRef.offerId} v${r.offerRef.version}; evaluated v${offer.version}. Re-fetch and re-evaluate the offer.`) };
-    }
-    const o = r.option;
-    const price = offer.prices.find((p) => p.scheme === o.scheme);
-    if (!price || price.amount !== o.amount || price.currency !== o.currency || (price.payTo ?? price.merchantId) !== o.payTo || offer.resource !== o.resource) {
-      return { ok: false, status: 409, rj: reject("OFFER_MISMATCH", "payment challenge does not match the signed offer (amount, currency, payee or resource)") };
-    }
-    return { ok: true, binding: { seller: offer.seller, offerId: offer.offerId, offerVersion: offer.version, offerDigest: oc.digest, resource: offer.resource, railReference: o.railReference } };
-  }
-
-  async function authorize(r: AuthorizeRequest): Promise<{ status: number; body: unknown }> {
+  async function authorize(r: AuthorizeRequest, caller: string): Promise<{ status: number; body: unknown }> {
+    if (!r || typeof r !== "object") return { status: 400, body: reject("BAD_REQUEST", "missing fields") };
+    // The acting agent is the authenticated one; a body naming someone else is refused, not recorded.
+    if (r.agentId !== undefined && r.agentId !== caller) return { status: 403, body: reject("AGENT_MISMATCH", `authenticated as ${caller}, request names ${r.agentId}`) };
+    r = { ...r, agentId: caller };
     const isCheckout = r.option?.scheme === "acp-delegated";
     if (!r.transactionId || !r.agentId || !r.mandateId || !r.option || (isCheckout ? !r.checkout : !r.offer)) return { status: 400, body: reject("BAD_REQUEST", "missing fields") };
     const requestDigest = digestOf(isCheckout
@@ -148,8 +153,8 @@ export async function startGateway(cfg: GatewayConfig): Promise<GatewayHandle> {
       if (!b.ok) return fail(b.status, reject(b.code, b.reason));
       binding = b.binding;
     } else {
-      const b = bindSignedOffer(r, m);
-      if (!b.ok) return fail(b.status, b.rj);
+      const b = await bindSignedOffer(cfg, m, r.offer!, r.offerRef, r.option);
+      if (!b.ok) return fail(b.status, reject(b.code, b.reason));
       binding = b.binding;
     }
     const o = r.option;
@@ -165,18 +170,24 @@ export async function startGateway(cfg: GatewayConfig): Promise<GatewayHandle> {
     // 5. Reserve atomically and sign
     const authId = newId("auth-");
     const now = new Date();
+    // Derived from the challenge by the binding step (x402: from the authorization id), never the agent's.
+    const railReference = o.scheme === "x402" ? nonceFor(authId) : binding.railReference;
+    if (!railReference) return fail(409, reject("OFFER_MISMATCH", "the challenge names no payment the gateway could reconcile"));
     const payload: PaymentAuthorization = {
       authId, transactionId: r.transactionId, mandateId: m.id, agentId: r.agentId, seller: binding.seller,
       offerId: binding.offerId, offerVersion: binding.offerVersion, offerDigest: binding.offerDigest, resource: binding.resource,
       scheme: o.scheme, amount: o.amount, currency: o.currency, payTo: o.payTo, challengeDigest: digestOf(o.challenge),
+      railReference, ...(binding.x402 ? { x402: binding.x402 } : {}),
       issuedAt: now.toISOString(), expiresAt: new Date(now.getTime() + ttl * 1000).toISOString(),
     };
     const signed = signEnvelope(key, payload);
-    const railReference = o.scheme === "x402" ? nonceFor(authId) : binding.railReference ?? null;
     let outcome: { ok: true } | { ok: false; status: number; rj: Rejection };
     try {
       outcome = ledger.immediate(() => {
         if (ledger.get(r.transactionId)) return { ok: false as const, status: 409, rj: reject("IDEMPOTENCY_RACE", "retry with the same request") };
+        // A newer revision of the mandate seen since it was loaded (a concurrent request) wins.
+        const hw = ledger.revisionOf(m.id);
+        if (hw && hw.revision > m.revision) return { ok: false as const, status: 403, rj: reject("MANDATE_SUPERSEDED", `revision ${m.revision} was superseded by revision ${hw.revision}`) };
         // One live authorization per checkout session, checked under the same lock as the budget:
         // each authorization gets its own one-time token, so two would let one basket be charged twice.
         const live = isCheckout && railReference ? ledger.liveCheckout(binding.seller, railReference) : undefined;
@@ -212,10 +223,11 @@ export async function startGateway(cfg: GatewayConfig): Promise<GatewayHandle> {
     return { currency: m.currency, limit: total.toString(), committed: committed.toString(), settled: ledger.settled(m.id, m.currency).toString(), available: (total - committed).toString() };
   }
 
-  async function outcome(txId: string, body: { agentId: string; result: "paid" | "payment_failed" | "unknown"; receipt?: Signed<Receipt>; detail?: string }) {
+  async function outcome(txId: string, caller: string, body: { agentId?: string; result: "paid" | "payment_failed" | "unknown"; receipt?: Signed<Receipt>; detail?: string }) {
     const tx = ledger.get(txId);
     if (!tx) return { status: 404, body: reject("UNKNOWN_TRANSACTION", txId) };
-    if (tx.agent_id !== body.agentId) return { status: 403, body: reject("NOT_YOUR_TRANSACTION", body.agentId) };
+    if (body?.agentId !== undefined && body.agentId !== caller) return { status: 403, body: reject("AGENT_MISMATCH", `authenticated as ${caller}, request names ${body.agentId}`) };
+    if (tx.agent_id !== caller) return { status: 403, body: reject("NOT_YOUR_TRANSACTION", caller) };
     if (tx.status === "settled" || tx.status === "released" || tx.status === "rejected" || tx.status === "refunded") return { status: 200, body: { status: tx.status, unchanged: true } };
     if (tx.scheme === "acp-delegated") {
       // A checkout has no seller receipt. Whatever the agent reports, only the payment provider decides.
@@ -321,20 +333,42 @@ export async function startGateway(cfg: GatewayConfig): Promise<GatewayHandle> {
     })).catch(() => { /* evidence sync is retried on the next status change */ });
   }
 
+  const agents = new AgentDirectory(cfg.agents ?? [], cfg.adminSecretHash);
+  const unauthenticated = (res: Parameters<typeof json>[0]) =>
+    json(res, 401, reject("AGENT_NOT_AUTHENTICATED", "present the secret enrolled for this agent (Authorization: Bearer)"), { "www-authenticate": "Bearer" });
+
   const srv = await serve(async (req, res) => {
     const u = new URL(req.url, "http://x");
+    if (req.method === "GET" && u.pathname === "/budget") {
+      const m = await loadMandate(u.searchParams.get("mandate") ?? "");
+      return "code" in m ? json(res, 403, m) : json(res, 200, budget(m));
+    }
+    const isRoute = (req.method === "POST" && (u.pathname === "/authorize" || u.pathname === "/reconcile" || /^\/transactions\/[^/]+\/(outcome|reconcile)$/.test(u.pathname)))
+      || (req.method === "GET" && /^\/transactions\/[^/]+$/.test(u.pathname));
+    if (!isRoute) return json(res, 404, { error: "not_found" });
+    const who: Principal | undefined = agents.authenticate(req.headers);
+    if (!who) return unauthenticated(res);
+    const agent = who.kind === "agent" ? who.agentId : undefined;
+
     if (req.method === "POST" && u.pathname === "/authorize") {
-      const out = await authorize(JSON.parse(req.body));
+      if (!agent) return unauthenticated(res);
+      const out = await authorize(JSON.parse(req.body || "null"), agent);
       return json(res, out.status, out.body);
     }
     const oc = u.pathname.match(/^\/transactions\/([^/]+)\/outcome$/);
-    if (req.method === "POST" && oc) { const out = await outcome(decodeURIComponent(oc[1]), JSON.parse(req.body)); return json(res, out.status, out.body); }
+    if (req.method === "POST" && oc) {
+      if (!agent) return unauthenticated(res);
+      const out = await outcome(decodeURIComponent(oc[1]), agent, JSON.parse(req.body || "{}"));
+      return json(res, out.status, out.body);
+    }
     const rc = u.pathname.match(/^\/transactions\/([^/]+)\/reconcile$/);
     if (req.method === "POST" && rc) {
+      if (!agent) return unauthenticated(res);
       const row = ledger.get(decodeURIComponent(rc[1]));
       if (!row) return json(res, 404, reject("UNKNOWN_TRANSACTION", rc[1]));
       const { agentId } = JSON.parse(req.body || "{}") as { agentId?: string };
-      if (row.agent_id !== agentId) return json(res, 403, reject("NOT_YOUR_TRANSACTION", String(agentId)));
+      if (agentId !== undefined && agentId !== agent) return json(res, 403, reject("AGENT_MISMATCH", `authenticated as ${agent}, request names ${agentId}`));
+      if (row.agent_id !== agent) return json(res, 403, reject("NOT_YOUR_TRANSACTION", agent));
       // Unresolved rows, plus settled checkout purchases (which can still be refunded). Nothing else moves.
       const open = UNRESOLVED.includes(row.status) || (row.status === "settled" && row.scheme === "acp-delegated");
       const status = open ? await reconcileOne(row) : row.status;
@@ -343,15 +377,14 @@ export async function startGateway(cfg: GatewayConfig): Promise<GatewayHandle> {
     }
     const tx = u.pathname.match(/^\/transactions\/([^/]+)$/);
     if (req.method === "GET" && tx) {
+      // The row holds the signed authorization, from which the signer would replay the credential
+      // to its agent; only that agent (or the operator) may read it.
       const row = ledger.get(decodeURIComponent(tx[1]));
+      if (row && agent && row.agent_id !== agent) return json(res, 403, reject("NOT_YOUR_TRANSACTION", agent));
       return row ? json(res, 200, { ...row, events: ledger.events(row.tx_id) }) : json(res, 404, { error: "not_found" });
     }
     if (req.method === "POST" && u.pathname === "/reconcile") return json(res, 200, { results: await reconcile() });
-    if (req.method === "GET" && u.pathname === "/budget") {
-      const m = await loadMandate(u.searchParams.get("mandate") ?? "");
-      return "code" in m ? json(res, 403, m) : json(res, 200, budget(m));
-    }
     json(res, 404, { error: "not_found" });
   });
-  return Object.assign(srv, { key, ledger, reconcile, setPayer: (a: string) => { cfg.payers.x402 = a; } });
+  return Object.assign(srv, { key, ledger, reconcile, setPayer: (a: string) => { cfg.payers.x402 = a; }, enrollAgent: (id: string, h: string) => agents.enroll(id, h) });
 }

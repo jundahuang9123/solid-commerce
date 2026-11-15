@@ -19,7 +19,7 @@
  * delegated token minted for an authorization was charged or refunded.
  */
 import type { SpendingMandate } from "../model.js";
-import type { PaymentOption } from "../payments/types.js";
+import type { PaymentOption, X402Terms } from "../payments/types.js";
 import type { TrustRegistry } from "../trust/registry.js";
 import type { PodClient } from "../pod/PodClient.js";
 import type { PodLayout } from "../pod/layout.js";
@@ -32,8 +32,11 @@ import {
 /** What the agent says it is paying for. Only the identifiers are taken from it; every term is re-read from the merchant. */
 export interface CheckoutClaim { merchant: string; sessionId: string; lineItems: Array<{ id: string; quantity: number }> }
 
-/** The scheme-neutral facts an authorization is bound to. */
-export interface Binding { seller: string; offerId: string; offerVersion: number; offerDigest: string; resource: string; railReference?: string }
+/**
+ * The scheme-neutral facts an authorization is bound to. `railReference` is derived by the gateway
+ * from the challenge or session it checked (x402 adds its nonce once the authorization id exists).
+ */
+export interface Binding { seller: string; offerId: string; offerVersion: number; offerDigest: string; resource: string; railReference?: string; x402?: X402Terms }
 
 export type BindResult = { ok: true; binding: Binding } | { ok: false; status: number; code: string; reason: string };
 
@@ -87,6 +90,7 @@ export async function bindCheckout(deps: { registry: TrustRegistry; pod: PodClie
   }
   const expected: CheckoutChallenge = { checkout_session_id: s.id, merchant_id: merchant.merchantId, provider: merchant.paymentProvider, snapshot_digest: digest };
   if (o.payTo !== merchant.merchantId || o.resource !== url || canonicalJson(ch) !== canonicalJson(expected)) return no(409, "CHECKOUT_MISMATCH", "payee, resource or challenge does not match the merchant's session");
+  if (o.railReference !== undefined && o.railReference !== s.id) return no(409, "RAIL_REFERENCE_MISMATCH", "the option names a different checkout session than its challenge");
   return { ok: true, binding: { seller: merchant.webId, offerId: url, offerVersion: 0, offerDigest: digest, resource: url, railReference: s.id } };
 }
 

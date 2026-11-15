@@ -21,8 +21,10 @@
  *     one exception: a payment never delivered because the upstream refused its
  *     target outright (e.g. 404) may move to another target of the same resource.
  *   - Re-presenting a settled credential never settles again. For a safe request
- *     (GET) it re-delivers; for any other method one payment buys one delivery,
- *     after which the credential is consumed (SettlementBook.tryStartDelivery).
+ *     (GET) it re-delivers; for any other method one payment buys one request,
+ *     identified by the buyer's Idempotency-Key and a digest of its body: a
+ *     retry may repeat that request (after a delivery it gets the stored answer),
+ *     never send another one (SettlementBook.tryStartDelivery).
  *     Concurrent presentations of one x402 credential are serialised, so there
  *     is at most one verify/settle in flight per credential.
  *   - A settlement whose outcome is unknown keeps its claim, so a retry with
@@ -115,10 +117,23 @@ const ELSEWHERE = "elsewhere";
  * card stay bound to their resource, but the target bindings are forgotten and
  * x402 falls back to its unsigned resource field. Persist this to make the
  * binding durable.
+ *
+ * The same holds for deliveries, and that matters most for non-GET routes:
+ * after a restart a credential whose one POST was already delivered (or whose
+ * request was bound to one Idempotency-Key and body) is unknown here, so it
+ * can deliver ONE more request, with any key and body. Only a persistent book
+ * (written before forwarding) closes that; this prototype does not have one.
  */
+/** The one request a payment on a non-repeatable route may deliver: its Idempotency-Key and a digest of method, target, content type and body. */
+export interface RequestClaim { idempotencyKey: string; digest: string }
+/** A delivered answer kept to replay to an identical retry of a non-repeatable request. */
+export interface StoredResponse { status: number; headers: Record<string, string | string[]>; body: Buffer }
+interface DeliveryState { inFlight: number; delivered: boolean; refused: boolean; request?: RequestClaim; response?: StoredResponse }
+export type DeliveryStart = "started" | "consumed" | "busy" | "conflict" | "replay";
+
 export class SettlementBook {
   private entries = new Map<string, Settlement>();
-  private deliveries = new Map<string, { inFlight: number; delivered: boolean; refused: boolean }>();
+  private deliveries = new Map<string, DeliveryState>();
   get(key: string) { return this.entries.get(key); }
 
   /**
@@ -135,7 +150,8 @@ export class SettlementBook {
     if (!e) return undefined;
     if (sameBinding(e.binding, binding)) return e;
     const d = this.deliveries.get(key);
-    if (e.settledAt && e.binding.resource === binding.resource && d && d.refused && !d.delivered && d.inFlight === 0) {
+    // Not for a payment bound to one request (non-repeatable routes): that request is fixed, target included.
+    if (e.settledAt && e.binding.resource === binding.resource && d && d.refused && !d.delivered && d.inFlight === 0 && !d.request) {
       e.binding = { ...binding };
       d.refused = false;
       return e;
@@ -171,23 +187,38 @@ export class SettlementBook {
   }
   /**
    * Start a delivery for a payment. A repeatable (safe, e.g. GET) request may re-deliver any number
-   * of times. A request that is not (e.g. POST, whose body the buyer chooses each time) gets one
-   * delivery per payment: once one delivered, the payment is "consumed", and while one is in flight
-   * another is "busy", since it may yet deliver. A transient failure that delivered nothing leaves
-   * the payment usable, so the buyer can retry with the same credential.
+   * of times. A request that is not (e.g. POST, whose body the buyer chooses each time) is bound, on
+   * its first presentation, to ONE request: its Idempotency-Key and the digest of its body (`request`).
+   * From then on the payment serves only that request:
+   *   - a different key or body: "conflict" while nothing was delivered, "consumed" once something was;
+   *   - the same request while one is in flight: "busy";
+   *   - the same request after a delivery: "replay" (the stored answer, without asking the upstream again);
+   *   - the same request after a transient failure or a refusal: "started" again. The upstream sees
+   *     the same Idempotency-Key, so an upstream that did the work before timing out can recognise
+   *     the retry; one that ignores the key may do the same work twice, but never a different job.
    */
-  tryStartDelivery(key: string, repeatable: boolean): "started" | "consumed" | "busy" {
-    const d = this.deliveries.get(key);
-    if (!repeatable && d?.delivered) return "consumed";
-    if (!repeatable && d && d.inFlight > 0) return "busy";
+  tryStartDelivery(key: string, repeatable: boolean, request?: RequestClaim): DeliveryStart {
+    let d = this.deliveries.get(key);
+    if (!repeatable) {
+      if (!request) return d?.delivered ? "consumed" : "conflict";
+      if (d?.request && (d.request.idempotencyKey !== request.idempotencyKey || d.request.digest !== request.digest)) return d.delivered ? "consumed" : "conflict";
+      if (d?.delivered) return d.response && d.request ? "replay" : "consumed";
+      if (d && d.inFlight > 0) return "busy";
+      d ??= { inFlight: 0, delivered: false, refused: false };
+      d.request ??= { ...request };
+      this.deliveries.set(key, d);
+    }
     this.deliveryStarted(key);
     return "started";
   }
-  deliveryEnded(key: string, outcome: DeliveryOutcome) {
+  /** The answer stored for the one request a non-repeatable payment delivered. */
+  storedResponse(key: string): StoredResponse | undefined { return this.deliveries.get(key)?.response; }
+  /** `response`: the delivered answer of a non-repeatable request, kept for replay to an identical retry. */
+  deliveryEnded(key: string, outcome: DeliveryOutcome, response?: StoredResponse) {
     const d = this.deliveries.get(key);
     if (!d) return;
     d.inFlight--;
-    if (outcome === "delivered") d.delivered = true;
+    if (outcome === "delivered") { d.delivered = true; if (response && d.request && !d.response) d.response = response; }
     d.refused = outcome === "refused" && !d.delivered;
   }
   get size() { return [...this.entries.values()].filter((e) => e.settledAt).length; }

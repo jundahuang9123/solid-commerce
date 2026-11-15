@@ -36,7 +36,39 @@ export class Ledger {
       CREATE INDEX IF NOT EXISTS tx_mandate ON transactions(mandate_id, status);
       CREATE TABLE IF NOT EXISTS events (
         id INTEGER PRIMARY KEY AUTOINCREMENT, tx_id TEXT NOT NULL, at TEXT NOT NULL, type TEXT NOT NULL, detail TEXT
+      );
+      CREATE TABLE IF NOT EXISTS mandate_revisions (
+        mandate_id TEXT PRIMARY KEY, revision INTEGER NOT NULL, terms_digest TEXT NOT NULL, seen_at TEXT NOT NULL
       );`);
+  }
+
+  /**
+   * High-water mark of user-signed mandate revisions. Every revision the gateway has verified is
+   * recorded here; a revision below the highest one seen, or a different signed text at the same
+   * revision, is refused. This stops an agent with Pod write access from putting back an older
+   * signed revision (a higher limit the user has since lowered) once the gateway has seen the newer one.
+   *
+   * It cannot catch a rollback to a revision the gateway never saw superseded: if the agent restores
+   * r1 before the gateway ever read r2, r1 is still the highest revision known here. Closing that
+   * needs the user's device to tell the gateway (or a user-signed revision index somewhere agents
+   * cannot write). It is also only as durable as this database: with the default ":memory:" ledger,
+   * a gateway restart forgets every mark.
+   */
+  observeRevision(mandateId: string, revision: number, termsDigest: string): { ok: true } | { ok: false; code: string; reason: string } {
+    return this.immediate(() => {
+      const row = this.revisionOf(mandateId);
+      if (row && revision < row.revision) return { ok: false as const, code: "MANDATE_SUPERSEDED", reason: `revision ${revision} was superseded by revision ${row.revision}` };
+      if (row && revision === row.revision && termsDigest !== row.terms_digest) return { ok: false as const, code: "MANDATE_REVISION_CONFLICT", reason: `a different signed text of revision ${revision} was seen before` };
+      if (!row || revision > row.revision) {
+        this.db.prepare("INSERT INTO mandate_revisions (mandate_id, revision, terms_digest, seen_at) VALUES (?, ?, ?, ?) ON CONFLICT(mandate_id) DO UPDATE SET revision = excluded.revision, terms_digest = excluded.terms_digest, seen_at = excluded.seen_at")
+          .run(mandateId, revision, termsDigest, new Date().toISOString());
+      }
+      return { ok: true as const };
+    });
+  }
+
+  revisionOf(mandateId: string): { revision: number; terms_digest: string } | undefined {
+    return this.db.prepare("SELECT revision, terms_digest FROM mandate_revisions WHERE mandate_id = ?").get(mandateId) as { revision: number; terms_digest: string } | undefined;
   }
 
   /** Run fn inside a write-locked transaction. */

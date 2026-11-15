@@ -24,6 +24,9 @@ export interface PaymentCredential {
   payer?: string;
 }
 
+/** x402 terms an authorization pins: CAIP-2 network, checksummed token address and its EIP-712 domain. */
+export interface X402Terms { network: string; asset: string; domainName: string; domainVersion: string }
+
 /** Gateway-issued, signed, single-purpose authorization to pay. */
 export interface PaymentAuthorization {
   authId: string;
@@ -40,6 +43,16 @@ export interface PaymentAuthorization {
   currency: string;
   payTo: string;
   challengeDigest: string;
+  /**
+   * The payment's identity on its rail, derived by the GATEWAY from the challenge it binds (never
+   * taken from the agent): x402 EIP-3009 nonce, L402 payment hash, card intent id, checkout session
+   * id. The ledger reconciles against it, and the signer refuses a challenge whose own reference
+   * differs, so reconciliation always asks the rail about the payment that was actually made.
+   * Optional in the type only for authorizations issued before it existed; the signer requires it.
+   */
+  railReference?: string;
+  /** x402 only: the chain, token contract and EIP-712 domain the signer may sign for (from the signed offer). */
+  x402?: X402Terms;
   issuedAt: string;
   expiresAt: string;
 }

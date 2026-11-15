@@ -23,8 +23,22 @@
  *   any other 3xx/4xx           the upstream's own answer, relayed unchanged with no
  *                               receipt and an sc-payment-outcome header (paid, not
  *                               delivered). The answer is deterministic, so retrying is
- *                               pointless; instead the payment may be presented once for
+ *                               pointless; instead a GET payment may be presented once for
  *                               another target of the same resource (see SettlementBook.lookup)
+ *
+ * Non-GET paid routes (a POST runs a job the buyer chooses with its body) need an
+ * Idempotency-Key header on the paid request; without one a credential is refused with
+ * 400 before any money moves. The first paid presentation binds the payment to that key
+ * and a digest of method, target, content type and body. After that:
+ *   same key and body           a retry of the same request: forwarded again (with the same
+ *                               Idempotency-Key, so the upstream can recognise it) after a
+ *                               transient failure or refusal, or answered from the stored
+ *                               response once delivered, without asking the upstream again
+ *   other key or body           409 idempotency_conflict before a delivery, 402
+ *                               credential_consumed after it. Never forwarded.
+ * Limits: an upstream that ignores Idempotency-Key may run the SAME job twice when it did the
+ * work and then timed out or failed; and the binding is in memory, so after a proxy restart a
+ * consumed POST credential can deliver one more request (see SettlementBook).
  */
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -37,7 +51,8 @@ import { offerToTurtle } from "../rdf/records.js";
 import { RECEIPT_HEADER, type Receipt } from "../payments/types.js";
 import { DEFAULT_NETWORK, DEFAULT_USDC } from "../payments/schemes/x402.js";
 import {
-  PaymentAcceptor, priceOptionsFor, type Acceptance, type DeliveryOutcome, type Payees, type RailUrls, type SchemePrices, type Settlement, type X402Asset,
+  isPaymentAuthorization, PAYMENT_HEADERS, PaymentAcceptor, priceOptionsFor,
+  type Acceptance, type DeliveryOutcome, type Payees, type RailUrls, type RequestClaim, type SchemePrices, type Settlement, type X402Asset,
 } from "../payments/serverSide.js";
 import { forward, readRawBody, type UpstreamResponse } from "./forward.js";
 import { matchRequest, RESERVED, validateRoutes, type PaidRoute } from "./routes.js";
@@ -52,6 +67,14 @@ const RETRYABLE_4XX = new Set([408, 425, 429]);
  * HEAD never reaches a paid route (routes.ts refuses it).
  */
 const SAFE_METHODS = new Set(["GET", "HEAD"]);
+/** The buyer's key for one paid non-GET request (draft-ietf-httpapi-idempotency-key-header). */
+export const IDEMPOTENCY_HEADER = "idempotency-key";
+const IDEMPOTENCY_KEY = /^[\x21-\x7e]{1,255}$/;
+/** Set on an answer replayed from the stored response of an already delivered non-GET request. */
+export const REPLAY_HEADER = "sc-idempotent-replay";
+const singleHeader = (v: string | string[] | undefined) => (Array.isArray(v) ? (v.length === 1 ? v[0] : undefined) : v);
+const hasPaymentCredential = (h: IncomingMessage["headers"]) =>
+  PAYMENT_HEADERS.some((n) => h[n] !== undefined) || isPaymentAuthorization(String(h.authorization ?? ""));
 
 function outcomeOf(up: UpstreamResponse | undefined): DeliveryOutcome {
   if (!up || up.status >= 500 || RETRYABLE_4XX.has(up.status)) return "transient";
@@ -186,34 +209,54 @@ export async function startPaymentProxy(cfg: PaymentProxyConfig, port = 0, host 
 
   async function paid(req: IncomingMessage, res: ServerResponse, body: Buffer, st: RouteState, method: string, pathAndQuery: string, target: string) {
     const o = current(st).payload;
+    const repeatable = SAFE_METHODS.has(method);
+    // A non-repeatable request is bound to its Idempotency-Key and body. Checked before the
+    // credential is looked at, so a request that would be refused never settles a payment.
+    let request: RequestClaim | undefined;
+    if (!repeatable) {
+      const idem = singleHeader(req.headers[IDEMPOTENCY_HEADER]);
+      if (!idem || !IDEMPOTENCY_KEY.test(idem)) {
+        if (!hasPaymentCredential(req.headers)) return challenge(res, st, o, undefined, repeatable);
+        return send(res, 400, { error: "idempotency_key_required", reason: `a paid ${method} needs an ${IDEMPOTENCY_HEADER} header (1-255 visible ASCII characters); a retry must repeat the same request with the same key` });
+      }
+      const contentType = singleHeader(req.headers["content-type"]) ?? "";
+      request = { idempotencyKey: idem, digest: sha256Hex(Buffer.concat([Buffer.from(`${target}\n${contentType}\n`), body])) };
+    }
     const a: Acceptance = await acceptor.accept(req.headers, o, { resource: o.resource, target });
     switch (a.kind) {
-      case "none": return challenge(res, st, o);
-      case "rejected": return a.status === 402 ? challenge(res, st, o, a.reason) : send(res, 400, { error: a.reason });
+      case "none": return challenge(res, st, o, undefined, repeatable);
+      case "rejected": return a.status === 402 ? challenge(res, st, o, a.reason, repeatable) : send(res, 400, { error: a.reason });
       case "failed": return send(res, a.status, a.body);
       case "paid": {
         // Checked and started with no await in between, so concurrent requests cannot both pass.
-        const start = acceptor.book.tryStartDelivery(a.settlement.key, SAFE_METHODS.has(method));
-        if (start === "consumed") return challenge(res, st, o, "credential_consumed");
+        const start = acceptor.book.tryStartDelivery(a.settlement.key, repeatable, request);
+        if (start === "consumed") return challenge(res, st, o, "credential_consumed", repeatable);
+        if (start === "conflict") return send(res, 409, { error: "idempotency_conflict", paid: true, reason: "this payment is bound to another request (Idempotency-Key and body); repeat that request exactly" }, a.responseHeaders);
         if (start === "busy") return send(res, 409, { error: "delivery_in_progress", paid: true, retry: "re-present the same payment credential once the request in flight has answered" }, a.responseHeaders);
-        return deliver(req, res, body, pathAndQuery, a.settlement, a.responseHeaders);
+        if (start === "replay") {
+          const stored = acceptor.book.storedResponse(a.settlement.key)!;
+          res.writeHead(stored.status, { ...stored.headers, [REPLAY_HEADER]: "true" });
+          return res.end(stored.body);
+        }
+        return deliver(req, res, body, pathAndQuery, a.settlement, a.responseHeaders, repeatable);
       }
     }
   }
 
-  async function challenge(res: ServerResponse, st: RouteState, o: Offer, error?: string) {
+  async function challenge(res: ServerResponse, st: RouteState, o: Offer, error?: string, repeatable = true) {
     const c = await acceptor.challenge(o, st.route.description, error);
-    send(res, 402, c.body, c.headers);
+    const note = repeatable ? {} : { idempotencyKey: `required: send the paid request with an ${IDEMPOTENCY_HEADER} header; the payment then serves that one request` };
+    send(res, 402, { ...c.body, ...note }, c.headers);
   }
 
-  async function deliver(req: IncomingMessage, res: ServerResponse, body: Buffer, pathAndQuery: string, s: Settlement, paymentHeaders: Record<string, string>) {
+  async function deliver(req: IncomingMessage, res: ServerResponse, body: Buffer, pathAndQuery: string, s: Settlement, paymentHeaders: Record<string, string>, repeatable: boolean) {
     // Started (by the caller, via tryStartDelivery) before the first await: while it runs, the
     // payment cannot move to another target, nor deliver a second non-repeatable request.
     let up: UpstreamResponse | undefined;
     try { up = await forward(req, body, { upstreamBase: cfg.upstream, pathAndQuery, publicUrl, paidRoute: true, paymentReference: `${s.scheme}:${s.railReference}`, timeoutMs }); }
     catch { up = undefined; }
     const outcome = outcomeOf(up);
-    acceptor.book.deliveryEnded(s.key, outcome);
+    if (outcome !== "delivered" || !up) acceptor.book.deliveryEnded(s.key, outcome);
     // Never charge again after this point, and say what happened in a way a client can act on.
     if (outcome === "transient" || !up) {
       return send(res, 502, { error: "upstream_unavailable", paid: true, upstreamStatus: up?.status ?? null, railReference: s.railReference, retry: "re-present the same payment credential" }, paymentHeaders);
@@ -233,7 +276,10 @@ export async function startPaymentProxy(cfg: PaymentProxyConfig, port = 0, host 
       contentDigest: "sha-256:" + sha256Hex(up.body), deliveredAt: new Date().toISOString(),
     } satisfies Receipt);
     deliveries++;
-    res.writeHead(up.status, { "content-type": "application/octet-stream", ...up.headers, [RECEIPT_HEADER]: b64json.encode(receipt), ...paymentHeaders });
+    const headers = { "content-type": "application/octet-stream", ...up.headers, [RECEIPT_HEADER]: b64json.encode(receipt), ...paymentHeaders };
+    // Recorded before the answer is written: an identical retry gets this very answer and receipt.
+    acceptor.book.deliveryEnded(s.key, "delivered", repeatable ? undefined : { status: up.status, headers, body: up.body });
+    res.writeHead(up.status, headers);
     res.end(up.body);
   }
 

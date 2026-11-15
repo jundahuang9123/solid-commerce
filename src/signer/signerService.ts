@@ -7,8 +7,20 @@
  *     the card token itself is only ever sent to the PSP
  *
  * It pays ONLY when given an authorization signed by the gateway that matches
- * the exact challenge. It is idempotent per authorization id: a retry gets the
- * same credential, and no second payment is made. Agents never see any secret.
+ * the exact challenge, and only for the agent the authorization names: callers
+ * authenticate with the per-agent secret enrolled at setup (src/trust/agentAuth.ts),
+ * and a credential, new or replayed, is returned only to that agent. It is
+ * idempotent per authorization id: a retry gets the same credential, and no
+ * second payment is made. Agents never see any secret of the vault.
+ *
+ * Each payer also checks the challenge against what the gateway bound into
+ * the authorization beyond the challenge digest: the rail reference the
+ * gateway reconciles against, and for x402 the chain, token and EIP-712 domain.
+ *
+ * The idempotency state (`done`) is in memory: after a restart the signer
+ * would try to pay an unexpired authorization again (the rails' own
+ * idempotency, i.e. the x402 nonce, the already-paid L402 invoice and the PSP
+ * idempotency key, still stops a second transfer for the same authorization).
  */
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import type { Hex } from "viem";
@@ -20,6 +32,7 @@ import { createL402Payment } from "../payments/schemes/l402.js";
 import { createCardPayment } from "../payments/schemes/cardPsp.js";
 import { createDelegatedPayment } from "./delegatedPayment.js";
 import type { DelegatedCredential } from "../checkout/acp.js";
+import { AgentDirectory, type AgentEnrollment } from "../trust/agentAuth.js";
 
 type Credential = PaymentCredential | DelegatedCredential;
 
@@ -28,9 +41,15 @@ export interface SignerConfig {
   evmPrivateKey?: Hex;
   lightning?: { url: string; accountToken: string };
   card?: { token: string; allowedProviders: string[] };
+  /** Agents allowed to call /pay, with the hash of each one's secret (more can be enrolled later). */
+  agents?: AgentEnrollment[];
 }
 
-export interface SignerHandle extends RunningServer { evmAddress: string; lightningAccount?: string; payments: number }
+export interface SignerHandle extends RunningServer {
+  evmAddress: string; lightningAccount?: string; payments: number;
+  /** Enroll an agent's secret (its hash, see secretHash); only enrolled agents can obtain credentials. */
+  enrollAgent(agentId: string, secretHash: string): void;
+}
 
 export async function startSigner(cfg: SignerConfig): Promise<SignerHandle> {
   const evmKey = cfg.evmPrivateKey ?? generatePrivateKey();
@@ -38,6 +57,7 @@ export async function startSigner(cfg: SignerConfig): Promise<SignerHandle> {
   const done = new Map<string, { challengeDigest: string; credential: Credential }>();
   const inFlight = new Map<string, Promise<Credential>>();
   let payments = 0;
+  const agents = new AgentDirectory(cfg.agents ?? []);
 
   const srv = await serve(async (req, res) => {
     const u = new URL(req.url, "http://x");
@@ -46,9 +66,14 @@ export async function startSigner(cfg: SignerConfig): Promise<SignerHandle> {
     }
     if (req.method !== "POST" || u.pathname !== "/pay") return json(res, 404, { error: "not_found" });
 
+    const caller = agents.authenticate(req.headers);
+    if (caller?.kind !== "agent") return json(res, 401, { error: "AGENT_NOT_AUTHENTICATED", reason: "present the agent secret enrolled with this signer" }, { "www-authenticate": "Bearer" });
     const { authorization, challenge } = JSON.parse(req.body) as { authorization: Signed<PaymentAuthorization>; challenge: unknown };
-    if (!verifyEnvelope(authorization, cfg.gatewayPublicJwk)) return json(res, 401, { error: "AUTHORIZATION_INVALID", reason: "not signed by the gateway" });
+    if (!authorization?.payload || !verifyEnvelope(authorization, cfg.gatewayPublicJwk)) return json(res, 401, { error: "AUTHORIZATION_INVALID", reason: "not signed by the gateway" });
     const a = authorization.payload;
+    // A credential is a bearer instrument at the seller: hand it only to the agent it was authorized for.
+    if (a.agentId !== caller.agentId) return json(res, 403, { error: "NOT_YOUR_AUTHORIZATION", reason: "the authorization names another agent" });
+    if (!a.railReference) return json(res, 409, { error: "AUTHORIZATION_INCOMPLETE", reason: "the authorization names no rail reference" });
     const challengeDigest = digestOf(challenge);
     if (challengeDigest !== a.challengeDigest) return json(res, 409, { error: "CHALLENGE_MISMATCH", reason: "challenge differs from the one the gateway authorized" });
 
@@ -80,7 +105,7 @@ export async function startSigner(cfg: SignerConfig): Promise<SignerHandle> {
       inFlight.delete(a.authId);
     }
   });
-  return Object.defineProperties(Object.assign(srv, { evmAddress, lightningAccount: cfg.lightning?.accountToken }), {
+  return Object.defineProperties(Object.assign(srv, { evmAddress, lightningAccount: cfg.lightning?.accountToken, enrollAgent: (id: string, h: string) => agents.enroll(id, h) }), {
     payments: { get: () => payments, enumerable: true },
   }) as SignerHandle;
 }

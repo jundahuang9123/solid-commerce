@@ -24,6 +24,7 @@ import { RECEIPT_HEADER, type PaymentCredential, type PaymentOption, type Receip
 import { evaluateOffers, type Evaluated } from "./ranking.js";
 import { checkDelivery } from "./delivery.js";
 import { b64json, postJson } from "../util/http.js";
+import { bearerHeaders } from "../trust/agentAuth.js";
 import { newId, type Signed } from "../util/crypto.js";
 import { fmt } from "../util/money.js";
 import type { WalletDescriptor } from "../pod/wallet.js";
@@ -42,6 +43,11 @@ export interface PreparedPurchase {
 
 export interface AssistantConfig {
   agentId: string;
+  /**
+   * This agent's secret for the gateway and the signer (src/trust/agentAuth.ts), issued at setup.
+   * Held in memory only, never written to the Pod. Without it the gateway and signer refuse to act.
+   */
+  agentSecret?: string;
   pod: PodClient;
   layout: PodLayout;
   interpreter: Interpreter;
@@ -172,7 +178,7 @@ export class ShoppingAssistant {
       if (!option) return this.finish(evidence, { ...base, status: "blocked", code: "NO_PAYABLE_OPTION", reason: "402 offers no scheme the mandate and wallet allow" });
 
       // 4. Gateway authorization (budget reservation)
-      const auth = await postJson(`${this.cfg.gatewayUrl}/authorize`, { transactionId: txId, agentId: this.cfg.agentId, mandateId: mandate.id, offer: best.signed, offerRef: challenge.offer, option });
+      const auth = await postJson(`${this.cfg.gatewayUrl}/authorize`, { transactionId: txId, agentId: this.cfg.agentId, mandateId: mandate.id, offer: best.signed, offerRef: challenge.offer, option }, bearerHeaders(this.cfg.agentSecret));
       if (auth.status === 409 && /OFFER_(CHANGED|MISMATCH)/.test(auth.body?.code)) {
         notes.push(`Gateway: ${auth.body.code}: ${auth.body.reason}; re-validating`);
         ranked = await rank(); evidence.evaluations = ranked.map((r) => r.evaluation); base.evaluations = evidence.evaluations;
@@ -187,9 +193,9 @@ export class ShoppingAssistant {
       Object.assign(evidence, { scheme: option.scheme, amount: option.amount, currency: option.currency, ledgerDoc: `${this.cfg.layout.transactions}${txId}-ledger.ttl`, challenge: option.challenge });
 
       // 5. Protected signer creates the payment credential
-      const pay = await postJson(`${wallet.signerEndpoint}/pay`, { authorization, challenge: option.challenge });
+      const pay = await postJson(`${wallet.signerEndpoint}/pay`, { authorization, challenge: option.challenge }, bearerHeaders(this.cfg.agentSecret));
       if (pay.status !== 200) {
-        await postJson(`${this.cfg.gatewayUrl}/transactions/${txId}/outcome`, { agentId: this.cfg.agentId, result: "payment_failed", detail: pay.body?.reason });
+        await postJson(`${this.cfg.gatewayUrl}/transactions/${txId}/outcome`, { agentId: this.cfg.agentId, result: "payment_failed", detail: pay.body?.reason }, bearerHeaders(this.cfg.agentSecret));
         return this.finish(evidence, { ...base, status: "payment_failed", transactionId: txId, code: pay.body?.error, reason: pay.body?.reason });
       }
       const credential: PaymentCredential = pay.body.credential;
@@ -213,7 +219,7 @@ export class ShoppingAssistant {
     }
     const common = { ...base, transactionId: txId, selected: offer, amount: option.amount, currency: option.currency, scheme: option.scheme };
     if (!res || res.status !== 200) {
-      const out = await postJson(`${this.cfg.gatewayUrl}/transactions/${txId}/outcome`, { agentId: this.cfg.agentId, result: "unknown", detail: `delivery failed: ${res?.status ?? "network"}` });
+      const out = await postJson(`${this.cfg.gatewayUrl}/transactions/${txId}/outcome`, { agentId: this.cfg.agentId, result: "unknown", detail: `delivery failed: ${res?.status ?? "network"}` }, bearerHeaders(this.cfg.agentSecret));
       const paid = out.body?.status === "settled";
       const delivery = { status: "NotDelivered" as const, checks: [paid ? "payment settled on the rail; content not delivered (recoverable: re-present the same credential)" : "payment not confirmed; reservation held until reconciled"] };
       evidence.delivery = delivery;
@@ -224,7 +230,7 @@ export class ShoppingAssistant {
     const receipt: Signed<Receipt> | undefined = rh ? b64json.decode(rh) : undefined;
     const check = checkDelivery(body, receipt?.payload, requirements, subject);
     this.log(`Delivered; checks: ${check.checks.join("; ")}`);
-    const out = await postJson(`${this.cfg.gatewayUrl}/transactions/${txId}/outcome`, { agentId: this.cfg.agentId, result: "paid", receipt });
+    const out = await postJson(`${this.cfg.gatewayUrl}/transactions/${txId}/outcome`, { agentId: this.cfg.agentId, result: "paid", receipt }, bearerHeaders(this.cfg.agentSecret));
     if (out.status !== 200) base.notes.push(`Gateway did not accept receipt: ${out.body?.reason}`);
     evidence.receipt = receipt;
     evidence.delivery = check;
@@ -234,7 +240,9 @@ export class ShoppingAssistant {
   /** Recover a paid-but-undelivered purchase: ask the signer for the SAME credential (idempotent) and re-fetch. */
   async recoverDelivery(prev: PurchaseResult, requirements: any[] = []): Promise<PurchaseResult> {
     if (!prev.transactionId || !prev.selected) throw new Error("nothing to recover");
-    const tx = await (await fetch(`${this.cfg.gatewayUrl}/transactions/${prev.transactionId}`)).json() as { auth_json: string };
+    const txRes = await fetch(`${this.cfg.gatewayUrl}/transactions/${encodeURIComponent(prev.transactionId)}`, { headers: bearerHeaders(this.cfg.agentSecret) });
+    if (!txRes.ok) throw new Error(`gateway: ${txRes.status} reading transaction ${prev.transactionId}`);
+    const tx = await txRes.json() as { auth_json: string };
     const evDoc = `${this.cfg.layout.transactions}${prev.transactionId}.ttl`;
     const evRes = await this.cfg.pod.get(evDoc);
     if (!evRes) throw new Error(`no evidence for ${prev.transactionId}`);
@@ -243,7 +251,7 @@ export class ShoppingAssistant {
     if (!challengeLit) throw new Error("evidence has no payment challenge");
     const challenge = JSON.parse(challengeLit.value);
     const wallet = await readWallet(this.cfg.pod, this.cfg.layout.wallet);
-    const pay = await postJson(`${wallet.signerEndpoint}/pay`, { authorization: JSON.parse(tx.auth_json), challenge });
+    const pay = await postJson(`${wallet.signerEndpoint}/pay`, { authorization: JSON.parse(tx.auth_json), challenge }, bearerHeaders(this.cfg.agentSecret));
     if (pay.status !== 200) throw new Error(`signer: ${pay.body?.error} ${pay.body?.reason}`);
     if (!pay.body.replayed) throw new Error("signer made a NEW payment during recovery");
     const option = { scheme: prev.scheme, amount: prev.amount, currency: prev.currency, challenge } as PaymentOption;

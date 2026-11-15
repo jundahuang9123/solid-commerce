@@ -64,9 +64,9 @@ async function quote(e: CheckoutEnvironment, merchant: AcpMerchantHandle) {
 }
 
 const authorize = (e: CheckoutEnvironment, txId: string, m: SpendingMandate, q: { claim: unknown; option: unknown }) =>
-  postJson(`${e.gateway.url}/authorize`, { transactionId: txId, agentId: AGENT_1, mandateId: m.id, checkout: q.claim, option: q.option });
+  postJson(`${e.gateway.url}/authorize`, { transactionId: txId, agentId: AGENT_1, mandateId: m.id, checkout: q.claim, option: q.option }, e.agentHeaders(AGENT_1));
 const budget = async (e: CheckoutEnvironment, m: SpendingMandate) => (await (await fetch(`${e.gateway.url}/budget?mandate=${encodeURIComponent(m.id)}`)).json()) as { settled: string; committed: string; available: string };
-const tx = async (e: CheckoutEnvironment, id: string) => (await (await fetch(`${e.gateway.url}/transactions/${id}`)).json()) as any;
+const tx = async (e: CheckoutEnvironment, id: string) => (await (await fetch(`${e.gateway.url}/transactions/${id}`, { headers: e.adminHeaders })).json()) as any;
 const charge = (e: CheckoutEnvironment, key: string, body: object, idem = "c-" + Math.random()) =>
   postJson(`${e.rails.psp.url}/agentic_commerce/charges`, body, { authorization: `Bearer ${key}`, "idempotency-key": idem });
 
@@ -74,7 +74,7 @@ const charge = (e: CheckoutEnvironment, key: string, body: object, idem = "c-" +
 async function authorizeAndPay(e: CheckoutEnvironment, m: SpendingMandate, q: Awaited<ReturnType<typeof quote>>, txId = "tx-" + Math.random()) {
   const a = await authorize(e, txId, m, q);
   assert.equal(a.status, 200, JSON.stringify(a.body));
-  const p = await postJson(`${e.signer.url}/pay`, { authorization: a.body.authorization, challenge: q.option.challenge });
+  const p = await postJson(`${e.signer.url}/pay`, { authorization: a.body.authorization, challenge: q.option.challenge }, e.agentHeaders(AGENT_1));
   assert.equal(p.status, 200, JSON.stringify(p.body));
   return { txId, authId: a.body.authorization.payload.authId as string, credential: p.body.credential };
 }
@@ -189,7 +189,7 @@ describe("ACP-style checkout (physical goods)", () => {
     const q = await quote(e, e.merchants.sohle);
     const a = await authorize(e, "tx-token", m, q);
     assert.equal(a.status, 200, JSON.stringify(a.body));
-    const pay = () => postJson(`${e.signer.url}/pay`, { authorization: a.body.authorization, challenge: q.option.challenge });
+    const pay = () => postJson(`${e.signer.url}/pay`, { authorization: a.body.authorization, challenge: q.option.challenge }, e.agentHeaders(AGENT_1));
     const [p1, p2] = await Promise.all([pay(), pay()]);
     assert.equal(p1.body.credential.token, p2.body.credential.token, "one token per authorization");
     assert.equal(e.signer.payments, 1);
@@ -256,14 +256,14 @@ describe("ACP-style checkout (physical goods)", () => {
     assert.equal(r.tracking, undefined, "no order: a payment failure, not a delivery problem");
     assert.equal((await tx(e, r.transactionId!)).status, "pending");
     assert.equal((await budget(e, m)).committed, "9490", "held while the token could still be charged");
-    await postJson(`${e.gateway.url}/reconcile`, {});
+    await postJson(`${e.gateway.url}/reconcile`, {}, e.adminHeaders);
     assert.equal((await budget(e, m)).committed, "9490", "the agent's report alone releases nothing");
 
     await new Promise((res) => setTimeout(res, 2200));
     const token = [...e.rails.psp.tokens.values()][0];
     const late = await charge(e, e.rails.psp.registerMerchant(e.merchants.sohle.merchantId), { token: token.id, amount: 9490, currency: "eur", merchant_id: e.merchants.sohle.merchantId, checkout_session_id: token.allowance.checkout_session_id });
     assert.equal(late.body.code, "token_expired");
-    await postJson(`${e.gateway.url}/reconcile`, {});
+    await postJson(`${e.gateway.url}/reconcile`, {}, e.adminHeaders);
     const t = await tx(e, r.transactionId!);
     assert.equal(t.status, "released");
     assert.equal((await budget(e, m)).committed, "0");
@@ -307,14 +307,14 @@ describe("ACP-style checkout (physical goods)", () => {
     assert.equal(e.rails.psp.merchantBalances.get(e.merchants.sohle.merchantId), 9490);
     assert.match((await e.pod.get(r2.evidence!.replace(/\.ttl$/, "-ledger.ttl")))!.text, /sc:Refunded/);
     // The first order (not refunded) stays settled after a full reconciliation pass
-    await postJson(`${e.gateway.url}/reconcile`, {});
+    await postJson(`${e.gateway.url}/reconcile`, {}, e.adminHeaders);
     assert.equal((await tx(e, r.transactionId!)).status, "settled");
   });
   test("a session re-addressed or re-itemized after authorization cannot be completed or charged", async () => {
     const e = await env();
     const m = await mandate(e, { slug: "eur" });
     const sohle = e.merchants.sohle;
-    const outcome = (txId: string) => postJson(`${e.gateway.url}/transactions/${txId}/outcome`, { agentId: AGENT_1, result: "paid" });
+    const outcome = (txId: string) => postJson(`${e.gateway.url}/transactions/${txId}/outcome`, { agentId: AGENT_1, result: "paid" }, e.agentHeaders(AGENT_1));
 
     // Redirect the parcel after the gateway approved the user's address
     const q1 = await quote(e, sohle);
@@ -404,11 +404,11 @@ describe("ACP-style checkout (physical goods)", () => {
     });
     row("tx-settled", "settled", unconfirmed);
     row("tx-pending", "pending", "pi_gone");
-    const rec = (id: string, agentId = AGENT_1) => postJson(`${e.gateway.url}/transactions/${id}/reconcile`, { agentId });
+    const rec = (id: string, agentId = AGENT_1) => postJson(`${e.gateway.url}/transactions/${id}/reconcile`, { agentId }, e.agentHeaders(agentId));
     assert.equal((await rec("tx-settled", "urn:someone-else")).status, 403);
     assert.equal((await rec("tx-settled")).body.status, "settled");
     assert.equal((await rec("tx-pending")).body.status, "pending", "a rail that cannot answer is not proof of non-payment");
-    await postJson(`${e.gateway.url}/reconcile`, {});
+    await postJson(`${e.gateway.url}/reconcile`, {}, e.adminHeaders);
     assert.equal((await tx(e, "tx-settled")).status, "settled");
     assert.equal((await tx(e, "tx-pending")).status, "pending");
     assert.equal((await budget(e, m)).committed, "200");
@@ -463,5 +463,27 @@ describe("ACP-style checkout (physical goods)", () => {
     assert.deepEqual([t.orderStatus, t.paymentStatus, t.delivery.status], ["returned", "refunded", "NonCompliant"]);
     assert.doesNotMatch((await e.pod.get(t.fulfilment))!.text, /schema:OrderCancelled/);
     assert.equal(e.rails.psp.merchantBalances.get(e.merchants.sohle.merchantId), 0);
+  });
+
+  test("concurrent refunds of one order refund once and keep a return a return; concurrent cancellations record one refund", async () => {
+    const e = await env();
+    const { assistant: a } = await ground(e, "Buy repairable shoes.");
+    const m = await mandate(e, { slug: "eur" });
+    let t = (await a.purchaseViaCheckout({ ...SHOES, mandateId: m.id })).tracking!;
+    e.merchants.sohle.advanceOrder(t.orderId);
+    e.merchants.sohle.advanceOrder(t.orderId);
+    t = await a.trackOrder(t);
+    t = await a.acceptDelivery(t, { solesReplaceable: "false" }, e.device);
+    const [o1, o2] = await Promise.all([e.merchants.sohle.refundOrder(t.orderId), e.merchants.sohle.refundOrder(t.orderId)]);
+    assert.deepEqual([o1.status, o2.status], ["returned", "returned"]);
+    const order = e.merchants.sohle.orders.get(t.orderId)!;
+    assert.deepEqual(order.events.map((x) => x.status), ["created", "shipped", "delivered", "returned"]);
+    t = await a.trackOrder(t);
+    assert.deepEqual([t.orderStatus, t.paymentStatus, t.delivery.status], ["returned", "refunded", "NonCompliant"]);
+
+    const t2 = (await a.purchaseViaCheckout({ ...SHOES, mandateId: m.id })).tracking!;
+    const cancels = await Promise.all([postJson(`${t2.orderUrl}/cancel`, {}), postJson(`${t2.orderUrl}/cancel`, {})]);
+    assert.deepEqual(cancels.map((c) => c.status), [200, 200]);
+    assert.deepEqual(e.merchants.sohle.orders.get(t2.orderId)!.events.map((x) => x.status), ["created", "canceled", "refunded"]);
   });
 });

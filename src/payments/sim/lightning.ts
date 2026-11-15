@@ -53,7 +53,9 @@ export async function startLightning(): Promise<LightningSim> {
     }
     if (req.method === "GET" && u.pathname.startsWith("/invoices/")) {
       const inv = invoices.get(u.pathname.slice(10));
-      return inv ? json(res, 200, { paymentHash: inv.paymentHash, paid: inv.paid, amountSat: inv.amountSat }) : json(res, 404, { error: "not_found" });
+      // The node's own record. Its invoices are unsigned base64 JSON (not BOLT11), so payers check
+      // amount and payee here, where a real wallet would verify the invoice's payee signature.
+      return inv ? json(res, 200, { paymentHash: inv.paymentHash, paid: inv.paid, amountSat: inv.amountSat, payee: inv.payee, expiresAt: inv.expiresAt }) : json(res, 404, { error: "not_found" });
     }
     if (req.method === "POST" && u.pathname === "/fund") { balances.set(body.account, (balances.get(body.account) ?? 0) + body.amountSat); return json(res, 200, { ok: true }); }
     if (req.method === "GET" && u.pathname.startsWith("/balance/")) return json(res, 200, { balance: balances.get(decodeURIComponent(u.pathname.slice(9))) ?? 0 });

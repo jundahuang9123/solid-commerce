@@ -26,6 +26,28 @@ export const DEFAULT_NETWORK = "eip155:84532";
 export const DEFAULT_USDC = "0x036CbD53842c5426634e7929541eC2318f3dCF7e";
 export const CHAIN_IDS: Record<string, number> = { "eip155:84532": 84532, "eip155:8453": 8453 };
 
+/**
+ * Tokens this deployment pays in, pinned with their EIP-712 domain. A challenge's `extra.name` is
+ * only a label chosen by the seller; the currency, and the domain the signer signs under, come
+ * from this table, keyed by network and token contract. The gateway refuses an x402 challenge for
+ * any token not listed here, and the signer refuses to sign for one.
+ *
+ * Only Circle's test USDC on Base Sepolia is listed: this prototype must not produce signatures a
+ * mainnet token would honour. Add an entry (with the token's real `name()` and `version()`) to pay
+ * in another token.
+ */
+export interface PinnedX402Token { network: string; asset: string; currency: string; domainName: string; domainVersion: string }
+export const KNOWN_X402_TOKENS: readonly PinnedX402Token[] = [
+  { network: DEFAULT_NETWORK, asset: DEFAULT_USDC, currency: "USDC", domainName: "USDC", domainVersion: "2" },
+];
+/** The pinned entry for this network and token contract (addresses compared checksummed), if any. */
+export function knownX402Token(network: unknown, asset: unknown): PinnedX402Token | undefined {
+  if (typeof network !== "string" || typeof asset !== "string") return undefined;
+  let a: string;
+  try { a = getAddress(asset); } catch { return undefined; }
+  return KNOWN_X402_TOKENS.find((k) => k.network === network && getAddress(k.asset) === a);
+}
+
 export interface PaymentRequirements {
   scheme: "exact";
   network: string;
@@ -93,7 +115,8 @@ export function parseX402(res: Response, resourceUrl: string): { options: Paymen
   const options = pr.accepts
     .filter((a) => a.scheme === "exact")
     .map((a): PaymentOption => ({
-      scheme: "x402", amount: a.amount, currency: a.extra.name === "USDC" ? "USDC" : a.extra.name,
+      // The currency is what the pinned token table says this contract is, never the seller's label.
+      scheme: "x402", amount: a.amount, currency: knownX402Token(a.network, a.asset)?.currency ?? `unknown-token:${a.network}:${a.asset}`,
       payTo: getAddress(a.payTo), resource: pr.resource.url ?? resourceUrl,
       challenge: { requirements: a, resource: pr.resource },
     }));
@@ -106,6 +129,18 @@ export async function createX402Payment(privateKey: Hex, auth: PaymentAuthorizat
   const account = privateKeyToAccount(privateKey);
   const req = challenge.requirements;
   if (req.amount !== auth.amount || getAddress(req.payTo) !== getAddress(auth.payTo)) throw new Error("x402 challenge does not match authorization");
+  // Chain, token and EIP-712 domain: exactly what the gateway bound from the signed offer, and a
+  // token this signer knows. Otherwise the same amount could be signed away in another token or
+  // on another chain (the challenge digest only proves the gateway saw the same challenge).
+  const pinned = knownX402Token(req.network, req.asset);
+  const t = auth.x402;
+  if (req.scheme !== "exact" || !t || !pinned) throw new Error("x402 challenge names a scheme, chain or token this signer does not pay in");
+  if (req.network !== t.network || getAddress(req.asset) !== getAddress(t.asset) || pinned.currency !== auth.currency) throw new Error("x402 challenge chain or token differs from the authorization");
+  if (req.extra?.name !== t.domainName || req.extra?.version !== t.domainVersion || t.domainName !== pinned.domainName || t.domainVersion !== pinned.domainVersion) {
+    throw new Error("x402 challenge EIP-712 domain differs from the token's pinned domain");
+  }
+  if (auth.railReference !== nonceFor(auth.authId)) throw new Error("x402 authorization names a different payment reference");
+  if (!Number.isInteger(req.maxTimeoutSeconds) || req.maxTimeoutSeconds <= 0) throw new Error("x402 challenge has no valid timeout");
   const now = Math.floor(Date.now() / 1000);
   const validBefore = Math.min(Math.floor(new Date(auth.expiresAt).getTime() / 1000), now + req.maxTimeoutSeconds);
   const authorization: Eip3009Authorization = {

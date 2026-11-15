@@ -21,6 +21,7 @@ export async function createDelegatedPayment(cardToken: string, allowedProviders
   if (challenge.merchant_id !== auth.payTo) throw new Error("challenge merchant differs from the authorized payee");
   if (!auth.resource.endsWith(`/checkout_sessions/${encodeURIComponent(challenge.checkout_session_id)}`)) throw new Error("challenge session differs from the authorized resource");
   if (challenge.snapshot_digest !== auth.offerDigest) throw new Error("challenge snapshot differs from the authorized session snapshot");
+  if (challenge.checkout_session_id !== auth.railReference) throw new Error("challenge session differs from the session the gateway reconciles");
   // The snapshot digest travels in the allowance, so the PSP refuses to charge
   // the token for a session that was changed after the gateway read it.
   const allowance: Allowance = {
