@@ -14,7 +14,7 @@
  * merchant API keys pass through here and must not reach the log.
  */
 import { AsyncLocalStorage } from "node:async_hooks";
-import type { Server } from "node:http";
+import type { IncomingMessage, Server } from "node:http";
 import { parse402 } from "../payments/http402.js";
 import { RECEIPT_HEADER } from "../payments/types.js";
 import { HEADER_RESPONSE, HEADER_SIGNATURE } from "../payments/schemes/x402.js";
@@ -25,8 +25,14 @@ import type { EventLog } from "./events.js";
 export type Role = "assistant" | "gateway" | "signer" | "seller" | "api" | "rail" | "merchant" | "pod";
 export interface Component { id: string; label: string; role: Role }
 
-/** The dashboard's own reads (Pod panel, budget meter) are not part of the story and are not shown. */
+/**
+ * The dashboard's own reads (Pod panel, budget meter) are not part of the story and are not shown,
+ * nor is anything a service does to answer them (the gateway reading the mandate from the Pod for
+ * GET /budget): QUIET requests to a component carry QUIET_HEADER, and that component handles them
+ * as QUIET too.
+ */
 export const QUIET = "dashboard";
+export const QUIET_HEADER = "x-demo-quiet";
 
 const actors = new AsyncLocalStorage<string>();
 /** Run fn as component `id`: its fetches are drawn as coming from that component. */
@@ -64,7 +70,8 @@ export class WireTap {
     globalThis.fetch = async function tapped(input: string | URL | Request, init?: RequestInit): Promise<Response> {
       const from = actors.getStore();
       const url = new URL(input instanceof Request ? input.url : String(input));
-      const to = from && from !== QUIET ? tap.lookup(url, from) : undefined;
+      if (from === QUIET) return tap.quiet(original, url, input, init);
+      const to = from ? tap.lookup(url, from) : undefined;
       if (!to) return original(input, init);
       const method = (init?.method ?? (input instanceof Request ? input.method : "GET")).toUpperCase();
       const headers = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined));
@@ -82,6 +89,15 @@ export class WireTap {
       return res;
     } as typeof fetch;
     return () => { globalThis.fetch = original; };
+  }
+
+  /** A QUIET fetch, not logged; to one of the demo's services it carries the marker across the hop. */
+  private quiet(original: typeof fetch, url: URL, input: string | URL | Request, init?: RequestInit): Promise<Response> {
+    const c = this.byOrigin.get(originOf(url));
+    if (!c || c.role === "pod") return original(input, init);
+    const headers = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined));
+    headers.set(QUIET_HEADER, "1");
+    return input instanceof Request ? original(new Request(input, { ...init, headers })) : original(input, { ...init, headers });
   }
 
   private lookup(url: URL, from: string): Component | undefined {
@@ -103,7 +119,14 @@ export class WireTap {
 function attribute(server: Server, id: string) {
   const listeners = server.listeners("request") as Array<(...a: unknown[]) => void>;
   server.removeAllListeners("request");
-  for (const l of listeners) server.on("request", (req, res) => actors.run(id, () => l.call(server, req, res)));
+  for (const l of listeners) {
+    server.on("request", (req: IncomingMessage, res) => {
+      // The marker is the demo's own bookkeeping: the service never sees it.
+      const quiet = req.headers[QUIET_HEADER] !== undefined;
+      delete req.headers[QUIET_HEADER];
+      return actors.run(quiet ? QUIET : id, () => l.call(server, req, res));
+    });
+  }
 }
 
 /** Payment-relevant request headers and a one-line summary of known request bodies. */

@@ -17,7 +17,9 @@ The terminal prints three things:
 - the **phone URL**, `http://<lan-ip>:4400/phone?t=<token>`.
 - a **QR code** of the phone URL.
 
-The token is new each time the demo starts. Viewing needs no token. Every button (Next step, Approve, Run attack, ...) needs it, so someone else on the venue Wi-Fi can watch but cannot act.
+Viewing needs no token. Every button (Next step, Approve, Run attack, ...) needs it, so someone else on the venue Wi-Fi can watch but cannot act.
+
+The token survives restarts: the first run saves it in `recordings/.demo-token` (readable only by you, never committed), and later runs reuse it, so the open dashboard, the phone and the printed QR code keep working when you restart the server, also into `--replay`. To start over with a new token, delete that file (do this after a talk if the URL was shown on screen), or set `DEMO_TOKEN`. If the server does come back with another token, the open dashboard locks its controls and says so instead of showing buttons that fail: open the new URL from the terminal.
 
 Options:
 
@@ -27,6 +29,7 @@ Options:
 | `DEMO_PUBLIC_URL=http://10.0.0.5:4400` | Base URL in the QR code, when the detected LAN address is wrong (several interfaces, VPN, a tunnel) |
 | `POD_URL=http://localhost:3000/` | Use an already running Solid server instead of starting Community Solid Server |
 | `INTERPRETER=claude` | Use Claude for interpretation, as in `npm run demo` |
+| `DEMO_TOKEN=<12+ letters, digits, - or _>` | Use this session token instead of the one kept in `recordings/.demo-token` |
 
 **Rehearse and record a fallback.** Run this on the laptop you will present from, close to the talk:
 
@@ -34,7 +37,9 @@ Options:
 npm run demo:web -- --rehearse talk
 ```
 
-It runs every screen unattended against the live services, with auto-approve on, and saves `recordings/talk.json`. The repository ships one recording made this way. You can also press **Record** in the toolbar at any point during a live session to save everything since the last Reset to `recordings/<name>.json`.
+It runs every screen unattended against the live services, with auto-approve on, and saves `recordings/talk.json` (replacing it: naming it on the command line is the request to). The repository ships one recording made this way. The rehearsal stops with an error, and saves nothing, if any step did not go as scripted: an action failed, a Break-it guardrail did not hold, a shoes checkout placed no order, or a shoes control found no order. A broken run never becomes your fallback.
+
+You can also press **Record** in the toolbar at any point during a live session to save everything since the last Reset to `recordings/<name>.json`. The name defaults to `session-<HHMM>` (the time the dashboard was opened). Record never replaces an existing file silently: if the name is taken, the dashboard asks before overwriting (the API answers `409` unless the request says `"overwrite": true`), so the shipped `recordings/talk.json` is not lost by accident.
 
 **Check the phone.** Scan the QR code. The phone must be on the same network as the laptop, and the network must allow device-to-device traffic (guest Wi-Fi often does not). If it does not work, use a phone hotspot for both devices, or rely on the on-screen phone (below).
 
@@ -55,7 +60,7 @@ It runs every screen unattended against the live services, with auto-approve on,
   npm run demo:web -- --replay recordings/talk.json
   ```
 
-  The same UI and controls appear, marked **REPLAY**.
+  The same UI and controls appear, marked **REPLAY**. The dashboard and phone you already have open reconnect by themselves and stay usable (same token, same QR code).
   - **Next step** and **Auto-play** play the recorded steps with their recorded timing (gaps capped at 1.2 s).
   - Each Break-it button, and each shoes button, plays its recorded run. Press them in the order they were recorded: buy, cancel, buy, advance, advance, accept.
   - Approvals are part of the recording and play without the phone.
@@ -109,7 +114,7 @@ Run the cards left to right. Each verdict comes from the service that enforced i
 - The dashboard is a view of the event log of one process. That process runs:
   - the environment of `src/demo/environment.ts`: a real Community Solid Server, the simulated rails, the sellers behind the 402 proxy, the checkout merchants, the gateway and the signer;
   - the scenarios in `src/web/scenarios/`, which call the same public APIs as `src/demo/run-demo.ts` and the tests.
-- The wire panel is recorded by wrapping `fetch` in that process. Each service's HTTP server tags the requests it handles, so calls it makes, such as seller to facilitator or gateway to Pod, are attributed to it.
+- The wire panel is recorded by wrapping `fetch` in that process. Each service's HTTP server tags the requests it handles, so calls it makes, such as seller to facilitator or gateway to Pod, are attributed to it. The dashboard's own polling (Pod panel, budget meters) is left out, and so is what a service does to answer it, such as the gateway reading the mandate from the Pod for a budget meter.
 - Only summaries are kept: decoded payment headers and the key fields of each answer. Card tokens, merchant API keys and wallet accounts are redacted, and delegated tokens, macaroons and preimages are shortened.
 - Some steps use the simulations directly, and the UI says so:
   - "Advance shipment" uses the simulated shop's test control.

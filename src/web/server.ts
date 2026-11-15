@@ -12,21 +12,24 @@
  *                                   shoes.<buy|advance|cancel|accept>
  *   POST /api/approvals/<id>        { approve: boolean, via?: "phone" | "screen" }
  *   POST /api/auto-approve          { on: boolean }
- *   POST /api/record                { name } -> recordings/<name>.json
+ *   POST /api/record                { name, overwrite? } -> recordings/<name>.json
+ *                                   (409 if that file exists and overwrite is not true)
  *
- * Watching needs nothing; every POST needs the per-session token from the
- * printed URLs (?t=..., sent back as x-demo-token). Anyone on the network can
- * reach the server, and only the presenter and their phone hold the token.
+ * Watching needs nothing; every POST needs the session token from the printed
+ * URLs (?t=..., sent back as x-demo-token). Anyone on the network can reach
+ * the server, and only the presenter and their phone hold the token. The CLI
+ * keeps the token across restarts (demoToken), so a restart (for example into
+ * --replay) leaves the open dashboard, the phone and the QR code working.
  */
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
-import { readFileSync, readdirSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { extname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { timingSafeEqual } from "node:crypto";
 import { randomHex } from "../util/crypto.js";
 import { readBody } from "../util/http.js";
-import type { DemoControls } from "./live.js";
+import { RecordingExists, type DemoControls } from "./live.js";
 import { qrSvg } from "./qr.js";
 
 const PUBLIC = fileURLToPath(new URL("./public/", import.meta.url));
@@ -92,7 +95,8 @@ export async function startDemoServer(demo: DemoControls, opts: ServeOptions = {
     if (u.pathname === "/api/auto-approve") { demo.setAuto(args.on === true); return send(res, 200, { on: args.on === true }); }
     if (u.pathname === "/api/record") {
       if (demo.mode === "replay") return send(res, 409, { error: "cannot record while replaying" });
-      return send(res, 200, { path: demo.record(String(args.name ?? "session")) });
+      try { return send(res, 200, { path: demo.record(String(args.name ?? "session"), { overwrite: args.overwrite === true }) }); }
+      catch (e) { if (e instanceof RecordingExists) return send(res, 409, { error: e.message, exists: true }); throw e; }
     }
     send(res, 404, { error: "not_found" });
   }
@@ -122,6 +126,32 @@ export async function startDemoServer(demo: DemoControls, opts: ServeOptions = {
     url: `http://localhost:${port}`, port, token, phoneUrl, dashboardUrl: `http://localhost:${port}/?t=${token}`, server,
     close: () => new Promise<void>((r) => { for (const s of streams) s.end(); server.closeAllConnections(); server.close(() => r()); }),
   };
+}
+
+/** Where the CLI keeps the session token between runs (gitignored, owner-readable only). */
+export const TOKEN_FILE = ".demo-token";
+
+/**
+ * The session token: DEMO_TOKEN if set, else the one saved in `dir`/.demo-token
+ * by an earlier run, else a new random one saved there. Delete the file (or set
+ * DEMO_TOKEN) to change it.
+ */
+export function demoToken(dir: string, env: Record<string, string | undefined> = process.env): string {
+  const given = env.DEMO_TOKEN?.trim();
+  if (given !== undefined && given !== "") {
+    if (!/^[\w-]{12,}$/.test(given)) throw new Error("DEMO_TOKEN must be at least 12 letters, digits, '-' or '_'");
+    return given;
+  }
+  const file = join(dir, TOKEN_FILE);
+  if (existsSync(file)) {
+    const saved = readFileSync(file, "utf8").trim();
+    if (/^[\w-]{12,}$/.test(saved)) return saved;
+  }
+  const fresh = randomHex(12);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(file, fresh + "\n", { mode: 0o600 });
+  chmodSync(file, 0o600);
+  return fresh;
 }
 
 function send(res: ServerResponse, status: number, body: unknown) {

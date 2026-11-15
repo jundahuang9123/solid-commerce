@@ -5,14 +5,24 @@ export const token = new URLSearchParams(location.search).get("t") ?? "";
 
 export const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
 
+/** GET /api/info with this page's token: { mode, authorized, phoneUrl? }. */
+export async function info() {
+  const r = await fetch(`/api/info?t=${encodeURIComponent(token)}`, { cache: "no-store" });
+  return r.json();
+}
+
 export async function api(path, body = {}) {
   const r = await fetch(path, { method: "POST", headers: { "content-type": "application/json", "x-demo-token": token }, body: JSON.stringify(body) });
   const out = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(out.error ?? `HTTP ${r.status}`);
+  if (!r.ok) throw Object.assign(new Error(out.error ?? `HTTP ${r.status}`), { status: r.status, body: out });
   return out;
 }
 
-/** Follow the event log. EventSource reconnects by itself; the server resends the log from the last reset. */
+/**
+ * Follow the event log. EventSource reconnects by itself; the server resends the log from the last reset.
+ * onStatus(true) also fires on every reconnect: the server may have restarted (live into --replay),
+ * so callers re-check what they learnt once from /api/info.
+ */
 export function connect(onEvent, onStatus) {
   const es = new EventSource("/api/events");
   es.onmessage = (m) => onEvent(JSON.parse(m.data));

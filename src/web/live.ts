@@ -9,6 +9,7 @@
  * step may wait for a person to approve on their phone.
  */
 import type { ChildProcess } from "node:child_process";
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { startCss, startCheckoutEnvironment, AGENT_1, AGENT_2, type CheckoutEnvironment } from "../demo/environment.js";
 import type { SpendingMandate } from "../model.js";
@@ -29,8 +30,14 @@ export interface DemoControls {
   act(name: string, args: Record<string, unknown>): ActionResult;
   decide(id: string, approved: boolean, via: Via): boolean;
   setAuto(on: boolean): void;
-  record(name: string): string;
+  /** Save the log since the last reset as recordings/<name>.json; refuses an existing file unless `overwrite`. */
+  record(name: string, opts?: { overwrite?: boolean }): string;
   close(): Promise<void>;
+}
+
+/** Thrown by record() when the file exists and overwrite was not asked for. */
+export class RecordingExists extends Error {
+  constructor(readonly path: string) { super(`${path} exists; record under another name, or overwrite it explicitly`); }
 }
 
 export interface LiveOptions {
@@ -184,8 +191,9 @@ export class LiveDemo implements DemoControls {
       } catch (e) {
         this.log.emit("error", { action: name, message: (e as Error).message });
       } finally {
-        this.busy = undefined;
+        // Still busy while refreshing: the next action starts only after the "idle" event.
         await this.refresh().catch(() => {});
+        this.busy = undefined;
         this.log.emit("busy", { action: null });
       }
     })();
@@ -204,8 +212,10 @@ export class LiveDemo implements DemoControls {
   decide(id: string, approved: boolean, via: Via) { return this.broker.decide(id, approved, via); }
   setAuto(on: boolean) { this.broker.setAuto(on); }
 
-  record(name: string): string {
+  record(name: string, opts: { overwrite?: boolean } = {}): string {
     const path = join(this.opts.recordingsDir, `${name.toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-|-$/g, "") || "session"}.json`);
+    // recordings/talk.json is the shipped fallback: never replace a recording by accident.
+    if (!opts.overwrite && existsSync(path)) throw new RecordingExists(path);
     this.log.save(path);
     this.log.emit("recorded", { path, events: this.log.all().length });
     return path;

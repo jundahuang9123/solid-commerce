@@ -66,7 +66,10 @@ export class ReplayDemo implements DemoControls {
     this.busy = name;
     this.log.emit("busy", { action: name });
     for (const [n, u] of plan.entries()) {
-      if (n > 0) await sleep(this.opts.stepPauseMs ?? 900);
+      if (n > 0) {
+        await sleep(this.opts.stepPauseMs ?? 900);
+        if (gen !== this.generation) return;   // reset during the pause: the next unit belongs to the new session
+      }
       u.played = true;
       let prev = u.events[0]?.t ?? 0;
       for (const e of u.events) {

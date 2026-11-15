@@ -1,6 +1,6 @@
 // Dashboard. All state is folded from the server's event log (src/web/events.ts); nothing here
 // invents a number. The same code renders a live session and a replayed recording.
-import { ICONS, api, approvalCard, approvalsReducer, connect, esc, patch, resolvedList, token } from "./shared.js";
+import { ICONS, api, approvalCard, approvalsReducer, connect, esc, info, patch, resolvedList, token } from "./shared.js";
 
 const $ = (id) => document.getElementById(id);
 const DECIMALS = { USDC: 6, SAT: 0, EUR: 2, USD: 2 };
@@ -33,6 +33,8 @@ const ui = {
   tab: store.get("demo.tab") ?? "weather",
   view: new URLSearchParams(location.search).get("view") ?? store.get("demo.view") ?? "research",
   wireFilter: null, phoneOpen: false, seenPending: new Set(), docSel: null, authorized: false, phoneUrl: "",
+  /** Set when this page's token stopped working (the server restarted with another one). */
+  tokenStale: false,
 };
 
 function reduce(e) {
@@ -144,6 +146,9 @@ function drawHeader() {
   $("auto-approve").checked = s.approvals.auto;
   $("auto-approve").disabled = !ui.authorized || s.mode === "replay";
   $("locked").hidden = ui.authorized;
+  $("locked").textContent = ui.tokenStale
+    ? "Controls are locked: the demo server restarted with a different session token. Open the new dashboard URL printed in the terminal. You can still watch."
+    : "Controls are locked: open the dashboard URL printed in the terminal (it carries the session token). You can still watch.";
   $("status").textContent = s.busy ? `Running: ${s.busy}` : s.recorded ? `Saved ${s.recorded.path.split("/").slice(-2).join("/")} (${s.recorded.events} events)` : "Ready";
   if (document.activeElement !== $("request") && !$("request").value) $("request").placeholder = s.request || $("request").placeholder;
   $("request").disabled = next !== 0;
@@ -306,7 +311,9 @@ function drawOutcomes() {
     card("Paid", p?.display ?? "0", p ? `via ${p.scheme}, authorized by the gateway` : "nothing can be paid without a signed mandate"),
     card("Budget left", b ? money(b.available, b.currency) : "no mandate", b ? `of ${money(b.limit, b.currency)} the user signed` : "approve one on the phone"),
     card("Evidence in the Pod", String(tx), "transaction documents the user controls"),
-    card("Guardrails held", guards.length ? `${held} of ${guards.length}` : "not run", "attacks and failures below, run live", guards.length && held === guards.length ? "good" : ""),
+    card("Guardrails held", guards.length ? `${held} of ${guards.length}` : "not run",
+      s.mode === "replay" ? `attacks and failures below, replayed from recording ${s.replay?.name ?? ""}${s.replay?.recordedAt ? ` (${s.replay.recordedAt.slice(0, 10)})` : ""}` : "attacks and failures below, run live",
+      guards.length && held === guards.length ? "good" : ""),
   ].join(""));
 }
 
@@ -405,21 +412,41 @@ document.addEventListener("click", (ev) => {
 for (const r of document.querySelectorAll('input[name="view"]')) r.addEventListener("change", () => { ui.view = r.value; ui.wireFilter = null; store.set("demo.view", ui.view); render(); });
 $("wire-filter").addEventListener("change", (e) => { ui.wireFilter = e.target.value; render(); });
 $("auto-approve").addEventListener("change", (e) => void api("/api/auto-approve", { on: e.target.checked }).catch((err) => { s.errors.unshift({ action: "auto-approve", message: err.message }); render(); }));
-$("record-form").addEventListener("submit", (e) => {
+// A fresh name per session, so Record never lands on the shipped recordings/talk.json by default.
+const hhmm = new Date().toTimeString().slice(0, 5).replace(":", "");
+$("record-name").value = `session-${hhmm}`;
+$("record-form").addEventListener("submit", async (e) => {
   e.preventDefault();
-  api("/api/record", { name: $("record-name").value }).catch((err) => { s.errors.unshift({ action: "record", message: err.message }); render(); });
+  const name = $("record-name").value;
+  const fail = (err) => { s.errors.unshift({ action: "record", message: err.message }); render(); };
+  try { await api("/api/record", { name }); }
+  catch (err) {
+    // The server never replaces a recording unless asked to.
+    if (err.status !== 409 || !err.body?.exists) return fail(err);
+    if (!confirm(`recordings/${name}.json already exists. Replace it?`)) return;
+    await api("/api/record", { name, overwrite: true }).catch(fail);
+  }
 });
 
 $("logo").innerHTML = ICONS.bag;
 $("phone-icon").innerHTML = ICONS.phone;
 
-fetch(`/api/info?t=${encodeURIComponent(token)}`).then((r) => r.json()).then((info) => {
-  ui.authorized = info.authorized;
-  ui.phoneUrl = info.phoneUrl ?? "";
-  if (info.authorized) {
-    $("qr").src = `/api/qr.svg?t=${encodeURIComponent(token)}`;
+/** What this page's token allows, the QR code and the phone link. Re-read after every reconnect: the server may have restarted. */
+let infoSeq = 0;
+async function loadInfo() {
+  const n = ++infoSeq;
+  let i;
+  try { i = await info(); } catch { return; }   // the stream's next reconnect tries again
+  if (n !== infoSeq) return;
+  ui.tokenStale = !i.authorized && (ui.authorized || ui.tokenStale);
+  ui.authorized = i.authorized;
+  ui.phoneUrl = i.phoneUrl ?? "";
+  $("qr").hidden = !i.authorized;
+  if (i.authorized) {
+    $("qr").src = `/api/qr.svg?t=${encodeURIComponent(token)}&v=${n}`;   // a new image, not a cached one
     $("phone-link").href = ui.phoneUrl;
-  } else $("qr").hidden = true;
+  } else $("qr").removeAttribute("src");
   render();
-});
-connect((e) => { reduce(e); render(); }, (up) => { if (!up) { $("status").textContent = "Reconnecting to the demo server"; } });
+}
+// onopen fires on the first connection and on every reconnect.
+connect((e) => { reduce(e); render(); }, (up) => { if (up) void loadInfo(); else $("status").textContent = "Reconnecting to the demo server"; });
