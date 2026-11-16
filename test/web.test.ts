@@ -320,6 +320,23 @@ describe("web demo, live", () => {
     }
   });
 
+  test("Break it in the middle of the weather steps: no fixture signs the mandate the phone is about to be asked for", async () => {
+    await freshSession(srv, demo, true);
+    for (const step of ["Ask", "Clarify"]) {
+      assert.ok((await run(srv, demo, "weather.next")).some((e) => e.type === "step" && e.data.state === "done"), step);
+      const events = await run(srv, demo, "guard.tamper");
+      assert.deepEqual(events.filter((e) => e.type === "fixture" || e.type === "approval.pending"), [], `after ${step}: nothing signed in the user's place`);
+      const done = events.find((e) => e.type === "guard" && e.data.state === "done")!.data;
+      assert.equal(done.tone, "unavailable", `after ${step}`);
+      assert.match(done.lines[0], /^Not run: the weather steps have started/);
+    }
+    // Once the phone approved the mandate at step 3, Break it runs against it.
+    assert.ok((await run(srv, demo, "weather.next")).some((e) => e.type === "step" && e.data.index === 2 && e.data.state === "done"));
+    const after = await run(srv, demo, "guard.tamper");
+    assert.deepEqual(after.filter((e) => e.type === "fixture"), []);
+    assert.equal(after.find((e) => e.type === "guard" && e.data.state === "done")!.data.tone, "blocked");
+  });
+
   test("Break it after the user rejected the mandate on the phone: no fixture signs it, the card says it did not run", async () => {
     await freshSession(srv, demo, false);
     const off = demo.log.subscribe((e) => {

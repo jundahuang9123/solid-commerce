@@ -54,13 +54,16 @@ export class WeatherScenario {
   }
 
   /**
-   * The guardrail scenarios need the main mandate; if the presenter starts there, set it up as a fixture.
-   * Never after the user was asked on the phone and did not sign it: a fixture must not stand in for a
-   * mandate the user rejected.
+   * The guardrail scenarios need the main mandate; if the presenter starts there (before the weather
+   * steps), set it up as a fixture. Never after the user was asked on the phone and did not sign it: a
+   * fixture must not stand in for a mandate the user rejected. Nor once the weather steps have started:
+   * the phone is about to be asked for that mandate (and the meaning the presenter picked), so a fixture
+   * would sign them, with the default meaning, in the user's place.
    */
   async groundedMandate(): Promise<SpendingMandate> {
     if (this.mandate) return this.mandate;
     if (this.mandateDeclined) throw new Unavailable("Not run: the 1 USDC mandate was rejected on the phone. Reset and approve it at step 3 first.");
+    if (this.next > 0) throw new Unavailable("Not run: the weather steps have started and the 1 USDC mandate is not approved yet. Approve it at step 3 first, or Reset and start with Break it.");
     return this.d.fixture("weather common ground and the 1 USDC mandate, as in steps 1 to 3", () => actAs(AGENT, async () => {
       const { ctx, result } = await this.assistant.understand(WEATHER_REQUEST, this.d.approved("sellers"));
       const proposals = [...result.proposals, ...result.questions.flatMap((q) => this.assistant.answer(q, DEFAULT_CHOICE, ctx))];
