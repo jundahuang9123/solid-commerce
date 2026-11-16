@@ -73,7 +73,7 @@ export class Guardrails {
         const viaAssistant = await this.agent().purchase({ ...BERLIN, mandateId: m.id });
         const offer = env.sellers.spree.currentOffer();
         const p = offer.payload.prices.find((x) => x.scheme === "x402")!;
-        const direct = await postJson(`${env.gateway.url}/authorize`, { transactionId: newId("tx-bypass-"), agentId: AGENT_1, mandateId: m.id, offer, option: { scheme: "x402", amount: p.amount, currency: "USDC", payTo: p.payTo, resource: offer.payload.resource, challenge: {} } });
+        const direct = await postJson(`${env.gateway.url}/authorize`, { transactionId: newId("tx-bypass-"), agentId: AGENT_1, mandateId: m.id, offer, option: { scheme: "x402", amount: p.amount, currency: "USDC", payTo: p.payTo, resource: offer.payload.resource, challenge: {} } }, env.agentHeaders(AGENT_1));
         return {
           tone: direct.status === 403 ? "blocked" as const : "fail" as const,
           lines: [`${direct.status} ${direct.body?.code}`, String(direct.body?.reason ?? ""), `assistant itself: ${viaAssistant.status} ${viaAssistant.code ?? ""}`],
@@ -132,7 +132,7 @@ export class Guardrails {
     try { r = await actAs(id(AGENT_1), () => this.agent().purchase({ ...BERLIN, mandateId: m.id })); }
     finally { env.sellers.spree.setBehaviour({ failDeliveryTimes: 0 }); }   // the seller's API comes back up
     this.crashed = r.status === "paid_not_delivered" ? r : undefined;
-    const tx = await actAs(QUIET, async () => (await fetch(`${env.gateway.url}/transactions/${encodeURIComponent(r.transactionId!)}`)).json() as Promise<{ status: string }>);
+    const tx = await actAs(QUIET, async () => (await fetch(`${env.gateway.url}/transactions/${encodeURIComponent(r.transactionId!)}`, { headers: env.adminHeaders })).json() as Promise<{ status: string }>);
     return {
       tone: r.status === "paid_not_delivered" ? "warn" as const : "fail" as const,
       lines: [`${r.status}: ${r.delivery?.checks.join("; ") ?? r.reason}`, `gateway ledger: ${tx.status} · signer payments ${before} → ${env.signer.payments}`],
@@ -159,9 +159,9 @@ export class Guardrails {
       const ch = parse402(await fetch(spree.resourceUrl), spree.resourceUrl);
       const option = ch.options.find((o) => o.scheme === "x402")!;
       const txId = newId("tx-replay-");
-      const auth = await postJson(`${env.gateway.url}/authorize`, { transactionId: txId, agentId: AGENT_1, mandateId: m.id, offer: spree.currentOffer(), offerRef: ch.offer, option });
+      const auth = await postJson(`${env.gateway.url}/authorize`, { transactionId: txId, agentId: AGENT_1, mandateId: m.id, offer: spree.currentOffer(), offerRef: ch.offer, option }, env.agentHeaders(AGENT_1));
       if (auth.status !== 200) return { tone: "fail" as const, lines: [`gateway: ${auth.status} ${auth.body?.code}`] };
-      const pay = await postJson(`${env.signer.url}/pay`, { authorization: auth.body.authorization, challenge: option.challenge });
+      const pay = await postJson(`${env.signer.url}/pay`, { authorization: auth.body.authorization, challenge: option.challenge }, env.agentHeaders(AGENT_1));
       const h = { [pay.body.credential.header.name]: pay.body.credential.header.value };
       const transfersBefore = env.rails.facilitator.chain.transfers.length;
       const other = await fetch(havel.resourceUrl, { headers: h });
@@ -169,7 +169,7 @@ export class Guardrails {
       const spreeRes: Response[] = [];
       for (let i = 0; i < 3; i++) spreeRes.push(await fetch(spree.resourceUrl, { headers: h }));
       const rh = spreeRes.find((r) => r.status === 200)?.headers.get(RECEIPT_HEADER);
-      await postJson(`${env.gateway.url}/transactions/${txId}/outcome`, { agentId: AGENT_1, result: "paid", receipt: rh ? b64json.decode(rh) : undefined });
+      await postJson(`${env.gateway.url}/transactions/${txId}/outcome`, { agentId: AGENT_1, result: "paid", receipt: rh ? b64json.decode(rh) : undefined }, env.agentHeaders(AGENT_1));
       const transfers = env.rails.facilitator.chain.transfers.length - transfersBefore;
       return {
         tone: other.status === 402 && transfers === 1 ? "blocked" as const : "fail" as const,
@@ -183,7 +183,7 @@ export class Guardrails {
     const env = this.env;
     const offer = env.sellers.shady.currentOffer();
     const p = offer.payload.prices[0];
-    const g = await actAs(id(AGENT_1), () => postJson(`${env.gateway.url}/authorize`, { transactionId: newId("tx-shady-"), agentId: AGENT_1, mandateId: m.id, offer, option: { scheme: "x402", amount: p.amount, currency: "USDC", payTo: p.payTo, resource: offer.payload.resource, challenge: {} } }));
+    const g = await actAs(id(AGENT_1), () => postJson(`${env.gateway.url}/authorize`, { transactionId: newId("tx-shady-"), agentId: AGENT_1, mandateId: m.id, offer, option: { scheme: "x402", amount: p.amount, currency: "USDC", payTo: p.payTo, resource: offer.payload.resource, challenge: {} } }, env.agentHeaders(AGENT_1)));
     return {
       tone: g.status === 403 ? "blocked" as const : "fail" as const,
       lines: [`${g.status} ${g.body?.code}`, this.named(String(g.body?.reason ?? "")), `Shady Forecasts received ${fmt(env.rails.facilitator.chain.balanceOf(offer.payload.prices[0].payTo!), "USDC")}`],
