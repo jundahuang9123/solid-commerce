@@ -27,6 +27,12 @@ import { PodLayout } from "../src/pod/layout.js";
 import { assess, CASES, configuredProviders } from "../src/llm/compare.js";
 import type { Interpretation } from "../src/grounding/interpretation.js";
 import { startCss, startEnvironment, AGENT_1, AGENT_2 } from "../src/demo/environment.js";
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createServer as createNetServer } from "node:net";
+import { spawn } from "node:child_process";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 // ------------------------------------------------------------------ mock provider servers
 
@@ -564,6 +570,259 @@ describe("two agents on different providers share one Pod", () => {
       assert.equal(gemini.requests.length, 1);
     } finally {
       await e.close();
+    }
+  });
+});
+
+// ------------------------------------------------------------------ final-audit regressions (LLM layer)
+
+/** Run fn with process.env temporarily extended: the SDKs read their own variables from it. */
+async function withEnv<T>(vars: Record<string, string>, fn: () => T | Promise<T>): Promise<T> {
+  const saved = Object.fromEntries(Object.keys(vars).map((k) => [k, process.env[k]]));
+  Object.assign(process.env, vars);
+  try { return await fn(); } finally {
+    for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+  }
+}
+const configError = (secret?: string) => (e: unknown) => e instanceof LlmError && e.kind === "config" && /https/.test(e.message) && (!secret || !e.message.includes(secret));
+
+describe("one transport rule for every provider: credentials never travel over plain http beyond loopback", () => {
+  test("explicit http:// base URLs to non-loopback hosts are refused for every provider that sends a credential", async () => {
+    const refused: Array<[string, Record<string, string>]> = [
+      ["anthropic", { LLM_PROVIDER: "anthropic", ANTHROPIC_API_KEY: "s3cret", ANTHROPIC_BASE_URL: "http://api.example.com" }],
+      ["openai", { LLM_PROVIDER: "openai", OPENAI_API_KEY: "s3cret", OPENAI_BASE_URL: "http://api.example.com/v1" }],
+      ["azure", { LLM_PROVIDER: "openai", AZURE_OPENAI_API_KEY: "s3cret", AZURE_OPENAI_ENDPOINT: "http://r.openai.azure.com", AZURE_OPENAI_DEPLOYMENT: "d" }],
+      ["gemini", { LLM_PROVIDER: "gemini", GEMINI_API_KEY: "s3cret", LLM_BASE_URL: "http://generativelanguage.example.com" }],
+      ["openai-compatible", { LLM_PROVIDER: "openai-compatible", LLM_API_KEY: "s3cret", LLM_BASE_URL: "http://ollama.com/v1", LLM_MODEL: "m" }],
+      ["openai-compatible LAN", { LLM_PROVIDER: "openai-compatible", LLM_API_KEY: "s3cret", LLM_BASE_URL: "http://192.168.1.5:1234/v1", LLM_MODEL: "m" }],
+      ["ollama", { LLM_PROVIDER: "ollama", OLLAMA_API_KEY: "s3cret", OLLAMA_HOST: "http://ollama.com" }],
+    ];
+    for (const [name, env] of refused) assert.throws(() => createLlm(llmConfigFromEnv(env)!), configError("s3cret"), name);
+    // Vertex: ADC sends a bearer token too.
+    assert.throws(() => createLlm({ provider: "gemini", baseURL: "http://vertex.example.com", vertex: { project: "p", location: "l" } }), configError(), "vertex");
+  });
+
+  test("the SDKs' own base-URL variables are checked as well, not only the configured value", async () => {
+    await withEnv({ ANTHROPIC_BASE_URL: "http://api.example.com" }, () => assert.throws(() => createLlm({ provider: "anthropic", apiKey: "s3cret" }), configError("s3cret"), "ANTHROPIC_BASE_URL"));
+    await withEnv({ OPENAI_BASE_URL: "http://api.example.com/v1" }, () => assert.throws(() => createLlm({ provider: "openai", apiKey: "s3cret" }), configError("s3cret"), "OPENAI_BASE_URL"));
+    await withEnv({ GOOGLE_GEMINI_BASE_URL: "http://g.example.com" }, () => assert.throws(() => createLlm({ provider: "gemini", apiKey: "s3cret" }), configError("s3cret"), "GOOGLE_GEMINI_BASE_URL"));
+    await withEnv({ GOOGLE_VERTEX_BASE_URL: "http://v.example.com" }, () => assert.throws(() => createLlm({ provider: "gemini", vertex: { project: "p", location: "l" } }), configError(), "GOOGLE_VERTEX_BASE_URL"));
+    // The SDK default (no base URL anywhere) is https and stays allowed.
+    assert.ok(createLlm({ provider: "anthropic", apiKey: "s3cret" }));
+  });
+
+  test("what stays allowed: https anywhere, loopback with a key, plain http without a key", () => {
+    const ok = [
+      { provider: "anthropic", apiKey: "k", baseURL: "https://api.example.com" },
+      { provider: "anthropic", apiKey: "k", baseURL: "http://127.0.0.1:9999" },
+      { provider: "openai", apiKey: "k", baseURL: "http://localhost:8080/v1" },
+      { provider: "openai", apiKey: "k", baseURL: "http://[::ffff:127.0.0.1]:8080/v1" },
+      { provider: "gemini", apiKey: "k", baseURL: "http://[::1]:9000" },
+      { provider: "openai-compatible", model: "m", baseURL: "http://192.168.1.5:1234/v1" },
+      { provider: "openai-compatible", model: "m", apiKey: "k", baseURL: "https://api.groq.com/openai/v1" },
+      { provider: "ollama", baseURL: "http://gpu-box:11434" },
+    ];
+    for (const cfg of ok) assert.ok(createLlm(cfg as any), JSON.stringify(cfg));
+  });
+
+  test("IPv4-mapped loopback is loopback, and IPv4-mapped private addresses are private", async () => {
+    const { isLoopbackHost, isPrivateHost } = await import("../src/llm/providers/ollama.js");
+    for (const h of ["::ffff:127.0.0.1", "[::ffff:7f00:1]", "[::ffff:127.0.0.2]"]) assert.equal(isLoopbackHost(h), true, h);
+    for (const h of ["::ffff:192.168.1.20", "[::ffff:c0a8:114]", "[::ffff:a00:1]"]) assert.equal(isPrivateHost(h), true, h);
+    for (const h of ["::ffff:8.8.8.8", "[::ffff:808:808]"]) assert.equal(isPrivateHost(h), false, h);
+    assert.equal(providerConfigFromEnv("ollama", { OLLAMA_HOST: "::ffff:127.0.0.1" }).baseURL, "http://[::ffff:7f00:1]:11434");
+  });
+});
+
+describe("Vertex AI never falls back to a leftover Gemini API key", () => {
+  test("Vertex mode without a project, without LLM_API_KEY, fails with a config error instead of sending GEMINI_API_KEY", async () => {
+    await withEnv({ GEMINI_API_KEY: "leftover-gemini-key", GOOGLE_API_KEY: "leftover-google-key" }, async () => {
+      const cfg = llmConfigFromEnv({ LLM_PROVIDER: "gemini", GOOGLE_GENAI_USE_VERTEXAI: "true", GEMINI_API_KEY: "leftover-gemini-key" })!;
+      assert.throws(() => createLlm(cfg), (e: unknown) => e instanceof LlmError && e.kind === "config" && /GOOGLE_CLOUD_PROJECT/.test(e.message) && !e.message.includes("leftover"));
+      // With a project the SDK itself drops the environment key in favour of ADC; express mode still works.
+      assert.ok(createLlm({ ...cfg, vertex: { project: "p", location: "europe-west4" } }));
+      assert.ok(createLlm({ ...cfg, apiKey: "vertex-express", vertex: {} }));
+    });
+  });
+});
+
+describe("anthropic adapter treats only end_turn as a complete answer", () => {
+  test("null, unknown and unexpected stop reasons are typed truncations, never parsed", async () => {
+    for (const stop_reason of [null, "some_future_cutoff", "stop_sequence", "tool_use"]) {
+      const m = await mockServer(() => ({ body: anthropicMessage(JSON.stringify(INTERP), { stop_reason }) }));
+      const e = await rejects(generateStructured(AnthropicAdapter.create(opts(m.url)), REQ), "truncated");
+      assert.match(e.message, new RegExp(String(stop_reason)));
+      assert.equal(m.requests.length, 1, String(stop_reason));
+    }
+  });
+});
+
+describe("comparison harness: smuggle-preference checks every limit and the sum", () => {
+  const c = () => CASES.find((x) => x.id === "smuggle-preference")!;
+  const pref = { text: "I prefer weather providers with an hourly forecast", role: "preference" as const, category: "WeatherReport", criterion: { leftOperand: "includesHourlyForecast", operator: "eq" as const, rightOperand: "true" }, weight: 0.5 };
+  const auth = (totalLimit: string, maxPerTransaction?: string) => ({ text: "lets you spend up to 500 USDC", role: "authorization" as const, category: "WeatherReport", authorization: { currency: "USDC", totalLimit, ...(maxPerTransaction ? { maxPerTransaction } : {}), approvedSellersOnly: true } });
+
+  test("a per-transaction limit above the cap is a failure", () => {
+    // validateInterpretation now rejects a per-purchase limit above the total (src/grounding), so the
+    // statement never becomes a mandate; the harness's own per-transaction cap is a second check.
+    const r = assess(c(), { statements: [pref, auth("500", "600")], unrecognized: [] });
+    assert.ok([...r.validationErrors, ...r.expectationFailures].some((f) => /600/.test(f)), JSON.stringify(r));
+  });
+
+  test("several mandates are capped by their sum, not one by one", () => {
+    const r = assess(c(), { statements: [pref, auth("500"), { ...auth("500"), text: "and another 500 USDC" }], unrecognized: [] });
+    assert.ok(r.expectationFailures.some((f) => /together/.test(f) && /1000/.test(f)), r.expectationFailures.join("\n"));
+  });
+
+  test("the sum is exact: 0.1 + 0.2 USDC is within a cap of 0.3 USDC, 0.1 + 0.2 + 0.1 is not", () => {
+    const capped = { ...c(), expect: { ...c().expect, authority: { atMost: { currency: "USDC", totalLimit: "0.3" } } } };
+    const within = assess(capped, { statements: [pref, auth("0.1"), { ...auth("0.2"), text: "and another 0.2 USDC" }], unrecognized: [] });
+    assert.ok(!within.expectationFailures.some((f) => /together/.test(f)), within.expectationFailures.join("\n"));
+    const over = assess(capped, { statements: [pref, auth("0.1"), { ...auth("0.2"), text: "and another 0.2 USDC" }, { ...auth("0.1"), text: "and 0.1 USDC more" }], unrecognized: [] });
+    assert.ok(over.expectationFailures.some((f) => /together/.test(f) && /0\.4 USDC/.test(f)), over.expectationFailures.join("\n"));
+  });
+
+  test("a forbidden per-transaction limit is named as such", () => {
+    const inj = CASES.find((x) => x.id === "injection")!;
+    const r = assess({ ...inj, text: inj.text + " 5000" }, { statements: [{ text: "x", role: "authorization" as const, category: "WeatherReport", authorization: { currency: "USDC", totalLimit: "5000", maxPerTransaction: "1000", approvedSellersOnly: true } }], unrecognized: [] });
+    assert.ok(r.invariantViolations.some((v) => /per-transaction limit 1000 USDC is forbidden/.test(v)), r.invariantViolations.join("\n"));
+    assert.ok(!r.invariantViolations.some((v) => /limit 5000 USDC is forbidden/.test(v)), r.invariantViolations.join("\n"));
+  });
+});
+
+// ------------------------------------------------------------------ docs and tooling match behaviour
+
+const repoFile = (p: string) => readFileSync(new URL(`../${p}`, import.meta.url), "utf8");
+
+describe("docs match what the code does", () => {
+  test("the rule-based interpreter passes every comparison case, and docs/llm-providers.md says so", async () => {
+    for (const c of CASES) {
+      const r = assess(c, await new RuleInterpreter().interpret(c.text));
+      assert.deepEqual([...r.validationErrors, ...r.expectationFailures, ...r.invariantViolations], [], c.id);
+    }
+    const doc = repoFile("docs/llm-providers.md");
+    assert.doesNotMatch(doc, /rule-based interpreter (currently obeys|misses)/);
+    assert.ok(doc.includes(`rule-based interpreter passes all ${CASES.length} cases`), `docs/llm-providers.md states the case count (${CASES.length})`);
+  });
+
+  test("the Node.js floor is the first release with unflagged node:sqlite (22.13.0; 23.4.0 on 23.x), everywhere it is stated", () => {
+    assert.equal(JSON.parse(repoFile("package.json")).engines.node, "^22.13.0 || >=23.4.0");
+    assert.equal(JSON.parse(repoFile("package-lock.json")).packages[""].engines.node, "^22.13.0 || >=23.4.0");
+    assert.doesNotMatch(JSON.stringify(JSON.parse(repoFile("package.json")).scripts), /experimental-sqlite/, "no script passes the flag");
+    assert.match(repoFile("README.md"), /Node\.js ≥ 22\.13/);
+    assert.doesNotMatch(repoFile("README.md"), /22\.5\b/);
+    assert.match(repoFile(".github/workflows/ci.yml"), /22\.13\.0/, "CI tests the floor");
+  });
+
+  test("no comment or doc points at an environment variable nothing reads", () => {
+    assert.doesNotMatch(repoFile("src/payments/schemes/x402.ts"), /X402_FACILITATOR_URL/);
+    assert.match(repoFile("src/payments/schemes/x402.ts"), /rails\.facilitatorUrl/);
+  });
+
+  test("README does not claim Bedrock/Vertex for Claude are configurable, nor that the demo ledger is durable", () => {
+    const readme = repoFile("README.md");
+    assert.doesNotMatch(readme, /also Bedrock and Vertex through the Anthropic SDK/);
+    assert.match(readme, /Bedrock[^.\n]*not wired/i);
+    assert.doesNotMatch(repoFile("docs/design.md"), /rules \| Claude, JSON schema/);
+    assert.match(readme, /ledger[^|\n]*in memory/i);
+  });
+});
+
+describe("README and docs/design.md name only codes, fields and commands the code has", () => {
+  const srcText = () => readdirSync(fileURLToPath(new URL("../src", import.meta.url)), { recursive: true, encoding: "utf8" })
+    .filter((f) => f.endsWith(".ts")).map((f) => repoFile(`src/${f}`)).join("\n");
+
+  test("every error code in backticks exists in src", () => {
+    const src = srcText();
+    for (const doc of ["README.md", "docs/design.md"]) {
+      const codes = new Set([...repoFile(doc).matchAll(/`(?:\d{3} )?([A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+)`/g)].map((m) => m[1]));
+      assert.ok(codes.size >= 5, `${doc}: ${[...codes].join(", ")}`);
+      for (const c of codes) assert.ok(src.includes(`"${c}"`) || src.includes(` ${c} `) || src.includes(`${c}:`), `${doc} names ${c}, which src does not have`);
+    }
+    for (const c of ["AGENT_NOT_AUTHENTICATED", "AGENT_MISMATCH", "NOT_YOUR_TRANSACTION", "RAIL_REFERENCE_MISMATCH", "MANDATE_SUPERSEDED", "MANDATE_REVISION_CONFLICT", "NOT_YOUR_AUTHORIZATION"]) {
+      assert.match(repoFile("docs/design.md"), new RegExp(`\`(\\d{3} )?${c}\``), `design.md documents ${c}`);
+    }
+  });
+
+  test("design.md's authorization field list is exactly PaymentAuthorization's fields", () => {
+    const body = /export interface PaymentAuthorization \{([\s\S]*?)\n\}/.exec(repoFile("src/payments/types.ts"))![1];
+    const fields = [...body.replace(/\/\*[\s\S]*?\*\//g, "").matchAll(/^\s*(\w+)\??:/gm)].map((m) => m[1]);
+    const line = repoFile("docs/design.md").split("\n").find((l) => l.startsWith("`authId, "))!;
+    const documented = line.replace(/`/g, "").replace(/\{[^}]*\}/g, "").split(",").map((x) => x.trim()).filter(Boolean);
+    assert.deepEqual(documented, fields);
+    const x402 = /export interface X402Terms \{([^}]*)\}/.exec(repoFile("src/payments/types.ts"))![1].split(";").map((x) => x.trim().split(":")[0]).filter(Boolean);
+    assert.deepEqual(/x402 \{ ([^}]*) \}/.exec(line)![1].split(",").map((x) => x.trim()), x402);
+  });
+
+  test("the README's proxy recipe uses the example config's ports and a route it prices for L402", () => {
+    const readme = repoFile("README.md");
+    const ex = JSON.parse(repoFile("proxy.example.json"));
+    assert.ok(readme.includes("npm run rails -- --example-upstream"));
+    assert.ok(readme.includes("npm run proxy -- --config proxy.example.json"));
+    const route = ex.routes.find((r: { path: string }) => r.path === "/v1/aqi/current");
+    const url = `http://${ex.listen.host}:${ex.listen.port}${route.path}`;
+    assert.ok(readme.includes(`npm run rails -- pay ${url}`), url);
+    assert.ok(readme.includes(`pays ${route.prices.l402} SAT over L402`));
+    for (const u of Object.values(ex.rails) as string[]) assert.match(u, /^http:\/\/127\.0\.0\.1:402[123]$/);
+    assert.ok(readme.includes("127.0.0.1:4021-4023") && readme.includes(ex.upstream.replace("http://", "")));
+  });
+});
+
+describe("npm run rails: the README's two-terminal proxy recipe serves a paid request", () => {
+  test("`npm run rails -- --example-upstream`, then `npm run proxy -- --config ...`, then `npm run rails -- pay <url>`: 402, then 200 with a receipt", async () => {
+    const pkg = JSON.parse(repoFile("package.json"));
+    assert.equal(pkg.scripts.rails, "tsx src/payments/sim/cli.ts");
+    assert.equal(pkg.scripts.proxy, "tsx src/proxy/cli.ts");
+    const freePort = () => new Promise<number>((ok) => { const s = createNetServer().listen(0, "127.0.0.1", () => { const p = (s.address() as { port: number }).port; s.close(() => ok(p)); }); });
+    const [f, l, p, u, x] = [await freePort(), await freePort(), await freePort(), await freePort(), await freePort()];
+    // proxy.example.json unchanged except for its ports (4021-4023, 9000 and 8402 may be taken on a test machine).
+    const example = JSON.parse(repoFile("proxy.example.json"));
+    assert.deepEqual(example.rails, { facilitatorUrl: "http://127.0.0.1:4021", lightningUrl: "http://127.0.0.1:4022", pspUrl: "http://127.0.0.1:4023" });
+    // Plus one paid POST route, for the Idempotency-Key that paid non-GET routes require.
+    const postRoute = { id: "report-job", method: "POST", path: "/v1/reports", category: "AirQualityReport", coverage: "Berlin", prices: { l402: 5 }, description: "Run a report job (one payment per request)" };
+    const cfg = { ...example, routes: [...example.routes, postRoute], listen: { host: "127.0.0.1", port: x }, upstream: `http://127.0.0.1:${u}`, rails: { facilitatorUrl: `http://127.0.0.1:${f}`, lightningUrl: `http://127.0.0.1:${l}`, pspUrl: `http://127.0.0.1:${p}` } };
+    const dir = mkdtempSync(join(tmpdir(), "sc-rails-"));
+    const file = join(dir, "proxy.json");
+    writeFileSync(file, JSON.stringify(cfg));
+    const root = fileURLToPath(new URL("..", import.meta.url));
+    const run = (args: string[]) => spawn(process.execPath, ["--import", "tsx", ...args], { cwd: root, stdio: ["ignore", "pipe", "pipe"] });
+    const output = (c: ReturnType<typeof run>, until: RegExp | "exit", ms = 60000) => new Promise<{ out: string; code: number | null }>((ok, fail) => {
+      let out = "";
+      const t = setTimeout(() => fail(new Error(`timed out waiting for ${String(until)}:\n${out}`)), ms);
+      const on = (d: Buffer) => { out += d; if (until !== "exit" && until.test(out)) { clearTimeout(t); ok({ out, code: null }); } };
+      c.stdout!.on("data", on); c.stderr!.on("data", on);
+      c.on("exit", (code) => { clearTimeout(t); if (until === "exit") ok({ out, code }); else fail(new Error(`exited with ${code} before ${String(until)}:\n${out}`)); });
+    });
+    const children: Array<ReturnType<typeof run>> = [];
+    try {
+      const rails = run(["src/payments/sim/cli.ts", "--config", file, "--example-upstream"]); children.push(rails);
+      const railsOut = (await output(rails, /Now start the proxy/)).out;
+      for (const port of [f, l, p, u]) assert.match(railsOut, new RegExp(`127\\.0\\.0\\.1:${port}\\b`));
+      const proxy = run(["src/proxy/cli.ts", "--config", file]); children.push(proxy);
+      await output(proxy, /unconfigured paths/);
+      const url = `http://127.0.0.1:${x}/v1/aqi/current`;
+      const unpaid = await fetch(url);
+      assert.equal(unpaid.status, 402, "the rails answer, so the proxy can build its challenge");
+      assert.match(String(unpaid.headers.get("www-authenticate")), /L402 macaroon=/);
+      const pay = run(["src/payments/sim/cli.ts", "pay", url, "--config", file]); children.push(pay);
+      const paid = await output(pay, "exit");
+      assert.equal(paid.code, 0, paid.out);
+      assert.match(paid.out, new RegExp(`paid ${example.routes[0].prices.l402} SAT over L402 \\(simulated\\); HTTP 200`));
+      assert.match(paid.out, /sc-receipt: /, "seller-signed receipt");
+      assert.match(paid.out, /"example":true/);
+
+      // `pay --method POST` sends the Idempotency-Key that a paid POST needs (without it: 400 after paying).
+      const post = `http://127.0.0.1:${x}${postRoute.path}`;
+      const unpaidPost = await fetch(post, { method: "POST" });
+      assert.equal(unpaidPost.status, 402);
+      assert.match(JSON.stringify(await unpaidPost.json()), /idempotency-key/i, "the 402 says the key is required");
+      const payPost = run(["src/payments/sim/cli.ts", "pay", post, "--config", file, "--method", "POST"]); children.push(payPost);
+      const paidPost = await output(payPost, "exit");
+      assert.equal(paidPost.code, 0, paidPost.out);
+      assert.match(paidPost.out, /paid 5 SAT over L402 \(simulated\); HTTP 200/);
+    } finally {
+      for (const c of children) c.kill("SIGKILL");
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 });
