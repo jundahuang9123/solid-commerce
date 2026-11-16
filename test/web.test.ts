@@ -436,6 +436,20 @@ describe("web demo, live", () => {
     assert.ok(wire.includes("gateway -> pod"), "the gateway's mandate read is shown: the header alone does not hide it");
   });
 
+  test("after a Reset that could not start a session, other actions are refused with a clear message", async () => {
+    await freshSession(srv, demo, true);
+    const env = demo["env"];
+    demo["env"] = undefined;   // what a failed boot() leaves behind: no environment, scenarios bound to the closed one
+    try {
+      for (const a of ["weather.next", "weather.answer", "guard.race", "shoes.buy"]) {
+        const r = await post(srv, `/api/action/${a}`, { choice: 0 });
+        assert.equal(r.status, 409, a);
+        assert.match((await r.json() as { error: string }).error, /^no live session: the last Reset could not start one\. Press Reset again/, a);
+      }
+    } finally { demo["env"] = env; }
+    assert.ok((await run(srv, demo, "weather.next")).some((e) => e.type === "step" && e.data.state === "done"), "with a session, actions run again");
+  });
+
   test("Reset pressed again while a reset is running is accepted and changes nothing", async () => {
     await freshSession(srv, demo, true);
     const previous = demo.log.all()[0];
