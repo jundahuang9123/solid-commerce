@@ -633,6 +633,29 @@ describe("web demo, replay", () => {
     } finally { await demo.close(); }
   });
 
+  test("a replayed Break-it card says it is replayed, not run against the live services", async (t) => {
+    let playwright: { chromium: { launch(): Promise<any> } } | undefined;
+    try { playwright = createRequire(import.meta.url)("playwright"); } catch { /* not installed here */ }
+    if (!playwright) return t.skip("playwright is not available");
+    const demo = new ReplayDemo(loadRecording(RECORDING), { name: "talk", stepPauseMs: 0 });   // recorded pace (gaps capped at 1.2 s)
+    const srv = await startDemoServer(demo, { host: "127.0.0.1", token: "replay-guard-token" });
+    const browser = await playwright.chromium.launch();
+    try {
+      const dash = await browser.newPage();
+      await dash.goto(srv.dashboardUrl);
+      await dash.locator('[data-tab="breakit"]').click();
+      await dash.locator('[data-act="guard.race"]:not([disabled])').click();
+      const running = dash.locator(".verdict.running");
+      await running.waitFor();
+      assert.equal(await running.innerText(), "Replaying the recorded run…");
+      await dash.locator(".verdict.blocked").first().waitFor();
+    } finally {
+      await browser.close();
+      await srv.close();
+      await demo.close();
+    }
+  });
+
   test("dashboard across a server restart: same token keeps the controls, another token locks them", async (t) => {
     let playwright: { chromium: { launch(): Promise<any> } } | undefined;
     try { playwright = createRequire(import.meta.url)("playwright"); } catch { /* not installed here */ }
