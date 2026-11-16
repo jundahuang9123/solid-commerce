@@ -249,7 +249,8 @@ describe("web demo, live", () => {
     assert.equal(respelt.status, 409);
     assert.equal((await respelt.json() as { file: string }).file, "recordings/api-test.json", "the confirm names the file that would really be replaced");
     assert.equal(statSync(path).size, size, "the existing recording is untouched");
-    assert.equal((await post(srv, "/api/record", { name: "api-test", overwrite: true })).status, 200);    assert.ok(loadRecording(path).events.length > 0);
+    assert.equal((await post(srv, "/api/record", { name: "api-test", overwrite: true })).status, 200);
+    assert.ok(loadRecording(path).events.length > 0);
   });
 
   test("reset while an approval is pending refuses it and starts a fresh session", async () => {
