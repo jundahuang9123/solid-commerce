@@ -19,6 +19,7 @@
 import OpenAI, { AzureOpenAI } from "openai";
 import { fromStrict, toStrictSchema } from "../jsonSchema.js";
 import { parseJsonText, schemaInstruction, toLlmError } from "../structured.js";
+import { assertSecureTransport, envUrl } from "../transport.js";
 import type { AdapterOptions, ChatAdapter, Completion, CompletionRequest } from "../types.js";
 
 export const OPENAI_DEFAULT_MODEL = "gpt-5";
@@ -47,18 +48,23 @@ export class OpenAIAdapter implements ChatAdapter {
   }
 
   static create(o: AdapterOptions): OpenAIAdapter {
+    // The SDK always sends a key (OPENAI_API_KEY when none is given) and reads OPENAI_BASE_URL itself.
+    assertSecureTransport("openai", o.baseURL ?? envUrl("OPENAI_BASE_URL"), true, o.baseURL ? "base URL" : "OPENAI_BASE_URL");
     return new OpenAIAdapter(o.model, new OpenAI({ apiKey: o.apiKey, baseURL: o.baseURL, timeout: o.timeoutMs, maxRetries: o.maxRetries }),
       { provider: "openai", mode: "json_schema", tokenParam: "max_completion_tokens", maxOutputTokens: o.maxOutputTokens });
   }
 
   /** Azure OpenAI: `model` is the deployment name. apiKey undefined lets the SDK read AZURE_OPENAI_API_KEY. */
   static createAzure(o: AdapterOptions & { endpoint: string; apiVersion: string }): OpenAIAdapter {
+    assertSecureTransport("openai", o.endpoint, true, "Azure endpoint");
     const client = new AzureOpenAI({ endpoint: o.endpoint, apiVersion: o.apiVersion, deployment: o.model, apiKey: o.apiKey, timeout: o.timeoutMs, maxRetries: o.maxRetries });
     return new OpenAIAdapter(o.model, client, { provider: "openai", mode: "json_schema", tokenParam: "max_completion_tokens", maxOutputTokens: o.maxOutputTokens });
   }
 
   /** Requires an explicit baseURL and apiKey: an OpenAI key must never be sent to a third-party host by default. */
   static createCompatible(o: AdapterOptions & { baseURL: string; mode: StructuredMode }): OpenAIAdapter {
+    // A real key only over https or loopback; without one, a keyless LAN server over http is fine.
+    assertSecureTransport("openai-compatible", o.baseURL, Boolean(o.apiKey));
     // Local servers (LM Studio, vLLM, Ollama's /v1) accept any key, but the SDK insists on one.
     const client = new OpenAI({ apiKey: o.apiKey ?? "not-needed", baseURL: o.baseURL, timeout: o.timeoutMs, maxRetries: o.maxRetries });
     return new OpenAIAdapter(o.model, client, { provider: "openai-compatible", mode: o.mode, tokenParam: "max_tokens", maxOutputTokens: o.maxOutputTokens });

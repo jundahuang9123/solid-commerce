@@ -7,6 +7,7 @@
  * ground smaller models, so it is sent in both places.
  */
 import { schemaInstruction, toLlmError } from "../structured.js";
+import { assertSecureTransport, isPrivateHost } from "../transport.js";
 import { LlmError, type AdapterOptions, type ChatAdapter, type Completion, type CompletionRequest } from "../types.js";
 
 export const OLLAMA_DEFAULT_URL = "http://localhost:11434";
@@ -14,39 +15,8 @@ export const OLLAMA_DEFAULT_MODEL = "llama3.1";
 /** The port the Ollama CLI assumes when OLLAMA_HOST names neither a scheme nor a port. */
 export const OLLAMA_DEFAULT_PORT = "11434";
 
-/** IPv4 dotted quad -> its four octets, or undefined. */
-function ipv4(h: string): number[] | undefined {
-  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(h);
-  const o = m?.slice(1).map(Number);
-  return o && o.every((x) => x <= 255) ? o : undefined;
-}
-
-/**
- * Hosts whose traffic never leaves this machine: localhost, 127.0.0.0/8, ::1,
- * and the unspecified addresses 0.0.0.0 / :: (connecting to them reaches the
- * local host, which is how `OLLAMA_HOST=0.0.0.0` works for the CLI).
- * `hostname` as URL.hostname gives it (IPv6 in brackets).
- */
-export function isLoopbackHost(hostname: string): boolean {
-  const h = hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
-  if (h === "localhost" || h.endsWith(".localhost") || h === "::1" || h === "::" || h === "0.0.0.0") return true;
-  return ipv4(h)?.[0] === 127;
-}
-
-/**
- * Loopback plus hosts that are only reachable on a private network: RFC 1918,
- * link-local, CGNAT (100.64/10, e.g. Tailscale), IPv6 ULA / link-local, and
- * names that are not public DNS names (single labels such as "gpu-box",
- * .local, .lan, .internal, .home.arpa).
- */
-export function isPrivateHost(hostname: string): boolean {
-  if (isLoopbackHost(hostname)) return true;
-  const h = hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
-  const o = ipv4(h);
-  if (o) return o[0] === 10 || (o[0] === 172 && o[1] >= 16 && o[1] <= 31) || (o[0] === 192 && o[1] === 168) || (o[0] === 169 && o[1] === 254) || (o[0] === 100 && o[1] >= 64 && o[1] <= 127);
-  if (h.includes(":")) return /^f[cd]/.test(h) || /^fe[89ab]/.test(h);
-  return !h.includes(".") || /\.(local|lan|internal|home\.arpa)$/.test(h);
-}
+// The loopback / private-host rules are shared by every provider: see ../transport.ts.
+export { isLoopbackHost, isPrivateHost } from "../transport.js";
 
 /**
  * OLLAMA_HOST as a base URL. Like the Ollama CLI, the scheme is optional and,
@@ -94,14 +64,8 @@ export class OllamaAdapter implements ChatAdapter {
 
   constructor(readonly model: string, private readonly o: Omit<AdapterOptions, "model">) {
     this.baseURL = (o.baseURL ?? OLLAMA_DEFAULT_URL).replace(/\/+$/, "");
-    if (o.apiKey) {
-      let url: URL;
-      try { url = new URL(this.baseURL); } catch { throw new LlmError("config", `invalid Ollama base URL "${this.baseURL}"`, this.provider); }
-      // The key travels as a bearer token: never over plain http beyond this machine.
-      if (url.protocol !== "https:" && !isLoopbackHost(url.hostname)) {
-        throw new LlmError("config", `refusing to send the Ollama API key over ${url.protocol.replace(":", "")} to ${url.host}; use an https:// URL (or remove OLLAMA_API_KEY for a local server)`, this.provider);
-      }
-    }
+    // The key travels as a bearer token: never over plain http beyond this machine.
+    assertSecureTransport(this.provider, this.baseURL, Boolean(o.apiKey), "Ollama base URL / OLLAMA_HOST");
   }
 
   static create(o: AdapterOptions): OllamaAdapter {
