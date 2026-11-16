@@ -94,6 +94,8 @@ export class LiveDemo implements DemoControls {
   private running?: Promise<void>;
   /** Reset was pressed while an action ran: it runs as soon as that action has stopped. */
   private resetQueued = false;
+  /** close() was called: nothing new starts, not even a queued reset. */
+  private closing = false;
   private budgets = new Map<string, { label: string; mandate: SpendingMandate }>();
   private lastDoc?: string;
   private weather?: WeatherScenario;
@@ -119,6 +121,7 @@ export class LiveDemo implements DemoControls {
    * server. An external server (POD_URL) cannot be restarted from here.
    */
   private async boot() {
+    if (this.closing) return;
     this.broker.cancelAll();
     const old = this.env;
     this.env = undefined;   // never left pointing at an environment that is closed
@@ -193,8 +196,8 @@ export class LiveDemo implements DemoControls {
       },
       refresh: () => this.refresh(),
       showDoc: (url, why) => actAs(QUIET, () => this.showDoc(env, url, why)),
-      cancelled: () => this.resetQueued,
-      pause: async (ms) => { for (const end = Date.now() + ms; Date.now() < end && !this.resetQueued;) await sleep(Math.min(50, end - Date.now())); },
+      cancelled: () => this.resetQueued || this.closing,
+      pause: async (ms) => { for (const end = Date.now() + ms; Date.now() < end && !this.resetQueued && !this.closing;) await sleep(Math.min(50, end - Date.now())); },
     };
   }
 
@@ -210,7 +213,9 @@ export class LiveDemo implements DemoControls {
     const fn = this.action(name, args);
     if (!fn) return { ok: false, status: 404, error: `unknown action ${name}` };
     if (this.busy) {
-      if (name !== "reset" || this.busy === "reset") return { ok: false, status: 409, error: `busy: ${this.busy}` };
+      if (name !== "reset") return { ok: false, status: 409, error: `busy: ${this.busy}` };
+      // A reset is already running: pressing Reset again changes nothing and is not an error.
+      if (this.busy === "reset") return { ok: true };
       // Reset must work even while a step waits for a phone that never answers, or while auto-play
       // is between steps: refuse what is pending (so that step ends the way a rejection would), tell
       // the scenario to start nothing new (DemoContext.cancelled), and restart as soon as it stops.
@@ -237,7 +242,7 @@ export class LiveDemo implements DemoControls {
         this.log.emit("error", { action: name, message: (e as Error).message });
       }
       if (name === "reset") this.resetQueued = false;
-      else if (this.resetQueued) {
+      else if (this.resetQueued && !this.closing) {
         // Hand straight over to the queued reset, with no idle moment in which another action could start.
         return this.start("reset", {}, () => this.boot());
       }
@@ -302,8 +307,10 @@ export class LiveDemo implements DemoControls {
   }
 
   async close() {
-    this.resetQueued = true;   // a running auto-play stops at its next check
+    this.closing = true;   // a running auto-play stops at its next check, and no queued reset boots afterwards
     this.broker.cancelAll();
+    // Let a running action (or a reset that is booting) stop before its environment is closed, but not for ever.
+    await Promise.race([this.running?.catch(() => {}), sleep(5_000)]);
     await this.env?.close().catch(() => {});
     this.css?.proc.kill();
     this.uninstall();

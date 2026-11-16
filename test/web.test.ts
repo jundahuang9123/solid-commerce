@@ -70,7 +70,7 @@ async function run(srv: DemoServer, demo: LiveDemo, name: string, args: Record<s
 }
 
 /** Wait until the action that is running (if any) has finished. */
-const idle = (demo: LiveDemo) => until(() => ([...demo.log.all()].reverse().find((e) => e.type === "busy")?.data.action ?? null) === null);
+const idle = (demo: LiveDemo) => until(() => demo["busy"] === undefined);
 
 /** Wait until a reset has produced a new log (fresh Pod and environment) that has finished starting up. */
 async function resetDone(demo: LiveDemo, previous: DemoEvent, timeoutMs = 60_000) {
@@ -79,6 +79,8 @@ async function resetDone(demo: LiveDemo, previous: DemoEvent, timeoutMs = 60_000
 
 /** Reset into a fresh session (fresh Pod, new environment) with auto-approve on or off. */
 async function freshSession(srv: DemoServer, demo: LiveDemo, auto: boolean) {
+  // Whatever an earlier test left waiting for the phone is approved, so that action can finish first.
+  assert.equal((await post(srv, "/api/auto-approve", { on: true })).status, 200);
   await idle(demo);
   assert.equal((await post(srv, "/api/auto-approve", { on: auto })).status, 200);
   const previous = demo.log.all()[0];
@@ -421,12 +423,49 @@ describe("web demo, live", () => {
 
   test("a non-QUIET caller that sends the quiet header is still traced, downstream too", async () => {
     await idle(demo);
+    // Self-contained: run alone (--test-name-pattern), there is no weather mandate yet.
+    if (!demo.log.all().some((e) => e.type === "budget" && e.data.key === "weather")) {
+      assert.equal((await post(srv, "/api/auto-approve", { on: true })).status, 200);
+      await run(srv, demo, "weather.autoplay");
+    }
     const mandate = [...demo.log.all()].reverse().find((e) => e.type === "budget" && e.data.key === "weather")!.data.mandate;
     const before = demo.log.all().length;
     await actAs("assistant-1", () => fetch(`${demo["env"]!.gateway.url}/budget?mandate=${encodeURIComponent(mandate)}`, { headers: { [QUIET_HEADER]: "1" } }));
     const wire = demo.log.all().slice(before).filter((e) => e.type === "wire").map((e) => `${e.data.from} -> ${e.data.to}`);
     assert.ok(wire.includes("assistant-1 -> gateway"));
     assert.ok(wire.includes("gateway -> pod"), "the gateway's mandate read is shown: the header alone does not hide it");
+  });
+
+  test("Reset pressed again while a reset is running is accepted and changes nothing", async () => {
+    await freshSession(srv, demo, true);
+    const previous = demo.log.all()[0];
+    const seen: DemoEvent[] = [];
+    const off = demo.log.subscribe((e) => seen.push(e));
+    try {
+      assert.equal((await post(srv, "/api/action/reset")).status, 202);
+      assert.equal((await post(srv, "/api/action/reset")).status, 202, "not a 'busy: reset' failure");
+      await resetDone(demo, previous);
+    } finally { off(); }
+    assert.equal(seen.filter((e) => e.type === "session").length, 1, "exactly one fresh session");
+    assert.deepEqual(seen.filter((e) => e.type === "error"), []);
+  });
+
+  // Last in this suite: it closes the shared demo (after() closing it again is harmless).
+  test("close() during auto-play with a Reset queued stops it and boots nothing afterwards", async () => {
+    await freshSession(srv, demo, true);
+    const css = demo["css"];
+    const seen: DemoEvent[] = [];
+    const off = demo.log.subscribe((e) => seen.push(e));
+    try {
+      assert.equal((await post(srv, "/api/action/weather.autoplay")).status, 202);
+      await until(() => seen.some((e) => e.type === "step" && e.data.index === 1 && e.data.state === "active"));
+      assert.equal((await post(srv, "/api/action/reset")).status, 202);
+      await demo.close();
+      await idle(demo);   // whatever was running has stopped (a queued reset would have booted by now)
+      await sleep(500);
+    } finally { off(); }
+    assert.deepEqual(seen.filter((e) => e.type === "session" || e.type === "purchase").map((e) => e.type), [], "no new session and no payment after close()");
+    assert.equal(demo["css"]?.proc.pid, css?.proc.pid, "no new Solid server was started after close()");
   });
 });
 
@@ -457,7 +496,10 @@ describe("web demo, replay", () => {
   test("the shipped recording passes the rehearsal's checks", () => {
     const rec = loadRecording(RECORDING);
     assert.deepEqual(recordingProblems(rec.events), []);
-    assert.doesNotMatch(readFileSync(RECORDING, "utf8"), new RegExp(QUIET_HEADER), "no demo-internal markers");
+    const text = readFileSync(RECORDING, "utf8");
+    assert.doesNotMatch(text, new RegExp(QUIET_HEADER), "no demo-internal markers");
+    // The agents' and the dashboard's bearer secrets (src/trust/agentAuth.ts) never reach a recording.
+    assert.doesNotMatch(text, /sca_[0-9a-f]{8}|Bearer\s+[A-Za-z0-9._~+/-]{8}/, "no bearer secrets");
   });
 
   test("replay refuses answers the recording does not hold, instead of showing the recorded one", async () => {
@@ -515,7 +557,8 @@ describe("web demo, replay", () => {
       assert.match(await dash.locator("#breakit-lead").innerText(), /^Each button replays an attack or failure recorded/, "the Break-it lead does not claim a live run");
       assert.ok(await dash.locator("#locked").isHidden());
       for (const a of ["shoes.buy", "shoes.cancel", "shoes.buy", "shoes.advance", "shoes.advance"]) await perform(demo, a);
-      await dash.locator('[data-k="accept-yes"]:not([disabled])').waitFor();
+      // The shoes tab is not the one on screen: wait for the button to be in the DOM and enabled, not visible.
+      await dash.locator('[data-k="accept-yes"]:not([disabled])').waitFor({ state: "attached" });
       assert.ok(await dash.locator('[data-k="accept-no"]').isDisabled(), "the verdict the recording does not hold cannot be pressed");
       assert.match(await dash.locator('[data-k="accept-no"]').innerText(), /not recorded/);
       assert.ok(await dash.locator("#btn-buy").isDisabled(), "no second Buy while the order waits for a verdict");
