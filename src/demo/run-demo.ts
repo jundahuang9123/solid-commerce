@@ -132,7 +132,7 @@ async function main() {
     const r3 = await a1.purchase({ text, category: "WeatherReport", subject: "Berlin", mandateId: mandate.id });
     say(`Assistant: \x1b[1m${r3.status}\x1b[0m ${r3.code}: ${r3.reason}`);
     const offer = env.sellers.spree.currentOffer();
-    const direct = await postJson(`${env.gateway.url}/authorize`, { transactionId: "tx-bypass", agentId: AGENT_1, mandateId: mandate.id, offer, option: { scheme: "x402", amount: offer.payload.prices[0].amount, currency: "USDC", payTo: offer.payload.prices[0].payTo, resource: offer.payload.resource, challenge: {} } });
+    const direct = await postJson(`${env.gateway.url}/authorize`, { transactionId: "tx-bypass", agentId: AGENT_1, mandateId: mandate.id, offer, option: { scheme: "x402", amount: offer.payload.prices[0].amount, currency: "USDC", payTo: offer.payload.prices[0].payTo, resource: offer.payload.resource, challenge: {} } }, env.agentHeaders(AGENT_1));
     say(`Gateway, called directly by a compromised agent: ${direct.status} ${direct.body.code}: ${direct.body.reason}`);
     await env.pod.putTurtle(doc, orig);
 
