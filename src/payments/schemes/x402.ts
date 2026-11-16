@@ -7,9 +7,12 @@
  *   200 response header  PAYMENT-RESPONSE   base64(JSON SettleResponse)
  *
  * Signatures are real EIP-712 signatures. Only settlement is simulated (see
- * src/payments/sim/facilitator.ts). To move to Base Sepolia, set
- * X402_FACILITATOR_URL to a real facilitator and fund the signer's address
- * with test USDC.
+ * src/payments/sim/facilitator.ts). No environment variable selects the
+ * facilitator: the 402 proxy takes it from its config file
+ * (rails.facilitatorUrl, see proxy.example.json), and the demo passes the
+ * in-process simulation's URL (src/demo/environment.ts). Moving to Base
+ * Sepolia needs a real facilitator there, a funded test key for the signer
+ * and on-chain reconciliation (README, "Making it real").
  */
 import { privateKeyToAccount } from "viem/accounts";
 import { getAddress, keccak256, toHex, type Hex } from "viem";

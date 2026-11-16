@@ -9,7 +9,9 @@
  * Amazon Bedrock and Google Vertex AI are not wired here. The Anthropic SDK
  * ships its own clients for them (@anthropic-ai/bedrock-sdk,
  * @anthropic-ai/vertex-sdk) with the same `beta.messages.create` surface;
- * pass such a client to the constructor to use them.
+ * pass such a client to the constructor to use them. A client passed in this
+ * way is not checked by the plain-http credential rule of create()
+ * (../transport.ts); it owns its transport.
  */
 import Anthropic from "@anthropic-ai/sdk";
 import { toLlmError } from "../structured.js";

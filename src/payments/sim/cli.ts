@@ -16,7 +16,9 @@
  * requests <url>, takes the L402 challenge from the 402, credits a throwaway
  * buyer account on the simulated Lightning node with the invoice amount
  * (POST /fund, a faucet that only the simulation has), pays the invoice and
- * repeats the request with `Authorization: L402 <macaroon>:<preimage>`.
+ * repeats the request with `Authorization: L402 <macaroon>:<preimage>` (plus an
+ * Idempotency-Key header for a method other than GET, which the proxy requires
+ * on paid non-GET routes).
  *
  * What this is NOT: real rails. All state is in memory and lost on exit, the
  * faucet hands out money to anyone who asks, and the buyer side bypasses the
@@ -129,7 +131,9 @@ export async function payL402(url: string, lightningUrl: string, method = "GET")
   if (funded.status !== 200) throw new Error(`funding the buyer account failed: ${JSON.stringify(funded.body)}`);
   const paid = await postJson(`${lightningUrl}/pay`, { paymentRequest: invoice }, { "x-account": account });
   if (paid.status !== 200 || !paid.body?.preimage) throw new Error(`paying the invoice failed: ${JSON.stringify(paid.body)}`);
-  const second = await fetch(url, { method, headers: { authorization: `L402 ${macaroon}:${paid.body.preimage}` } });
+  // A paid non-GET route serves one request per payment and requires an Idempotency-Key on it.
+  const idem: Record<string, string> = method === "GET" || method === "HEAD" ? {} : { "idempotency-key": `cli-${account}` };
+  const second = await fetch(url, { method, headers: { authorization: `L402 ${macaroon}:${paid.body.preimage}`, ...idem } });
   return { status: second.status, headers: Object.fromEntries(second.headers), body: await second.text(), paidSat: amountSat };
 }
 

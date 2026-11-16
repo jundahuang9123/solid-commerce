@@ -5,7 +5,11 @@
  *
  * Adapters call assertSecureTransport() with the URL the SDK will actually
  * use: the configured base URL, else the variable the SDK itself reads from
- * process.env (e.g. ANTHROPIC_BASE_URL), else the SDK's https default.
+ * process.env (e.g. ANTHROPIC_BASE_URL), else the SDK's https default. The
+ * check runs in the factories (create / createAzure / createCompatible, and
+ * the Ollama constructor). An Anthropic, OpenAI or Gemini adapter constructed
+ * in code around a ready client object is not checked: that client owns its
+ * transport.
  *
  * Deliberately strict: a LAN server (http://192.168.x.y, http://gpu-box) with
  * an API key is refused too, because "private" is a guess about the network,

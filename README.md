@@ -28,7 +28,7 @@ And when the seller has no 402 at all, the buyer side can synthesize the same de
 
 ## Run it
 
-Requires Node.js ≥ 22.5. Ledger storage uses the built-in `node:sqlite`.
+Requires Node.js ≥ 22.13 on the 22.x line, or ≥ 23.4. Ledger storage uses the built-in `node:sqlite`, and those are the first releases that load it without the `--experimental-sqlite` flag (no script passes that flag). CI runs on 22.13.0 and on the latest 22.x.
 
 ```bash
 npm install
@@ -60,7 +60,7 @@ Options:
 - `LLM_PROVIDER=anthropic|openai|gemini|ollama|openai-compatible` (with `LLM_MODEL`, and the provider's usual API-key variable) runs the interpreter on an LLM instead of the offline rules. See [`docs/llm-providers.md`](docs/llm-providers.md). The older `INTERPRETER=claude` still works.
 - `POD_URL=http://localhost:3000/ npm run demo` uses an already running Solid server (`npm run pod` starts one).
 - `npm run demo -- --export-examples ontology/examples` writes the generated Pod documents to disk.
-- `npm run proxy -- --config proxy.example.json` runs the 402 proxy in front of an API of your own.
+- `npm run proxy -- --config proxy.example.json` runs the 402 proxy in front of an API of your own. It needs payment rails: `npm run rails` starts the simulated ones (see [the proxy section](#selling-through-http-402-the-proxy)).
 - `npm run compare:interpreters` runs the same requests through every configured LLM provider and reports where they differ.
 
 ### What the demo shows
@@ -118,6 +118,8 @@ flowchart LR
 | Payment schemes | `src/payments/` | x402, L402-style and card/PSP parsers and payers, plus simulated rails, PSP and checkout merchants |
 | Web demo | `src/web/` | Live dashboard, wire trace, phone approval, Break it, shoes checkout, recording and replay |
 
+**Who may call the gateway and the signer** (`src/trust/agentAuth.ts`). Each agent gets its own random bearer secret at setup (`startEnvironment` issues them; they stay in memory and are never written to the Pod). The gateway and the signer store only a SHA-256 of each secret. The acting agent is the one whose secret is presented; a request body whose `agentId` names another agent is refused with `AGENT_MISMATCH`. Every gateway route except `GET /budget` needs a secret, otherwise `401 AGENT_NOT_AUTHENTICATED`. `GET /transactions/:id` answers only the transaction's own agent (`NOT_YOUR_TRANSACTION`) or the operator. The operator (admin) secret is accepted only there and on `POST /reconcile`; it cannot authorize or pay. In the web demo, the Break-it scenarios use it to read a transaction. The signer hands out a credential, new or replayed, only to the agent the authorization names. `GET /budget` stays unauthenticated and shows the limit, committed, settled and available amounts of a mandate.
+
 See [`docs/design.md`](docs/design.md) for the design decisions and threat model.
 
 ## Ontology: representing what the user wants
@@ -131,7 +133,7 @@ Natural language is never stored as authority. The interpreter proposes a struct
 | "The report must be current" | `sc:PurchaseRequirement`, `sc:groundedIn` the meaning | Filters offers. Missing information counts as *not met* |
 | "You may spend up to 1 USDC from approved providers" | `sc:SpendingMandate` ⊑ `odrl:Set` with `odrl:payAmount`, `sc:totalSpend`, `odrl:dateTime`, `sc:seller`, `sc:paymentScheme` constraints | The only thing the gateway accepts as financial authority |
 
-Every record carries `sc:revision`, `sc:status` (`Proposed` / `UserConfirmed` / `Rejected` / `Superseded`), provenance (`prov:wasDerivedFrom` the original statement, `prov:wasRevisionOf` the archived previous revision) and an `sc:Confirmation`. The confirmation is an Ed25519 signature by the user's enrolled approval key over the canonical digest of the record's terms. RDF syntax alone cannot establish consent; the signature and the enrolled key do. Editing any confirmed term in the Pod invalidates it.
+Every record carries `sc:revision`, `sc:status` (`Proposed` / `UserConfirmed` / `Rejected` / `Superseded`), provenance (`prov:wasDerivedFrom` the original statement, `prov:wasRevisionOf` the archived previous revision) and an `sc:Confirmation`. The confirmation is an Ed25519 signature by the user's enrolled approval key over the canonical digest of the record's terms. RDF syntax alone cannot establish consent; the signature and the enrolled key do. Editing any confirmed term in the Pod invalidates it. Putting an older signed revision back in place of a newer one is refused too: the assistant compares each live record with the signed copies archived in `history/`, and the gateway remembers the newest mandate revision it has verified (`MANDATE_SUPERSEDED`). An agent that also deletes the history documents defeats the assistant's check; see the [threat table](docs/design.md#threats-considered).
 
 Real generated examples are in [`ontology/examples/`](ontology/examples/). The `sc:` namespace (`https://w3id.org/solid-commerce#`) is a placeholder and not a registered standard.
 
@@ -143,11 +145,26 @@ A real seller does not need to rewrite its API. `src/proxy/` is a reverse proxy,
 - An unpaid request to a paid route gets one 402 with x402, L402-style and card challenges. A paid request is settled first, then forwarded upstream with all payment headers stripped. The response carries a seller-signed receipt over the exact bytes returned.
 - Each payment is bound to one resource and one request target. A credential bought for one route never opens another. Re-presenting a settled credential re-delivers a GET without charging again; for other methods a delivered payment is used up.
 - Route matching is canonical. Respellings of a paid path, other methods on it and ambiguous escapes are refused (404 / 405 / 400), never passed through for free.
-- If the upstream fails after payment, the buyer gets `502` with `paid: true` and can retry with the same credential.
+- A paid route with a method other than GET needs an `Idempotency-Key` header on the paid request. Without one, a request that carries a payment credential gets `400 idempotency_key_required` before any money moves, and the 402 says the key is required. The payment then serves that one request (key plus a digest of target, content type and body): an identical retry is forwarded again after an upstream failure or refusal, or answered from the stored response once delivered (`sc-idempotent-replay: true`). Any other request gets `409 idempotency_conflict` before delivery and `402 credential_consumed` after it.
+- If the upstream fails after payment, the buyer gets `502` with `paid: true` and can retry with the same credential (for a non-GET route: the same request with the same `Idempotency-Key`).
+
+The proxy needs payment rails that speak the HTTP surfaces of `src/payments/sim/`, and in this prototype only the simulations do. To try it with `proxy.example.json`, use two terminals:
 
 ```bash
-npm run proxy -- --config proxy.example.json
+# Terminal 1: simulated x402 facilitator, Lightning node and PSP on the config's rails ports
+# (127.0.0.1:4021-4023), plus a stand-in API on its upstream address (127.0.0.1:9000)
+npm run rails -- --example-upstream
 ```
+
+```bash
+# Terminal 2: the proxy on 127.0.0.1:8402, then one unpaid and one paid request
+npm run proxy -- --config proxy.example.json &
+curl -i http://127.0.0.1:8402/v1/aqi/current                  # 402: x402, L402 and card challenges
+npm run rails -- pay http://127.0.0.1:8402/v1/aqi/current     # pays 8 SAT over L402: HTTP 200 with an sc-receipt
+kill %1                                                       # stops the proxy
+```
+
+`npm run rails -- pay <url>` is a minimal L402 buyer for trying the seller side by hand. It credits a throwaway account on the simulated Lightning node (a faucet only the simulation has), pays whatever the 402 asks and repeats the request with the credential (with `--method POST` for a paid POST route, plus an `Idempotency-Key`). It bypasses the gateway, mandates and signer that the assistant uses. All rails state is in memory and is lost when `npm run rails` stops. Without `--example-upstream`, put your own API on the config's `upstream` address. `test/llm.test.ts` runs the same three commands with the real CLIs, on free ports.
 
 Keys come only from environment variables or files named in the config, never from the config itself. Missing keys are generated for the process with a loud warning. The demo weather sellers are themselves plain APIs behind this proxy.
 
@@ -163,7 +180,7 @@ Most shops will never answer with 402. For them the assistant uses an ACP-style 
 
 ## LLM providers
 
-The interpreter can run on Anthropic Claude (also Bedrock and Vertex through the Anthropic SDK), OpenAI or Azure OpenAI, Google Gemini or Vertex AI, Ollama, or any OpenAI-compatible endpoint (Mistral, Groq, OpenRouter, Together, DeepSeek, LM Studio, vLLM). Each adapter uses the provider's native structured-output mode and then validates the answer locally, with one repair attempt.
+The interpreter can run on Anthropic Claude, OpenAI or Azure OpenAI, Google Gemini or Vertex AI, Ollama, or any OpenAI-compatible endpoint (Mistral, Groq, OpenRouter, Together, DeepSeek, LM Studio, vLLM). Claude on Amazon Bedrock or Google Vertex AI is not wired: no `LLM_PROVIDER` value selects it, and its SDK clients (`@anthropic-ai/bedrock-sdk`, `@anthropic-ai/vertex-sdk`) are not dependencies. Such a client can be passed to the Anthropic adapter in code; that path is untested. Each adapter uses the provider's native structured-output mode and then validates the answer locally, with one repair attempt. An adapter created from configuration (`createLlm`, `LLM_PROVIDER`) refuses to send an API key or token over plain `http://` to a host other than loopback.
 
 Whatever the model says still passes the vocabulary check, clarification and the user's signature. A weaker model can misread a request, but it cannot create spending authority. Setup per provider: [`docs/llm-providers.md`](docs/llm-providers.md).
 
@@ -209,9 +226,10 @@ All checks from the implementation brief are automated in `test/e2e.test.ts`. Th
 | Solid Protocol over HTTP against Community Solid Server 7 | CSS runs with its open development config (no Solid-OIDC). WAC documents are generated (`buildAcls`) but not applied |
 | x402 v2 headers and payload shapes; EIP-712 `TransferWithAuthorization` signatures (viem) | Facilitator and USDC ledger are in-memory. Network IDs point at Base Sepolia but nothing touches a chain |
 | Ed25519 signatures on offers, receipts, authorizations and user confirmations | User approval device is in-process (stands in for a passkey or phone) |
-| SQLite ledger with `BEGIN IMMEDIATE` reservations | Signer idempotency state is in memory |
+| SQLite ledger with `BEGIN IMMEDIATE` reservations and a per-mandate revision high-water mark | The ledger runs in memory (`:memory:`) in every entry point (`npm run demo`, `npm run demo:web` and the tests): a restart forgets all budget state and revision marks. `ledgerPath` accepts a file, but no entry point sets it and no test runs several processes on one file. Signer idempotency state is in memory |
+| Per-agent secrets for the gateway and signer (only SHA-256 hashes stored) | Bearer secrets over plain loopback HTTP, issued at startup, with no rotation, expiry or revocation. A deployment would use mTLS or per-request signatures over TLS |
 | SHACL validation (`rdf-validate-shacl`) | Signing uses canonical JSON of parsed terms, not RDF Dataset Canonicalization (RDFC-1.0) |
-| 402 proxy over real HTTP | Proxy settlement state (route bindings) is in memory |
+| 402 proxy over real HTTP | Proxy settlement state (route bindings, Idempotency-Key bindings, stored responses) is in memory: after a proxy restart a consumed non-GET credential can deliver one more request. `npm run rails` serves the simulated rails for it |
 | ACP-style checkout sessions, delegated tokens and orders over real HTTP | Merchants and PSP are simulations; ACP shapes are modelled on the public description, not verified against the specification |
 | Official provider SDKs (`@anthropic-ai/sdk`, `openai`, `@google/genai`) and Ollama's REST API | Adapters tested only against local mock servers, never against the live services |
 | | L402 macaroon and invoices are simplified; the card PSP is a mock |
@@ -223,8 +241,9 @@ All checks from the implementation brief are automated in `test/e2e.test.ts`. Th
 3. **L402:** replace the simulated node with LND/CLN and use real macaroons (e.g. Aperture).
 4. **Card:** use a PSP's test mode. The vault stores only the PSP's payment-method token.
 5. **Signer hardening:** persistent idempotency store, HSM/KMS or a passkey-protected key, rate limits.
-6. **Interpretation research:** run `npm run compare:interpreters` against live providers and compare the rule-based and LLM interpreters on intent preservation across sessions and changing preferences (see Frohn, *From Prompting to Grounding*).
-7. **Checkout:** verify the ACP-style shapes against the current Agentic Commerce Protocol specification and a real PSP's delegated-payment API; persist the proxy's settlement bindings.
+6. **Agent authentication:** replace the bearer secrets with mTLS or per-request signatures (e.g. HTTP Message Signatures) over TLS, with rotation and revocation. Give the gateway a ledger file (`ledgerPath`) so budgets and revision marks survive a restart, and test several gateway processes on one file.
+7. **Interpretation research:** run `npm run compare:interpreters` against live providers and compare the rule-based and LLM interpreters on intent preservation across sessions and changing preferences (see Frohn, *From Prompting to Grounding*).
+8. **Checkout:** verify the ACP-style shapes against the current Agentic Commerce Protocol specification and a real PSP's delegated-payment API; persist the proxy's settlement bindings.
 
 Before using live funds, review the applicable privacy and payment obligations and the operational recovery procedures.
 

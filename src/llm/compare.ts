@@ -29,6 +29,7 @@ import { PodLayout } from "../pod/layout.js";
 import { createLlm, llmConfigFromEnv, providerConfigFromEnv, type LlmConfig } from "./config.js";
 import { OLLAMA_DEFAULT_URL } from "./providers/ollama.js";
 import { LlmError, PROVIDERS, type ProviderName } from "./types.js";
+import { fmt, toAtomic } from "../util/money.js";
 
 export interface CompareCase {
   id: string;
@@ -142,8 +143,14 @@ export function assess(c: CompareCase, interp: Interpretation): Pick<CaseRun, "o
     for (const m of mandates) {
       if (m.currency !== cap.currency || Number(m.totalLimit) > Number(cap.totalLimit) || Number(m.maxPerTransaction) > Number(cap.totalLimit)) failures.push(`expected at most ${cap.currency} ${cap.totalLimit}, got ${describe(m)}`);
     }
-    const sum = mandates.filter((m) => m.currency === cap.currency).reduce((a, m) => a + Number(m.totalLimit), 0);
-    if (mandates.length > 1 && sum > Number(cap.totalLimit)) failures.push(`expected at most ${cap.currency} ${cap.totalLimit} in total, got ${mandates.length} mandates worth ${dec(String(sum))} ${cap.currency} together`);
+    // Summed exactly in atomic units: as floats, 0.1 + 0.2 would exceed a cap of 0.3.
+    const atomic = (v: string) => { try { return BigInt(toAtomic(v, cap.currency)); } catch { return undefined; } };
+    const parts = mandates.filter((m) => m.currency === cap.currency).map((m) => atomic(m.totalLimit));
+    const sum = parts.every((x) => x !== undefined) ? parts.reduce((a, x) => a! + x!, 0n) : undefined;
+    const limit = atomic(cap.totalLimit);
+    if (mandates.length > 1 && (sum === undefined || limit === undefined || sum > limit)) {
+      failures.push(`expected at most ${cap.currency} ${cap.totalLimit} in total, got ${mandates.length} mandates worth ${sum === undefined ? "an amount that does not parse" : fmt(sum, cap.currency)} together`);
+    }
   } else if (typeof e.authority === "object") {
     const want = e.authority;
     const hit = mandates.find((m) => m.currency === want.currency && dec(m.totalLimit) === dec(want.totalLimit) && (!want.maxPerTransaction || dec(m.maxPerTransaction) === dec(want.maxPerTransaction)));
