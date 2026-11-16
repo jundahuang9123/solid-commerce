@@ -320,6 +320,43 @@ describe("web demo, live", () => {
     }
   });
 
+  test("Record in a browser: a session-<HHMM> default name, and the replace prompt names the file the server would replace", async (t) => {
+    let playwright: { chromium: { launch(): Promise<any> } } | undefined;
+    try { playwright = createRequire(import.meta.url)("playwright"); } catch { /* not installed here */ }
+    if (!playwright) return t.skip("playwright is not available");
+    await idle(demo);
+    const browser = await playwright.chromium.launch();
+    try {
+      const dash = await browser.newPage();
+      const errors: string[] = [];
+      dash.on("pageerror", (e: Error) => errors.push(e.message));
+      const prompts: string[] = [];
+      let answer = false;
+      dash.on("dialog", (d: { message(): string; accept(): Promise<void>; dismiss(): Promise<void> }) => { prompts.push(d.message()); return answer ? d.accept() : d.dismiss(); });
+      await dash.goto(srv.dashboardUrl);
+      await dash.locator("#record-form button:not([disabled])").waitFor();
+      assert.match(await dash.locator("#record-name").inputValue(), /^session-\d{4}$/, "never the shipped 'talk' by default");
+      const file = join(recordings, "browser-take.json");
+      await dash.locator("#record-name").fill("Browser-Take");
+      await dash.locator("#record-form button, #record-form [type=submit]").first().click();
+      await until(() => existsSync(file));
+      const size = statSync(file).size;
+      await dash.locator("#record-form button, #record-form [type=submit]").first().click();
+      await until(() => prompts.length === 1);
+      assert.equal(prompts[0], "recordings/browser-take.json already exists. Replace it?", "the prompt names the real (normalised) file");
+      await sleep(200);
+      assert.equal(statSync(file).size, size, "dismissed: the recording is untouched");
+      answer = true;
+      await post(srv, "/api/action/weather.next");   // something new in the log, so a replaced file differs
+      await idle(demo);
+      await dash.locator("#record-form button, #record-form [type=submit]").first().click();
+      await until(() => prompts.length === 2 && statSync(file).size !== size);
+      assert.deepEqual(errors, []);
+    } finally {
+      await browser.close();
+    }
+  });
+
   test("Break it in the middle of the weather steps: no fixture signs the mandate the phone is about to be asked for", async () => {
     await freshSession(srv, demo, true);
     for (const step of ["Ask", "Clarify"]) {
