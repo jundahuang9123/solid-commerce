@@ -105,6 +105,10 @@ export class LiveDemo implements DemoControls {
   private constructor(private readonly opts: LiveOptions) {
     // Installed before the environment starts: PodClient captures fetch when constructed.
     this.uninstall = this.tap.install();
+    // Once Reset is pressed, no new payment: a Pay step already past the gateway asks the signer in
+    // vain (503, "payment_failed"), so nothing is signed or settled after the press. Requests already
+    // sent (a credential the signer has issued, its delivery) still complete.
+    this.tap.gate = (_from, to) => ((this.resetQueued || this.closing) && to.role === "signer" ? "Reset was pressed, so the demo signs no new payment" : undefined);
     this.broker = new ApprovalBroker(this.log, () => this.env!.device, (w) => this.nameOf(w), opts.autoApproveDelayMs ?? 600);
   }
 

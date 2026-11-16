@@ -452,6 +452,33 @@ describe("web demo, live", () => {
     assert.ok(events.some((e) => e.type === "step" && e.data.index === 0 && e.data.state === "done"));
   });
 
+  test("Reset pressed while the Pay step runs: the signer is not asked to pay, so no payment is made", async () => {
+    await freshSession(srv, demo, true);
+    const env = demo["env"]!;
+    const previous = demo.log.all()[0];
+    const seen: DemoEvent[] = [];
+    let pressed = false;
+    // Press Reset at the latest possible moment: the gateway has just authorised the payment.
+    const off = demo.log.subscribe((e) => {
+      seen.push(e);
+      if (!pressed && e.type === "wire" && e.data.to === "gateway" && /^\/authorize/.test(e.data.path) && e.data.status === 200) {
+        pressed = true;
+        assert.deepEqual(demo.act("reset", {}), { ok: true });
+      }
+    });
+    try {
+      assert.equal((await post(srv, "/api/action/weather.autoplay")).status, 202);
+      await resetDone(demo, previous);
+    } finally { off(); }
+    assert.ok(pressed, "the Pay step reached the gateway");
+    const signer = seen.filter((e) => e.type === "wire" && e.data.to === "signer");
+    assert.deepEqual(signer.map((e) => e.data.status), [503], "the signer call was refused by the demo, not sent");
+    assert.match(signer[0].data.response.join(" "), /not sent.*Reset/);
+    assert.equal(env.rails.facilitator.chain.transfers.length, 0, "nothing moved on the rail");
+    assert.ok(!seen.some((e) => e.type === "purchase" && e.data.status === "completed"), "no completed purchase");
+    assert.equal(seen.filter((e) => e.type === "reset").length, 1);
+  });
+
   test("--rehearse refuses to save a weather run that did not go as scripted (stale data delivered)", async () => {
     await freshSession(srv, demo, true);
     demo["env"]!.sellers.spree.setBehaviour({ observationAgeMinutes: 120 });

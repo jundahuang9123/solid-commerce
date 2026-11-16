@@ -55,6 +55,12 @@ export class WireTap {
   private seq = 0;
   /** URL of the most recent document written to the Pod (any component). */
   lastPodWrite?: string;
+  /**
+   * Optional: a reason to refuse a traced request before it is sent (LiveDemo: the signer, once Reset
+   * was pressed). The caller gets a 503 JSON answer `{ error: "DEMO_RESET", reason }`, as if the
+   * service had refused, and the wire panel shows the request as refused by the demo, not sent.
+   */
+  gate?: (from: string | undefined, to: Component) => string | undefined;
 
   constructor(private readonly log: EventLog) {}
 
@@ -86,6 +92,11 @@ export class WireTap {
       const started = Date.now();
       const base = { id: ++tap.seq, from, to: to.id, method, path: tap.pathOf(url, to), pod: to.role === "pod" };
       const request = requestNotes(headers, typeof init?.body === "string" ? init.body : undefined, url.pathname);
+      const refused = tap.gate?.(from, to);
+      if (refused) {
+        tap.log.emit("wire", { ...base, status: 503, ms: 0, request, response: [`refused by the demo, not sent: ${refused}`] });
+        return new Response(JSON.stringify({ error: "DEMO_RESET", reason: refused }), { status: 503, headers: { "content-type": "application/json" } });
+      }
       let res: Response;
       try { res = await original(input, init); }
       catch (err) {
