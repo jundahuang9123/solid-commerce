@@ -9,7 +9,6 @@
  * step may wait for a person to approve on their phone.
  */
 import type { ChildProcess } from "node:child_process";
-import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { startCss, startCheckoutEnvironment, AGENT_1, AGENT_2, type CheckoutEnvironment } from "../demo/environment.js";
 import type { SpendingMandate } from "../model.js";
@@ -20,6 +19,7 @@ import { WireTap, QUIET, actAs, type Component } from "./wire.js";
 import { WeatherScenario } from "./scenarios/weather.js";
 import { Guardrails } from "./scenarios/guardrails.js";
 import { ShoesScenario } from "./scenarios/shoes.js";
+import { sleep } from "./scenarios/common.js";
 
 export type ActionResult = { ok: true } | { ok: false; status: number; error: string };
 
@@ -29,6 +29,8 @@ export interface DemoControls {
   readonly log: EventLog;
   act(name: string, args: Record<string, unknown>): ActionResult;
   decide(id: string, approved: boolean, via: Via): boolean;
+  /** Whether `id` was a real approval that has already been answered (a benign race, not an error). */
+  wasDecided?(id: string): boolean;
   setAuto(on: boolean): void;
   /** Save the log since the last reset as recordings/<name>.json; refuses an existing file unless `overwrite`. */
   record(name: string, opts?: { overwrite?: boolean }): string;
@@ -70,6 +72,14 @@ export interface DemoContext {
   /** Put a Pod document's Turtle into the Pod panel. */
   showDoc(url: string, why: string): Promise<void>;
   stepPauseMs: number;
+  /**
+   * True once Reset was pressed while this action runs. Scenarios check it between steps and
+   * before paying, and start nothing new; a call already in flight (a purchase the gateway has
+   * authorised, say) still finishes, since the services cannot be interrupted mid-request.
+   */
+  cancelled(): boolean;
+  /** Wait `ms`, or less if Reset is pressed meanwhile. */
+  pause(ms: number): Promise<void>;
 }
 
 export class LiveDemo implements DemoControls {
@@ -82,6 +92,8 @@ export class LiveDemo implements DemoControls {
   private uninstall: () => void;
   private busy?: string;
   private running?: Promise<void>;
+  /** Reset was pressed while an action ran: it runs as soon as that action has stopped. */
+  private resetQueued = false;
   private budgets = new Map<string, { label: string; mandate: SpendingMandate }>();
   private lastDoc?: string;
   private weather?: WeatherScenario;
@@ -100,15 +112,36 @@ export class LiveDemo implements DemoControls {
     return d;
   }
 
-  /** (Re)start the environment with a fresh Pod and an empty event log. */
+  /**
+   * (Re)start the environment with a fresh Pod and an empty event log. If the
+   * Community Solid Server this demo started has died (crash, OOM, killed), a
+   * new one is started first, so Reset is also the way out of a dead Pod
+   * server. An external server (POD_URL) cannot be restarted from here.
+   */
   private async boot() {
     this.broker.cancelAll();
-    if (this.env) await this.env.close();
+    const old = this.env;
+    this.env = undefined;   // never left pointing at an environment that is closed
+    if (old) await old.close().catch(() => {});
     this.tap.clear();
     this.budgets.clear();
     this.lastDoc = undefined;
-    if (!this.opts.podUrl && !process.env.POD_URL) this.css ??= await startCss();
-    const env = await startCheckoutEnvironment({ podUrl: this.opts.podUrl ?? this.css?.url, decider: this.broker.decider });
+    const external = this.opts.podUrl ?? process.env.POD_URL;
+    let env: CheckoutEnvironment;
+    try {
+      if (!external) {
+        if (this.css && !(await cssAlive(this.css))) {
+          this.css.proc.kill("SIGKILL");
+          this.css = undefined;
+        }
+        this.css ??= await startCss();
+      }
+      env = await startCheckoutEnvironment({ podUrl: external ?? this.css?.url, decider: this.broker.decider });
+    } catch (e) {
+      this.broker.reopen();   // a later Reset (or close) must not find the broker refusing everything
+      const where = external ? `the Solid server at ${external} is unreachable or failing` : "the Community Solid Server could not be (re)started";
+      throw new Error(`could not start a fresh session (${where}): ${(e as Error).message}. Press Reset again; if it keeps failing, restart the demo or switch to --replay.`);
+    }
     this.env = env;
     this.log.reset({ mode: "live" });
     this.broker.reopen();
@@ -160,6 +193,8 @@ export class LiveDemo implements DemoControls {
       },
       refresh: () => this.refresh(),
       showDoc: (url, why) => actAs(QUIET, () => this.showDoc(env, url, why)),
+      cancelled: () => this.resetQueued,
+      pause: async (ms) => { for (const end = Date.now() + ms; Date.now() < end && !this.resetQueued;) await sleep(Math.min(50, end - Date.now())); },
     };
   }
 
@@ -176,12 +211,22 @@ export class LiveDemo implements DemoControls {
     if (!fn) return { ok: false, status: 404, error: `unknown action ${name}` };
     if (this.busy) {
       if (name !== "reset" || this.busy === "reset") return { ok: false, status: 409, error: `busy: ${this.busy}` };
-      // Reset must work even while a step waits for a phone that never answers: refuse what is
-      // pending (so that step ends the way a rejection would), then restart once it has.
-      this.broker.cancelAll();
-      void this.running?.then(() => this.act("reset", {}));
+      // Reset must work even while a step waits for a phone that never answers, or while auto-play
+      // is between steps: refuse what is pending (so that step ends the way a rejection would), tell
+      // the scenario to start nothing new (DemoContext.cancelled), and restart as soon as it stops.
+      // Pressing Reset again meanwhile changes nothing: one reset is already on its way.
+      if (!this.resetQueued) {
+        this.resetQueued = true;
+        this.broker.cancelAll();
+        this.log.emit("reset.queued", { after: this.busy });
+      }
       return { ok: true };
     }
+    this.start(name, args, fn);
+    return { ok: true };
+  }
+
+  private start(name: string, args: Record<string, unknown>, fn: () => Promise<unknown>) {
     this.busy = name;
     this.log.emit("busy", { action: name });
     this.running = (async () => {
@@ -190,14 +235,17 @@ export class LiveDemo implements DemoControls {
         await fn();
       } catch (e) {
         this.log.emit("error", { action: name, message: (e as Error).message });
-      } finally {
-        // Still busy while refreshing: the next action starts only after the "idle" event.
-        await this.refresh().catch(() => {});
-        this.busy = undefined;
-        this.log.emit("busy", { action: null });
       }
+      if (name === "reset") this.resetQueued = false;
+      else if (this.resetQueued) {
+        // Hand straight over to the queued reset, with no idle moment in which another action could start.
+        return this.start("reset", {}, () => this.boot());
+      }
+      // Still busy while refreshing: the next action starts only after the "idle" event.
+      await this.refresh().catch(() => {});
+      this.busy = undefined;
+      this.log.emit("busy", { action: null });
     })();
-    return { ok: true };
   }
 
   private action(name: string, args: Record<string, unknown>): (() => Promise<unknown>) | undefined {
@@ -210,13 +258,15 @@ export class LiveDemo implements DemoControls {
   }
 
   decide(id: string, approved: boolean, via: Via) { return this.broker.decide(id, approved, via); }
+  wasDecided(id: string) { return this.broker.wasDecided(id); }
   setAuto(on: boolean) { this.broker.setAuto(on); }
 
   record(name: string, opts: { overwrite?: boolean } = {}): string {
     const path = join(this.opts.recordingsDir, `${name.toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-|-$/g, "") || "session"}.json`);
     // recordings/talk.json is the shipped fallback: never replace a recording by accident.
-    if (!opts.overwrite && existsSync(path)) throw new RecordingExists(path);
-    this.log.save(path);
+    // The exclusive write ("wx") makes the existence check and the write one step.
+    try { this.log.save(path, { overwrite: opts.overwrite === true }); }
+    catch (e) { if ((e as NodeJS.ErrnoException).code === "EEXIST") throw new RecordingExists(path); throw e; }
     this.log.emit("recorded", { path, events: this.log.all().length });
     return path;
   }
@@ -252,9 +302,17 @@ export class LiveDemo implements DemoControls {
   }
 
   async close() {
+    this.resetQueued = true;   // a running auto-play stops at its next check
     this.broker.cancelAll();
     await this.env?.close().catch(() => {});
     this.css?.proc.kill();
     this.uninstall();
   }
+}
+
+/** The Community Solid Server child is still running and answering. */
+async function cssAlive(css: { url: string; proc: ChildProcess }): Promise<boolean> {
+  if (css.proc.exitCode !== null || css.proc.signalCode !== null) return false;
+  try { return (await actAs(QUIET, () => fetch(css.url, { signal: AbortSignal.timeout(3000) }))).status < 500; }
+  catch { return false; }
 }

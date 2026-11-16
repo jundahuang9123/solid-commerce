@@ -12,7 +12,7 @@ import { readWallet } from "../../pod/wallet.js";
 import { fmt } from "../../util/money.js";
 import { actAs } from "../wire.js";
 import type { ActionResult, DemoContext } from "../live.js";
-import { recordLabel, sleep } from "./common.js";
+import { recordLabel, Unavailable } from "./common.js";
 
 export const WEATHER_STEPS = ["Ask", "Clarify", "Approve", "Compare", "Pay (HTTP 402)", "Deliver & check", "Evidence"];
 export const WEATHER_REQUEST = "Get me a current Berlin weather report. I prefer providers that include an hourly forecast. You may spend up to 1 USDC from approved providers.";
@@ -30,6 +30,8 @@ export class WeatherScenario {
   private mandate?: SpendingMandate;
   private intention = { category: "WeatherReport", subject: "Berlin" as string | undefined, text: WEATHER_REQUEST };
   private result?: PurchaseResult;
+  /** Set once the phone was asked for the mandate and did not sign it: the user's "no" stands until Reset. */
+  private mandateDeclined = false;
 
   constructor(private readonly d: DemoContext) {
     this.assistant = d.env.assistant(AGENT_1, { log: d.agentLog(AGENT) });
@@ -51,9 +53,14 @@ export class WeatherScenario {
     return { ok: true };
   }
 
-  /** The guardrail scenarios need the main mandate; if the presenter starts there, set it up as a fixture. */
+  /**
+   * The guardrail scenarios need the main mandate; if the presenter starts there, set it up as a fixture.
+   * Never after the user was asked on the phone and did not sign it: a fixture must not stand in for a
+   * mandate the user rejected.
+   */
   async groundedMandate(): Promise<SpendingMandate> {
     if (this.mandate) return this.mandate;
+    if (this.mandateDeclined) throw new Unavailable("Not run: the 1 USDC mandate was rejected on the phone. Reset and approve it at step 3 first.");
     return this.d.fixture("weather common ground and the 1 USDC mandate, as in steps 1 to 3", () => actAs(AGENT, async () => {
       const { ctx, result } = await this.assistant.understand(WEATHER_REQUEST, this.d.approved("sellers"));
       const proposals = [...result.proposals, ...result.questions.flatMap((q) => this.assistant.answer(q, DEFAULT_CHOICE, ctx))];
@@ -68,10 +75,11 @@ export class WeatherScenario {
     return m;
   }
 
+  /** Every step in turn; stops at once when a Reset was asked for (see DemoContext.cancelled). */
   private async autoplay() {
-    while (this.next < WEATHER_STEPS.length) {
+    while (this.next < WEATHER_STEPS.length && !this.d.cancelled()) {
       if (!(await this.step())) return;
-      if (this.next < WEATHER_STEPS.length) await sleep(this.d.stepPauseMs);
+      if (this.next < WEATHER_STEPS.length) await this.d.pause(this.d.stepPauseMs);
     }
   }
 
@@ -79,6 +87,7 @@ export class WeatherScenario {
   private async step(text?: string): Promise<boolean> {
     const i = this.next;
     if (i >= WEATHER_STEPS.length) { this.say("assistant", "This scenario is complete. Reset to run it again."); return false; }
+    if (this.d.cancelled()) return false;   // a Reset is waiting: start nothing new, in particular no payment
     this.d.log.emit("step", { scenario: "weather", index: i, state: "active" });
     let outcome: "done" | "failed" = "failed";
     try {
@@ -156,6 +165,7 @@ export class WeatherScenario {
       items: [...confirmed.map((r) => ({ label: recordLabel(r), kind: r.kind, approved: true })), ...rejected.map((r) => ({ label: recordLabel(r), kind: r.kind, approved: false }))],
     });
     const m = confirmed.find((r): r is SpendingMandate => r.kind === "mandate");
+    if (!m && proposals.some((r) => r.kind === "mandate")) this.mandateDeclined = true;
     if (!m) { this.say("assistant", "No spending mandate was approved, so I cannot pay anyone. Reset to try again."); return false; }
     this.setMandate(m);
     return true;
@@ -190,7 +200,7 @@ export class WeatherScenario {
   }
 
   private async pay() {
-    if (!this.mandate) return false;
+    if (!this.mandate || this.d.cancelled()) return false;
     const r = await this.assistant.purchase({ ...this.intention, mandateId: this.mandate.id });
     this.result = r;
     this.d.log.emit("purchase", {

@@ -14,10 +14,12 @@ import { newId } from "../../util/crypto.js";
 import { fmt, toMajor } from "../../util/money.js";
 import { actAs, QUIET } from "../wire.js";
 import type { DemoContext } from "../live.js";
+import { Unavailable } from "./common.js";
 
 const BERLIN = { text: "Get me a current Berlin weather report.", category: "WeatherReport", subject: "Berlin" };
 const id = (agent: string) => agent.split(":").pop()!;
-type Tone = "blocked" | "ok" | "warn" | "fail";
+/** "unavailable": the card could not run in this session (not a verdict on the guardrail). */
+type Tone = "blocked" | "ok" | "warn" | "fail" | "unavailable";
 
 /** What a compromised agent might try: rewrite every decimal limit in the mandate to 100 (as in run-demo.ts). */
 const raiseLimits = (ttl: string) => ttl.replace(/odrl:rightOperand (?:"\d+(?:\.\d+)?"\^\^xsd:decimal|\d+\.\d+)/g, 'odrl:rightOperand "100.00"^^xsd:decimal');
@@ -43,7 +45,8 @@ export class Guardrails {
         const out = await run();
         this.d.log.emit("guard", { id: card, state: "done", ...out, recoverable: card === "crash" && Boolean(this.crashed) });
       } catch (e) {
-        this.d.log.emit("guard", { id: card, state: "done", tone: "fail", lines: [(e as Error).message] });
+        this.d.log.emit("guard", { id: card, state: "done", tone: e instanceof Unavailable ? "unavailable" : "fail", lines: [(e as Error).message] });
+        if (e instanceof Unavailable) return;   // no mandate, so no budget line either
       }
       await this.summary();
     };
@@ -75,7 +78,8 @@ export class Guardrails {
         const p = offer.payload.prices.find((x) => x.scheme === "x402")!;
         const direct = await postJson(`${env.gateway.url}/authorize`, { transactionId: newId("tx-bypass-"), agentId: AGENT_1, mandateId: m.id, offer, option: { scheme: "x402", amount: p.amount, currency: "USDC", payTo: p.payTo, resource: offer.payload.resource, challenge: {} } }, env.agentHeaders(AGENT_1));
         return {
-          tone: direct.status === 403 ? "blocked" as const : "fail" as const,
+          // Blocked for the reason the talk gives (the user's signature no longer matches), not just any 403.
+          tone: direct.status === 403 && direct.body?.code === "MANDATE_NOT_CONFIRMED" ? "blocked" as const : "fail" as const,
           lines: [`${direct.status} ${direct.body?.code}`, String(direct.body?.reason ?? ""), `assistant itself: ${viaAssistant.status} ${viaAssistant.code ?? ""}`],
         };
       } finally {
@@ -172,7 +176,8 @@ export class Guardrails {
       await postJson(`${env.gateway.url}/transactions/${txId}/outcome`, { agentId: AGENT_1, result: "paid", receipt: rh ? b64json.decode(rh) : undefined }, env.agentHeaders(AGENT_1));
       const transfers = env.rails.facilitator.chain.transfers.length - transfersBefore;
       return {
-        tone: other.status === 402 && transfers === 1 ? "blocked" as const : "fail" as const,
+        // Held: Havel refuses Spree's payment, and Spree re-delivers for the one transfer without charging again.
+        tone: other.status === 402 && transfers === 1 && spreeRes.every((r) => r.status === 200) ? "blocked" as const : "fail" as const,
         lines: [`Havel: ${other.status}${otherBody.error ? ` (${otherBody.reason ?? otherBody.error})` : ""}`, `Spree: ${spreeRes.map((r) => r.status).join(", ")} · ${transfers} transfer${transfers === 1 ? "" : "s"} on the rail`],
       };
     });
@@ -185,7 +190,7 @@ export class Guardrails {
     const p = offer.payload.prices[0];
     const g = await actAs(id(AGENT_1), () => postJson(`${env.gateway.url}/authorize`, { transactionId: newId("tx-shady-"), agentId: AGENT_1, mandateId: m.id, offer, option: { scheme: "x402", amount: p.amount, currency: "USDC", payTo: p.payTo, resource: offer.payload.resource, challenge: {} } }, env.agentHeaders(AGENT_1)));
     return {
-      tone: g.status === 403 ? "blocked" as const : "fail" as const,
+      tone: g.status === 403 && g.body?.code === "SELLER_NOT_IN_MANDATE" ? "blocked" as const : "fail" as const,
       lines: [`${g.status} ${g.body?.code}`, this.named(String(g.body?.reason ?? "")), `Shady Forecasts received ${fmt(env.rails.facilitator.chain.balanceOf(offer.payload.prices[0].payTo!), "USDC")}`],
     };
   }

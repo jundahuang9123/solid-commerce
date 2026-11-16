@@ -31,6 +31,8 @@ export type Via = "phone" | "screen" | "auto";
 export class ApprovalBroker {
   private pending = new Map<string, { item: ApprovalItem; resolve: (ok: boolean) => void }>();
   private batch?: { index: number; total: number };
+  /** Recently decided ids, so a late second answer (phone vs screen vs auto) can be told apart from a bogus id. */
+  private decided = new Set<string>();
   /** Set while the session is being reset: anything asked meanwhile is refused at once. */
   private closed = false;
   auto = false;
@@ -61,10 +63,15 @@ export class ApprovalBroker {
     const p = this.pending.get(id);
     if (!p) return false;
     this.pending.delete(id);
+    this.decided.add(id);
+    if (this.decided.size > 200) this.decided.delete(this.decided.values().next().value!);
     this.log.emit("approval.resolved", { id, approved, via, kind: p.item.kind, title: p.item.title, financial: p.item.financial });
     p.resolve(approved);
     return true;
   }
+
+  /** True when `id` was pending and has been answered already (by another device, auto-approve or a reset). */
+  wasDecided(id: string): boolean { return this.decided.has(id); }
 
   setAuto(on: boolean) {
     this.auto = on;

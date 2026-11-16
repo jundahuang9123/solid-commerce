@@ -15,3 +15,10 @@ export function recordLabel(r: GroundRecord): string {
     case "mandate": return `Mandate: ≤ ${r.totalLimit} ${r.currency}, ${r.allowedSellers.length} seller${r.allowedSellers.length === 1 ? "" : "s"}`;
   }
 }
+
+/**
+ * A Break-it card that cannot run in this session (for example because the
+ * user rejected the mandate it needs). Shown as "not run", never as a
+ * guardrail that did not hold, and never worked around with a fixture.
+ */
+export class Unavailable extends Error {}

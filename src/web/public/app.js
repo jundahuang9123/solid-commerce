@@ -12,12 +12,12 @@ const GUARDS = [
   { id: "replay", title: "Replay the payment elsewhere", text: "Re-send Spree's payment to Havel Data, and re-send it to Spree three times.", button: "Run replay" },
   { id: "unapproved", title: "Unapproved seller", text: "Shady Forecasts is cheapest. A compromised agent tries to pay it anyway.", button: "Run attack" },
 ];
-const TONE_LABEL = { blocked: "Blocked", warn: "Handled", ok: "Recovered", fail: "Guardrail did not hold" };
+const TONE_LABEL = { blocked: "Blocked", warn: "Handled", ok: "Recovered", fail: "Guardrail did not hold", unavailable: "Not run" };
 
 // ------------------------------------------------------------------ state
 
 const fresh = () => ({
-  mode: "live", replay: null, components: {}, session: null, busy: null,
+  mode: "live", replay: null, components: {}, session: null, busy: null, resetQueued: null,
   steps: [], stepState: {}, request: "",
   chat: { weather: [], shoes: [] }, question: null, choice: null, confirmed: { weather: [], shoes: [] },
   offers: null, purchase: null, delivery: null, evidence: null,
@@ -44,6 +44,7 @@ function reduce(e) {
     case "reset": { const auto = s.approvals.auto; s = fresh(); s.approvals.auto = auto; ui.docSel = null; break; }
     case "session": s.session = d; s.mode = s.replay ? "replay" : d.mode; break;
     case "replay": s.replay = d; s.mode = "replay"; break;
+    case "reset.queued": s.resetQueued = d; break;
     case "components": for (const c of d.components) s.components[c.id] = c; break;
     case "busy":
       if (d.action && !s.busy) s.podBase = s.pod;   // "+n new" counts what the next action adds
@@ -70,7 +71,8 @@ function reduce(e) {
     case "guard.summary": s.guardSummary = d; break;
     case "shoes.agreed": s.shoes.agreed = d; break;
     case "shoes.products": s.shoes.products = d.items; break;
-    case "shoes.purchase": s.shoes.purchase = d; if (!d.transactionId || d.status !== "fulfilment_pending") s.shoes.order = null; break;
+    // A failed checkout places no order; the previous order (if any) still exists and stays on screen.
+    case "shoes.purchase": s.shoes.purchase = d; break;
     case "shoes.checkout": s.shoes.checkout = d; break;
     case "shoes.order": s.shoes.order = d; break;
     case "shoes.note": s.shoes.notes = [d.text, ...s.shoes.notes].slice(0, 4); break;
@@ -94,6 +96,10 @@ const shortId = (v, n = 12) => (v && v.length > n + 1 ? v.slice(0, n) + "…" : 
 const note = (n) => { const i = n.indexOf("  "); return i > 0 ? `<span class="hk">${esc(n.slice(0, i))}</span> ${esc(n.slice(i + 2))}` : esc(n); };
 const reasonClass = (r) => (r.startsWith("✗") ? "bad" : r.startsWith("✓") || r.startsWith("+") ? "ok" : "");
 const canAct = () => ui.authorized && !s.busy;
+/** In a replay, whether the recording holds this answer; live, every answer is possible. */
+const recorded = (kind, v) => s.mode !== "replay" || !s.replay?.[kind] || s.replay[kind].includes(v);
+/** An order that still needs the presenter: not yet delivered, or delivered without the user's verdict. */
+const openOrder = (o) => Boolean(o && (["created", "shipped"].includes(o.orderStatus) || (o.orderStatus === "delivered" && !o.acceptance)));
 
 function meter(label, used, limit, sub) {
   const pct = limit > 0 ? Math.min(100, (used / limit) * 100) : 0;
@@ -149,7 +155,7 @@ function drawHeader() {
   $("locked").textContent = ui.tokenStale
     ? "Controls are locked: the demo server restarted with a different session token. Open the new dashboard URL printed in the terminal. You can still watch."
     : "Controls are locked: open the dashboard URL printed in the terminal (it carries the session token). You can still watch.";
-  $("status").textContent = s.busy ? `Running: ${s.busy}` : s.recorded ? `Saved ${s.recorded.path.split("/").slice(-2).join("/")} (${s.recorded.events} events)` : "Ready";
+  $("status").textContent = s.resetQueued && s.busy ? `Resetting after the current step of ${s.resetQueued.after}…` : s.busy ? `Running: ${s.busy}` : s.recorded ? `Saved ${s.recorded.path.split("/").slice(-2).join("/")} (${s.recorded.events} events)` : "Ready";
   if (document.activeElement !== $("request") && !$("request").value) $("request").placeholder = s.request || $("request").placeholder;
   $("request").disabled = next !== 0;
   patch($("alerts"), s.errors.map((e, i) => `<div class="alert"><b>${esc(e.action)} failed:</b> ${esc(e.message)} <button type="button" class="btn small" data-k="dismiss-${i}" data-dismiss="${i}">Dismiss</button></div>`).join(""));
@@ -182,7 +188,8 @@ function drawQuestion() {
   const open = q.answered === undefined;
   patch($("question"), `<div role="radiogroup" aria-label="Meaning of ${esc(q.term)}" class="chips">${q.options.map((o, i) => {
     const on = (open ? s.choice : q.answered) === i;
-    return `<button type="button" role="radio" aria-checked="${on}" class="chip${on ? " on" : ""}" data-k="choice-${i}" data-choice="${i}"${open && canAct() ? "" : " disabled"}>${esc(o)}</button>`;
+    const inRecording = recorded("choices", i);
+    return `<button type="button" role="radio" aria-checked="${on}" class="chip${on ? " on" : ""}" data-k="choice-${i}" data-choice="${i}"${inRecording ? "" : ' title="Not in the recording: the replay can only show the recorded answer"'}${open && canAct() && inRecording ? "" : " disabled"}>${esc(o)}</button>`;
   }).join("")}</div>`);
 }
 
@@ -302,7 +309,7 @@ function turtleBody(ttl) {
 
 function drawOutcomes() {
   const p = s.purchase, b = s.budgets.weather;
-  const guards = Object.values(s.guards).filter((g) => g.tone);
+  const guards = Object.values(s.guards).filter((g) => g.tone && g.tone !== "unavailable");
   const held = guards.filter((g) => g.tone !== "fail").length;
   const tx = s.pod?.containers.find((c) => c.path.endsWith("transactions/"))?.docs.length ?? 0;
   const card = (k, v, sub, cls = "") => `<div class="outcome ${cls}"><div class="eyebrow">${esc(k)}</div><div class="big-num">${esc(v)}</div><div class="small">${esc(sub)}</div></div>`;
@@ -320,7 +327,9 @@ function drawOutcomes() {
 function drawShoes() {
   const sh = s.shoes;
   patch($("shoes-ask"), `<p class="quote">"Buy repairable shoes. You may spend up to <b>120 EUR including delivery</b>."${sh.agreed ? ` → <b>${esc(sh.agreed.term)}</b> agreed as <b>${esc(sh.agreed.label)}</b>` : ""}</p>`);
-  $("btn-buy").disabled = !canAct();
+  // While an order is open, a second checkout would only be refused (the budget is committed) and hide it.
+  $("btn-buy").disabled = !canAct() || openOrder(sh.order);
+  $("btn-buy").title = openOrder(sh.order) ? "Advance, cancel or give your verdict on the open order first" : "";
   const notes = [...sh.notes, ...(sh.purchase?.notes ?? []), ...(sh.purchase && !sh.purchase.transactionId ? [] : sh.purchase?.code ? [`${sh.purchase.code}: ${sh.purchase.reason ?? ""}`] : [])];
   patch($("shoes-status"), notes.map((n) => `<p>${esc(n)}</p>`).join(""));
   if (sh.products) patch($("products"), sh.products.map((p) => {
@@ -348,11 +357,13 @@ function drawShoes() {
   $("btn-advance").disabled = !canAct() || !o || !["created", "shipped"].includes(o.orderStatus);
   $("btn-cancel").disabled = !canAct() || !o || !["created", "shipped"].includes(o.orderStatus);
   const waiting = o && o.orderStatus === "delivered" && !o.acceptance;
+  const can = (ok) => waiting && canAct() && recorded("verdicts", ok);
+  const notRecorded = (ok) => (recorded("verdicts", ok) ? "" : ' title="Not in the recording: switch to a live session to answer this way"');
   patch($("inspect"), o?.acceptance
     ? `<div class="strong">${o.acceptance.verdict === "Delivered" ? "You accepted the delivery as agreed." : "You reported the goods are not as agreed."}</div><ul class="checks">${o.acceptance.checks.map((c) => `<li class="${reasonClass(c)}">${esc(c)}</li>`).join("")}</ul><div class="small fa-sub">Signed on the device (${esc(o.acceptance.keyId)}) and recorded in the Pod as the delivery outcome.</div>`
     : `<div class="strong">${waiting ? "Your shoes arrived." : "When the shoes arrive:"} Is this true: ${esc(o?.inspect?.join("; ") ?? "soles replaceable")}?</div>
-      <div class="btn-row"><button type="button" class="btn dark grow" data-k="accept-yes" data-act="shoes.accept" data-ok="true"${waiting && canAct() ? "" : " disabled"}>Yes, as agreed</button>
-      <button type="button" class="btn grow" data-k="accept-no" data-act="shoes.accept" data-ok="false"${waiting && canAct() ? "" : " disabled"}>No, not compliant</button></div>
+      <div class="btn-row"><button type="button" class="btn dark grow" data-k="accept-yes" data-act="shoes.accept" data-ok="true"${notRecorded(true)}${can(true) ? "" : " disabled"}>Yes, as agreed${recorded("verdicts", true) ? "" : " (not recorded)"}</button>
+      <button type="button" class="btn grow" data-k="accept-no" data-act="shoes.accept" data-ok="false"${notRecorded(false)}${can(false) ? "" : " disabled"}>No, not compliant${recorded("verdicts", false) ? "" : " (not recorded)"}</button></div>
       <div class="small fa-sub">Your answer is signed on the device and recorded in the Pod as the delivery outcome.</div>`);
   patch($("shoes-budget"), s.budgets.shoes ? budgetMeter(s.budgets.shoes, "Shoes mandate") : '<p class="muted small">No shoes mandate yet.</p>');
   patch($("shoes-doc"), esc(s.docs.find((d) => d.path.includes("-fulfilment"))?.turtle ?? "The fulfilment document appears after the order."));
@@ -360,14 +371,17 @@ function drawShoes() {
 
 function drawGuards() {
   const g = s.guardSummary;
+  $("breakit-lead").textContent = s.mode === "replay"
+    ? `Each button replays an attack or failure recorded against the live services${s.replay?.recordedAt ? ` on ${s.replay.recordedAt.slice(0, 10)}` : ""}. The verdict shown is what the gateway, signer, seller or rail answered then.`
+    : "Each button runs a real attack or failure against the live services. The verdict comes from the gateway, signer, seller or rail, not from the agent.";
   patch($("guard-summary"), g ? `budget ${esc(g.committed)} / ${esc(g.limit)} · Spree received ${esc(g.sellerReceived)}` : "budget appears after the first scenario");
   patch($("guards"), GUARDS.map((d) => {
     const r = s.guards[d.id];
     const btn = (act, text, cls = "outline") => `<button type="button" class="btn ${cls}" data-k="g-${act}" data-act="guard.${act}"${canAct() ? "" : " disabled"}>${text}</button>`;
     const buttons = d.id === "crash" ? `<div class="btn-row">${btn("crash", d.button)}${r?.recoverable ? btn("recover", "Recover", "primary") : `<button type="button" class="btn primary" disabled>Recover</button>`}</div>` : btn(d.id, d.button);
     const tiles = r?.tiles ? `<div class="tiles" role="img" aria-label="${esc(r.lines[0])}">${r.tiles.map((t) => `<span class="tile ${t.status === "completed" ? "on" : ""}" title="${esc(`${t.agent}: ${t.code ?? t.status}`)}"></span>`).join("")}</div>` : "";
-    const verdict = r?.running ? '<div class="verdict running">Running against the live services…</div>'
-      : r?.tone ? `${tiles}<div class="verdict ${r.tone}"><span class="sr-only">${esc(TONE_LABEL[r.tone])}: </span>${r.tone === "fail" ? "<b>Guardrail did not hold</b><br>" : ""}${r.lines.map(esc).join("<br>")}</div>` : "";
+    const verdict = r?.running ? `<div class="verdict running">${s.mode === "replay" ? "Replaying the recorded run…" : "Running against the live services…"}</div>`
+      : r?.tone ? `${tiles}<div class="verdict ${r.tone}"><span class="sr-only">${esc(TONE_LABEL[r.tone] ?? r.tone)}: </span>${r.tone === "fail" ? "<b>Guardrail did not hold</b><br>" : r.tone === "unavailable" ? "<b>Not run</b><br>" : ""}${r.lines.map(esc).join("<br>")}</div>` : "";
     return `<article class="card guard"><h2>${esc(d.title)}</h2><p class="small">${esc(d.text)}</p>${buttons}${verdict}</article>`;
   }).join(""));
 }
@@ -383,16 +397,23 @@ function drawPhone() {
 
 // ------------------------------------------------------------------ input
 
+/**
+ * Benign races are not failures: a second click before the "busy" event disabled the button (409 busy),
+ * or an approval answered meanwhile on the phone, on screen, by auto-approve or by a reset. Those show
+ * nothing; the screen already shows what is running or what was decided.
+ */
+const benign = (e) => e.status === 409 && (/^busy: /.test(e.message) || e.body?.alreadyDecided === true);
+
 async function act(name, args = {}) {
   try { await api(`/api/action/${name}`, args); }
-  catch (e) { s.errors.unshift({ action: name, message: e.message }); render(); }
+  catch (e) { if (benign(e)) return; s.errors.unshift({ action: name, message: e.message }); render(); }
 }
 
 document.addEventListener("click", (ev) => {
   const t = ev.target.closest("button");
   if (!t) return;
   if (t.dataset.tab) { ui.tab = t.dataset.tab; store.set("demo.tab", ui.tab); return render(); }
-  if (t.dataset.decide) return void api(`/api/approvals/${encodeURIComponent(t.dataset.decide)}`, { approve: t.dataset.approve === "true", via: "screen" }).catch((e) => { s.errors.unshift({ action: "approval", message: e.message }); render(); });
+  if (t.dataset.decide) return void api(`/api/approvals/${encodeURIComponent(t.dataset.decide)}`, { approve: t.dataset.approve === "true", via: "screen" }).catch((e) => { if (benign(e)) return; s.errors.unshift({ action: "approval", message: e.message }); render(); });
   if (t.dataset.choice) return void act("weather.answer", { choice: Number(t.dataset.choice) });
   if (t.dataset.doc) { ui.docSel = t.dataset.doc; return render(); }
   if (t.dataset.dismiss) { s.errors.splice(Number(t.dataset.dismiss), 1); return render(); }
@@ -423,7 +444,7 @@ $("record-form").addEventListener("submit", async (e) => {
   catch (err) {
     // The server never replaces a recording unless asked to.
     if (err.status !== 409 || !err.body?.exists) return fail(err);
-    if (!confirm(`recordings/${name}.json already exists. Replace it?`)) return;
+    if (!confirm(`${err.body.file ?? `recordings/${name}.json`} already exists. Replace it?`)) return;
     await api("/api/record", { name, overwrite: true }).catch(fail);
   }
 });
