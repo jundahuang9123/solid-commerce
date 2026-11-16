@@ -1,5 +1,6 @@
 /**
- * Durable transaction ledger (SQLite via node:sqlite). Budget reservations
+ * Transaction ledger (SQLite via node:sqlite). It is durable only when given a
+ * file path; every entry point in this prototype runs it in memory. Budget reservations
  * happen inside BEGIN IMMEDIATE transactions, so concurrent agents, or several
  * gateway processes sharing the file, cannot together exceed a mandate.
  *

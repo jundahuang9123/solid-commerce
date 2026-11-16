@@ -159,6 +159,7 @@ npm run rails -- --example-upstream
 ```bash
 # Terminal 2: the proxy on 127.0.0.1:8402, then one unpaid and one paid request
 npm run proxy -- --config proxy.example.json &
+sleep 5                                                       # wait until the proxy prints its route table
 curl -i http://127.0.0.1:8402/v1/aqi/current                  # 402: x402, L402 and card challenges
 npm run rails -- pay http://127.0.0.1:8402/v1/aqi/current     # pays 8 SAT over L402: HTTP 200 with an sc-receipt
 kill %1                                                       # stops the proxy
