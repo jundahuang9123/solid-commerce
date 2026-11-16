@@ -214,8 +214,9 @@ export class LiveDemo implements DemoControls {
 
   act(name: string, args: Record<string, unknown>): ActionResult {
     // A Reset that could not start a session leaves no environment (see boot()); the scenarios still
-    // point at the closed one, so anything but another Reset would fail in confusing ways.
-    if (!this.env && name !== "reset") return { ok: false, status: 409, error: "no live session: the last Reset could not start one. Press Reset again; if it keeps failing, restart the demo or switch to --replay." };
+    // point at the closed one, so anything but another Reset would fail in confusing ways. (While a
+    // reset is still starting the new session there is no environment either: that is "busy: reset".)
+    if (!this.env && name !== "reset" && this.busy !== "reset") return { ok: false, status: 409, error: "no live session: the last Reset could not start one. Press Reset again; if it keeps failing, restart the demo or switch to --replay." };
     if (name === "weather.answer") return this.weather!.choose(Number(args.choice));
     const fn = this.action(name, args);
     if (!fn) return { ok: false, status: 404, error: `unknown action ${name}` };

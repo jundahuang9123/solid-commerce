@@ -531,6 +531,16 @@ describe("web demo, live", () => {
     assert.ok((await run(srv, demo, "weather.next")).some((e) => e.type === "step" && e.data.state === "done"), "with a session, actions run again");
   });
 
+  test("while a Reset is starting the new session, other actions answer 'busy: reset' (benign), not 'no live session'", async () => {
+    await freshSession(srv, demo, true);
+    const previous = demo.log.all()[0];
+    assert.equal((await post(srv, "/api/action/reset")).status, 202);
+    const r = await post(srv, "/api/action/weather.next");
+    assert.equal(r.status, 409);
+    assert.equal((await r.json() as { error: string }).error, "busy: reset", "the dashboard treats this as a benign race");
+    await resetDone(demo, previous);
+  });
+
   test("Reset pressed again while a reset is running is accepted and changes nothing", async () => {
     await freshSession(srv, demo, true);
     const previous = demo.log.all()[0];
